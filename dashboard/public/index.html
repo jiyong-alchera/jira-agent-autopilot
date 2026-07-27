@@ -49,8 +49,9 @@ const api = {
   async del(p) { const r = await fetch(p, { method: "DELETE" }); return r.json(); },
 };
 
-function Section({ title, children, right, collapsible, defaultOpen = false }) {
+function Section({ title, children, right, collapsible, defaultOpen = false, openSignal }) {
   const [open, setOpen] = useState(collapsible ? defaultOpen : true);
+  useEffect(() => { if (openSignal) setOpen(true); }, [openSignal]);   // 외부(활성 패널 점프)에서 강제 오픈
   const shown = !collapsible || open;
   return (
     <div className="bg-slate-900/70 border border-slate-700 rounded-xl p-5 mb-5">
@@ -90,8 +91,9 @@ function InfoTip({ text, title }) {
 }
 
 // 프로젝트 카드 내부의 접이식 하위 영역(기본 접힘). 헤더 클릭으로 토글, 우측 액션(right)은 펼쳤을 때만.
-function SubSection({ title, right, defaultOpen = false, children }) {
+function SubSection({ title, right, defaultOpen = false, openSignal, children }) {
   const [open, setOpen] = useState(defaultOpen);
+  useEffect(() => { if (openSignal) setOpen(true); }, [openSignal]);   // 외부(활성 패널 점프)에서 강제 오픈
   return (
     <div className="mt-3 pt-3 border-t border-slate-700/70">
       <div className="flex items-center justify-between">
@@ -314,9 +316,11 @@ function InfoModal({ onClose }) {
 }
 
 // =================== 프로젝트 1개 (설정·자격증명·.env·카드 등록·카드 상태) ===================
-function ProjectCard({ proj, onDeleted, flash }) {
+function ProjectCard({ proj, onDeleted, flash, jumpTo }) {
   const PID = proj.id;
   const withP = (url) => url + (url.includes("?") ? "&" : "?") + "project=" + encodeURIComponent(PID);
+  const rootRef = React.useRef(null);
+  const [openSig, setOpenSig] = useState(0);   // 활성 패널 점프 시 Section·'카드 상태' 강제 오픈 신호
 
   const [config, setConfig] = useState(proj);
   const [creds, setCreds] = useState({});
@@ -429,12 +433,23 @@ function ProjectCard({ proj, onDeleted, flash }) {
       const d = await api.get(withP(`/api/jira/issue/${key}`)); if (d.ok) setDetail(d);   // 반영된 본문 재조회
     } else { flash(r.message || "반영 실패"); setEnhance((p) => (p && p.key === key) ? { ...p, applying: false } : p); }
   };
-  const toggleCard = async (key) => {
-    if (expandedKey === key) { setExpandedKey(""); setDetail(null); setCardHistory(null); setEnhance(null); return; }
-    setExpandedKey(key); setDetail(null); setCardHistory(null); setReply(""); setReplyAnswered(true); setReplyTarget(null); setClaudeLog(null); setEnhance(null); setDetailLoading(true);
+  const loadCardDetail = async (key) => {
+    setDetail(null); setCardHistory(null); setReply(""); setReplyAnswered(true); setReplyTarget(null); setClaudeLog(null); setEnhance(null); setDetailLoading(true);
     const r = await api.get(withP(`/api/jira/issue/${key}`)); setDetailLoading(false); setDetail(r.ok ? r : { error: r.message || "조회 실패" });
     try { const h = await api.get(withP(`/api/history`)); setCardHistory({ key, entries: h.ok ? (h.entries || []).filter((e) => e.key === key) : [] }); } catch { setCardHistory({ key, entries: [] }); }
   };
+  const toggleCard = async (key) => {
+    if (expandedKey === key) { setExpandedKey(""); setDetail(null); setCardHistory(null); setEnhance(null); return; }
+    setExpandedKey(key); await loadCardDetail(key);
+  };
+  // 활성 패널에서 이 프로젝트의 카드로 점프: Section·'카드 상태' 열기 + 검색으로 노출 + 펼치기 + 스크롤
+  useEffect(() => {
+    if (!jumpTo || jumpTo.projectId !== PID) return;
+    setOpenSig((n) => n + 1);
+    setCardQuery(jumpTo.key); setCardPage(0);
+    setExpandedKey(jumpTo.key); loadCardDetail(jumpTo.key);
+    requestAnimationFrame(() => { try { rootRef.current && rootRef.current.scrollIntoView({ behavior: "smooth", block: "start" }); } catch {} });
+  }, [jumpTo]);
   const changeStatus = async (key, transitionId, toName) => {
     if (!transitionId) return;
     const r = await api.post(`/api/jira/issue/${key}/transition`, { transitionId, project: PID });
@@ -507,7 +522,8 @@ function ProjectCard({ proj, onDeleted, flash }) {
   const title = <span>📁 {config.name || PID} <span className="text-xs text-slate-500">({config.projectKey || "프로젝트 키 미설정"})</span></span>;
 
   return (
-    <Section title={title} collapsible right={<div className="flex gap-2"><Btn onClick={saveConfig}>설정 저장</Btn><Btn color="red" onClick={del}>삭제</Btn></div>}>
+    <div ref={rootRef} style={{ scrollMarginTop: "1rem" }}>
+    <Section title={title} collapsible openSignal={openSig} right={<div className="flex gap-2"><Btn onClick={saveConfig}>설정 저장</Btn><Btn color="red" onClick={del}>삭제</Btn></div>}>
       {/* 설정 */}
       <SubSection title="설정">
       <div className="grid grid-cols-2 gap-x-5">
@@ -737,7 +753,7 @@ function ProjectCard({ proj, onDeleted, flash }) {
       </SubSection>
 
       {/* 카드 상태 */}
-      <SubSection title="카드 상태 · 60초 자동 갱신" right={<Btn color="slate" onClick={loadCards}>조회</Btn>}>
+      <SubSection title="카드 상태 · 60초 자동 갱신" openSignal={openSig} right={<Btn color="slate" onClick={loadCards}>조회</Btn>}>
         {cardsErr && <p className="text-rose-400 text-sm mb-2">{cardsErr}</p>}
         {cards.length > 0 && (
           <input value={cardQuery} onChange={(e) => { setCardQuery(e.target.value); setCardPage(0); }} spellCheck={false}
@@ -1028,6 +1044,7 @@ function ProjectCard({ proj, onDeleted, flash }) {
         })()}
       </SubSection>
     </Section>
+    </div>
   );
 }
 
@@ -1043,10 +1060,16 @@ function App() {
   const [histDetail, setHistDetail] = useState(null);   // 펼친 행의 티켓 내용 { key, loading, detail }
   const [toast, setToast] = useState("");
   const [infoOpen, setInfoOpen] = useState(false);
+  const [active, setActive] = useState([]);        // 전 프로젝트 활성(완료 전) 작업
+  const [activeErr, setActiveErr] = useState("");
+  const [jumpTo, setJumpTo] = useState(null);      // 활성 패널 → 프로젝트 카드 점프 { projectId, key, nonce }
+  const jumpNonce = React.useRef(0);
   const flash = (m) => { setToast(m); setTimeout(() => setToast(""), 2500); };
 
   const loadProjects = async () => { const r = await api.get("/api/projects"); setProjects(r.projects || []); };
   const loadHistory = async () => { const r = await api.get("/api/history"); if (r.ok) setHistory(r.entries || []); };
+  const loadActive = async () => { const r = await api.get("/api/active"); if (r.ok) { setActive(r.issues || []); setActiveErr((r.errors || []).length ? `일부 프로젝트 조회 실패: ${r.errors.map((e) => e.project).join(", ")}` : ""); } else setActiveErr(r.message || "조회 실패"); };
+  const jumpToCard = (projectId, key) => { jumpNonce.current += 1; setJumpTo({ projectId, key, nonce: jumpNonce.current }); };
   const toggleHist = async (rowId, key, project) => {
     if (histExpanded === rowId) { setHistExpanded(""); setHistDetail(null); return; }
     setHistExpanded(rowId); setHistDetail({ key, loading: true, detail: null });
@@ -1068,14 +1091,15 @@ function App() {
     if (!url) { flash(`Jira 사이트 설정이 없어 링크를 만들 수 없습니다 (${project || "?"})`); return; }
     flash(await copyText(url) ? `링크 복사됨: ${key}` : "복사 실패 — 클립보드 권한을 확인하세요");
   };
-  useEffect(() => { loadProjects(); loadHistory(); api.get("/api/loops/status").then(setStatus); }, []);
+  useEffect(() => { loadProjects(); loadHistory(); loadActive(); api.get("/api/loops/status").then(setStatus); }, []);
   useEffect(() => {
     const t = setInterval(async () => {
       setStatus(await api.get("/api/loops/status"));
       for (const type of ["plan", "build", "review"]) { const r = await api.get(`/api/logs/${type}?lines=120`); setLogs((p) => ({ ...p, [type]: r.log || "" })); }
       loadHistory();
     }, 4000);
-    return () => clearInterval(t);
+    const ta = setInterval(loadActive, 30000);   // 활성 작업은 30초마다(프로젝트별 Jira 조회 비용 고려)
+    return () => { clearInterval(t); clearInterval(ta); };
   }, []);
 
   const toggleLoop = async (type) => { const running = status[type]?.running; const r = await api.post(`/api/loops/${type}/${running ? "stop" : "start"}`); flash(r.ok ? `${type} 루프 ${running ? "중지" : "시작"}` : (r.message || "실패")); setStatus(await api.get("/api/loops/status")); };
@@ -1124,7 +1148,32 @@ function App() {
         <Btn color="green" onClick={addProject}>+ 프로젝트 추가</Btn>
       </div>
       {projects.length === 0 && <p className="text-slate-500 text-sm mb-5">프로젝트가 없습니다. "+ 프로젝트 추가"로 시작하세요.</p>}
-      {projects.map((p) => <ProjectCard key={p.id} proj={p} flash={flash} onDeleted={() => { flash("프로젝트 삭제됨"); loadProjects(); }} />)}
+      {projects.map((p) => <ProjectCard key={p.id} proj={p} flash={flash} jumpTo={jumpTo} onDeleted={() => { flash("프로젝트 삭제됨"); loadProjects(); }} />)}
+
+      {/* 활성화된 작업 (전역) — 완료 전 진행 카드 + 처리 중 실시간, 클릭 시 프로젝트로 점프 */}
+      <Section title={`활성화된 작업 (전 프로젝트) · ${active.length}건`} collapsible defaultOpen right={<Btn color="slate" onClick={loadActive}>새로고침</Btn>}>
+        <p className="text-xs text-slate-500 mb-2">완료 전 진행 카드를 프로젝트 상관없이 모아 보여줍니다(30초 자동 갱신). <b>처리 중</b>은 실행 중이라는 뜻이고, 행을 클릭하면 해당 프로젝트 카드로 이동해 자동으로 펼쳐집니다.</p>
+        {activeErr && <p className="text-amber-300/80 text-xs mb-2">{activeErr}</p>}
+        {active.length === 0 ? <p className="text-slate-500 text-sm">지금 진행 중인 작업이 없습니다.</p> : (
+          <table className="w-full text-sm table-fixed">
+            <thead><tr className="text-slate-400 text-left border-b border-slate-700"><th className="py-2 w-32">프로젝트</th><th className="w-28">키(번호)</th><th>티켓 이름</th><th className="w-36">단계</th></tr></thead>
+            <tbody>
+              {active.map((c) => {
+                const [baseLabel, cls] = stageBadge[c.stage] || ["-", ""];
+                const label = (c.stage === "processing" && c.proc) ? `처리 중(${c.proc})` : baseLabel;
+                return (
+                  <tr key={`${c.project}:${c.key}`} className="border-b border-slate-800 hover:bg-slate-800/40 cursor-pointer" onClick={() => jumpToCard(c.project, c.key)} title={`단계 설정 시각(수정): ${c.updated ? new Date(c.updated).toLocaleString() : "-"} · 클릭 시 해당 프로젝트 카드로 이동`}>
+                    <td className="py-2 text-slate-300 truncate" title={c.projectName}>{c.projectName}</td>
+                    <td className="text-indigo-400 truncate">{c.key}</td>
+                    <td className="pr-3 truncate" title={c.summary || ""}>{c.summary}</td>
+                    <td><span className={`inline-block whitespace-nowrap text-xs px-2 py-1 rounded-full border ${cls}`}>{label}</span></td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
+      </Section>
 
       {/* 처리 이력 (전역) — 페이지네이션 */}
       <Section title="처리 이력 (전 프로젝트)" collapsible defaultOpen right={<Btn color="slate" onClick={loadHistory}>새로고침</Btn>}>

@@ -259,7 +259,7 @@ async function jiraSearch(jql, cfg, cred) {
   const res = await fetch(`https://${cfg.jiraSite}/rest/api/3/search/jql`, {
     method: "POST",
     headers: { Authorization: `Basic ${auth}`, "Content-Type": "application/json", Accept: "application/json" },
-    body: JSON.stringify({ jql, fields: ["summary", "status", "labels", "assignee"], maxResults: 50 }),
+    body: JSON.stringify({ jql, fields: ["summary", "status", "labels", "assignee", "updated"], maxResults: 50 }),
   });
   if (!res.ok) throw new Error(`Jira ${res.status}: ${(await res.text()).slice(0, 300)}`);
   return res.json();
@@ -774,52 +774,75 @@ app.get("/api/jira/statuses", async (req, res) => {
     res.json({ ok: true, statuses });
   } catch (e) { fail(res, e); }
 });
+// 한 프로젝트의 트리거 카드 목록 + 단계 판정(처리 중 락 > 상태매핑 > 완료 > 라벨). /api/cards·/api/active 공용.
+async function buildProjectCards(cfg, cred) {
+  const proj = cfg.projectKey ? ` AND project = "${cfg.projectKey}"` : "";
+  // 할당자 무관하게 트리거(claude-work) 카드를 모두 인식. 각 카드에 assignedToMe 플래그로 구분.
+  const data = await jiraSearch(`${triggerClause(cfg)}${proj} ORDER BY created DESC`, cfg, cred);
+  const myId = await myAccountId(cfg, cred);
+  const stateDir = path.join(cfg.cloneBase || path.join(cfg.workDir || SCRIPTS_DIR, "repos"), ".state");
+  // 처리 중 여부: 카드별 락 + '살아있는' PID 확인. build/plan(<KEY>.lock)·review(<KEY>.review.lock) 둘 다 인식.
+  // 여러 단계가 동시에 돌 수 있으므로(예: build+review) 활성 단계 목록을 반환. 스테일 락(죽은 PID)은 제외.
+  const procPhases = (key) => {
+    const phases = [];
+    for (const suffix of [".lock", ".review.lock"]) {
+      const lock = path.join(stateDir, `${key}${suffix}`);
+      if (!fs.existsSync(lock)) continue;
+      let pid = null; try { pid = parseInt(fs.readFileSync(`${lock}.pid`, "utf8").trim(), 10); } catch {}
+      if (pid && !isAlive(pid)) continue;   // 죽은 프로세스(스테일 락) → 무시
+      let ph = "run"; try { ph = fs.readFileSync(`${lock}.phase`, "utf8").trim() || "run"; } catch {}
+      phases.push(ph);
+    }
+    return phases;
+  };
+  const labelStage = (it) => {
+    if (it.labels.includes(cfg.failedLabel)) return "failed";
+    if (it.labels.includes(cfg.prOpenLabel)) return "await-merge";   // PR 올림 → 병합 대기
+    const planned = it.labels.includes(cfg.plannedLabel), answered = it.labels.includes(cfg.answeredLabel);
+    if (planned && answered) return "build-ready";
+    if (planned) return "awaiting-answer";
+    return "plan-ready";
+  };
+  return (data.issues || []).map((i) => {
+    const catKey = i.fields.status?.statusCategory?.key; // "new" | "indeterminate" | "done"
+    const assignee = i.fields.assignee;
+    const assignedToMe = !!myId && !!assignee && assignee.accountId === myId;
+    const it = { key: i.key, summary: i.fields.summary, status: i.fields.status?.name, labels: i.fields.labels || [], url: `https://${cfg.jiraSite}/browse/${i.key}`, assignedToMe, assignee: (assignee && assignee.displayName) || null, updated: i.fields.updated || null };
+    const phases = procPhases(i.key);
+    const proc = phases.join("+") || null;   // 배지 표기용(예: "build+review")
+    const mapped = (cfg.statusStageMap || {})[it.status];   // 설정에서 이 상태를 특정 단계로 강제 매핑
+    let stage;
+    if (phases.length) stage = "processing";                               // 실행 중(살아있는 락)이면 최우선 → 완료 상태여도 중지 가능
+    else if (mapped) stage = mapped;                                       // 상태→단계 매핑(예: QA READY → done)
+    else if (catKey === "done" || effectiveDoneStatuses(cfg).includes(it.status)) stage = "done"; // 상태 카테고리 Done 이거나 '완료로 인식' 상태(doneStatus ∪ 매핑 완료)
+    else stage = labelStage(it);
+    return { ...it, stage, proc, procPhases: phases };
+  });
+}
+
 app.get("/api/cards", async (req, res) => {
+  try { const { cfg, cred } = resolveProject(req); res.json({ ok: true, issues: await buildProjectCards(cfg, cred) }); }
+  catch (e) { fail(res, e); }
+});
+
+// 전 프로젝트의 '활성(완료 전)' 작업을 한 곳에 취합 — 프로젝트 헤더를 매번 열지 않고 확인.
+// 처리 중(살아있는 락) 카드는 procPhases 로 표시되어 실시간 강조된다. 프로젝트별 조회 실패는 errors 로 분리.
+app.get("/api/active", async (req, res) => {
   try {
-    const { cfg, cred } = resolveProject(req);
-    const proj = cfg.projectKey ? ` AND project = "${cfg.projectKey}"` : "";
-    // 할당자 무관하게 트리거(claude-work) 카드를 모두 인식. 각 카드에 assignedToMe 플래그로 구분.
-    const data = await jiraSearch(`${triggerClause(cfg)}${proj} ORDER BY created DESC`, cfg, cred);
-    const myId = await myAccountId(cfg, cred);
-    const stateDir = path.join(cfg.cloneBase || path.join(cfg.workDir || SCRIPTS_DIR, "repos"), ".state");
-    // 처리 중 여부: 카드별 락 + '살아있는' PID 확인. build/plan(<KEY>.lock)·review(<KEY>.review.lock) 둘 다 인식.
-    // 여러 단계가 동시에 돌 수 있으므로(예: build+review) 활성 단계 목록을 반환. 스테일 락(죽은 PID)은 제외.
-    const procPhases = (key) => {
-      const phases = [];
-      for (const suffix of [".lock", ".review.lock"]) {
-        const lock = path.join(stateDir, `${key}${suffix}`);
-        if (!fs.existsSync(lock)) continue;
-        let pid = null; try { pid = parseInt(fs.readFileSync(`${lock}.pid`, "utf8").trim(), 10); } catch {}
-        if (pid && !isAlive(pid)) continue;   // 죽은 프로세스(스테일 락) → 무시
-        let ph = "run"; try { ph = fs.readFileSync(`${lock}.phase`, "utf8").trim() || "run"; } catch {}
-        phases.push(ph);
-      }
-      return phases;
-    };
-    const labelStage = (it) => {
-      if (it.labels.includes(cfg.failedLabel)) return "failed";
-      if (it.labels.includes(cfg.prOpenLabel)) return "await-merge";   // PR 올림 → 병합 대기
-      const planned = it.labels.includes(cfg.plannedLabel), answered = it.labels.includes(cfg.answeredLabel);
-      if (planned && answered) return "build-ready";
-      if (planned) return "awaiting-answer";
-      return "plan-ready";
-    };
-    const issues = (data.issues || []).map((i) => {
-      const catKey = i.fields.status?.statusCategory?.key; // "new" | "indeterminate" | "done"
-      const assignee = i.fields.assignee;
-      const assignedToMe = !!myId && !!assignee && assignee.accountId === myId;
-      const it = { key: i.key, summary: i.fields.summary, status: i.fields.status?.name, labels: i.fields.labels || [], url: `https://${cfg.jiraSite}/browse/${i.key}`, assignedToMe, assignee: (assignee && assignee.displayName) || null };
-      const phases = procPhases(i.key);
-      const proc = phases.join("+") || null;   // 배지 표기용(예: "build+review")
-      const mapped = (cfg.statusStageMap || {})[it.status];   // 설정에서 이 상태를 특정 단계로 강제 매핑
-      let stage;
-      if (phases.length) stage = "processing";                               // 실행 중(살아있는 락)이면 최우선 → 완료 상태여도 중지 가능
-      else if (mapped) stage = mapped;                                       // 상태→단계 매핑(예: QA READY → done)
-      else if (catKey === "done" || effectiveDoneStatuses(cfg).includes(it.status)) stage = "done"; // 상태 카테고리 Done 이거나 '완료로 인식' 상태(doneStatus ∪ 매핑 완료)
-      else stage = labelStage(it);
-      return { ...it, stage, proc, procPhases: phases };
-    });
-    res.json({ ok: true, issues });
+    const issues = [], errors = [];
+    for (const p of listProjects()) {
+      if (!p.projectKey) continue;   // 프로젝트 키 없으면 탐지 대상 아님
+      const cfg = getProject(p.id), cred = getProjectCreds(p.id);
+      try {
+        for (const it of await buildProjectCards(cfg, cred)) {
+          if (it.stage === "done") continue;   // 완료 카드는 제외(진행 중만)
+          issues.push({ ...it, project: p.id, projectName: p.name || p.id });
+        }
+      } catch (e) { errors.push({ project: p.id, message: e.message }); }
+    }
+    // 단계 설정 시각(Jira updated) 최신순 — 방금 단계가 바뀐 카드가 위로.
+    issues.sort((a, b) => new Date(b.updated || 0) - new Date(a.updated || 0));
+    res.json({ ok: true, issues, errors });
   } catch (e) { fail(res, e); }
 });
 
