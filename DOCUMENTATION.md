@@ -129,7 +129,7 @@ Jira 카드를 자동으로 탐지해 **Claude가 개발 → PR 생성 → 카�
 | 담당자 답변 코멘트 | 실제 답변 존재(build 진입 게이트 ②) | 사람(담당자) |
 | 완료(상태 카테고리 Done 또는 `DONE_STATUS` 이름) | 처리 완료, 탐지 제외 | build 단계의 Claude/사람 |
 | `claude-failed` 라벨 | 연속 실패 N회 초과 → 탐지 제외(수동 확인 필요) | 실패 처리 로직(Claude) |
-| 처리 락(`repos/.state/<KEY>.lock`(plan/build) · `<KEY>.review.lock`(review) + `.phase`/`.pid`) | 해당 카드 **처리 중**(phase·스크립트 PID 기록 → 대시보드 '중지'에 사용). 대시보드는 두 락을 모두 인식해 build/plan·review 작업 모두 '처리 중' 표시·중지 가능 | run-jira-agent.sh / run-review.sh(시작 시 생성, 종료 시 trap 으로 제거) |
+| 처리 락(`repos/.state/<KEY>.lock`(plan/build) · `<KEY>.review.lock`(review) · `<KEY>.reviewloop.lock`(승인까지 루프) + `.phase`/`.pid`) | 해당 카드 **처리 중**(phase·스크립트 PID 기록 → 대시보드 '중지'에 사용). 대시보드는 세 락을 모두 인식해 plan/build·review·승인 루프 작업 모두 '처리 중' 표시·중지 가능 | run-jira-agent.sh / run-review.sh / run-review-loop.sh(시작 시 생성, 종료 시 trap 으로 제거) |
 | `repo_<name>` 라벨 | 카드의 대상 repo(여러 개 가능) | 사람/대시보드(카드 등록 시) |
 
 이 설계의 핵심 효과:
@@ -215,6 +215,26 @@ Jira 카드를 자동으로 탐지해 **Claude가 개발 → PR 생성 → 카�
   - 문제 없음 → **고유 승인 마커 코멘트**를 남김. 자기 자신의 PR 은 GitHub formal approve 가 불가하므로 `gh pr review --approve` 대신 마커 코멘트로 "리뷰 완료(승인)"를 표시한다.
 - 코드/커밋/머지/상태·라벨은 **건드리지 않음**(리뷰 코멘트만). 결과는 이력에 `review/approved` 또는 `review/reviewed` 로 기록하고, **Slack 알림**(`SLACK_WEBHOOK_URL` 설정 시)도 보낸다 — 승인 `✅ PR 리뷰 승인`, 미승인 `📝 PR 리뷰 코멘트(수정 필요)`(각 repo#번호·PR URL 포함).
 
+#### 4.3c run-review-loop.sh (승인까지 반복 루프 — 대시보드 '승인까지 루프')
+
+대시보드 'PR 목록'의 **`🔁 승인까지 루프`** 버튼이 실행하는 스크립트. `[반영+재리뷰]` 는 1회만 돌기 때문에
+리뷰가 '수정 필요'로 끝나면 사람이 다시 버튼을 눌러야 했는데, 이 루프는 **승인 마커가 남을 때까지 반복**한다.
+
+`run-review-loop.sh <KEY> <owner/repo> <PR번호>` — 한 회차(iteration)는:
+
+1. **승인 확인** — `gh api repos/<owner>/issues/<N>/comments` 에 `CLAUDE-REVIEW-APPROVED` 가 있으면 즉시 성공 종료(시작 시점에도 1회 확인).
+2. **리뷰 반영** — `REWORK=1 REWORK_ONLY_OWNER/NUM=… run-jira-agent.sh <KEY> build` (그 PR 하나만 반영·push).
+3. **재리뷰** — `FORCE_REVIEW=1 REVIEW_ONLY_OWNER/NUM=… run-review.sh <KEY>` (그 PR 하나만, 마커가 있어도 강제).
+4. **판정** — GitHub 에서 마커를 다시 확인. 있으면 종료, 없으면 **회차를 명시한 Slack 알림** 후 다음 회차.
+
+- **상한**: `REVIEW_LOOP_MAX`(기본 5, 대시보드가 주입 · 설정 `reviewLoopMax`). 상한을 넘겨도 미승인이면 **사람 확인 요청**(`⏸`) 후 종료. `run-review.sh` 의 `MAX_AUTO_REWORK`(자동 주기용 상한)와는 별개다.
+- **중지**: `.state/<KEY>.reviewloop.stop` 파일(대시보드 '루프 중지' 버튼이 생성) 또는 프로세스 트리 SIGTERM. 둘 다 **진행 중인 반영/리뷰까지 즉시 종료**하고 이력에 `stopped` 를 남긴다. 중지 처리는 마커 디렉토리(`.reviewloop.term`)로 **1회만** 수행된다.
+- **동시 실행 방지**: 카드당 하나 — `.state/<KEY>.reviewloop.lock`(+`.pid`/`.phase`). 대시보드는 이 락도 '처리 중'으로 인식한다. 하위 `run-jira-agent.sh`/`run-review.sh` 는 각자 `<KEY>.lock`/`<KEY>.review.lock` 을 회차마다 잡았다 놓는다.
+- **중단 조건**: PR 이 OPEN 이 아님(병합·닫힘), 반영 실패(exit≠0), 다른 작업이 카드 락을 쥐고 있어 반영이 `SKIP` 됨 — 모두 Slack 알림 후 루프를 멈춘다.
+- **Slack 알림**(모두 회차 표기): 시작 `🔁 … 루프 시작 (최대 N회)`, **미승인 `📝 … 리뷰 루프 i/N회차 — 수정 필요(미승인)`**, 승인 `✅ … 리뷰 승인 완료 (루프 i/N회차)`, 상한 `⏸`, 중지 `⏹`, 반영 실패 `❌`. 하위 스크립트의 Slack 알림은 **끄고**(`SLACK_WEBHOOK_URL=""` 주입) 루프가 대표해서 보내 중복을 막는다.
+- **진행 상태**: 회차·단계를 `.state/<KEY>.reviewloop.json`(`{iter,max,step,owner,number,…}`)에 기록 → 대시보드가 5초마다 폴링해 버튼 옆에 `🔁 승인 루프 2/5회차 · 리뷰 중` 으로 표시한다. 이력은 회차마다 `review-loop/reviewed`, 종료 시 `approved`/`stopped`/`failed`.
+- 루프 진행 로그는 `loop-review.log`, 엔진 상세 로그는 기존대로 `agent-logs/<KEY>-build.log`·`<KEY>-review.log`(대시보드 '엔진 실행 로그'에서 실시간 확인).
+
 ### 4.4 대시보드 백엔드 (dashboard/server.js, Express)
 
 기본 포트 `4317`. 주요 API:
@@ -231,6 +251,9 @@ Jira 카드를 자동으로 탐지해 **Claude가 개발 → PR 생성 → 카�
 | POST | `/api/loops/:type/start` · `/stop` | 루프 시작/중지 (프로세스 spawn/kill). `type` = `plan` \| `build` \| `review` |
 | POST | `/api/loops/:type/run-once` | 준비된 전체 카드 즉시 1회 실행(스케줄 무시, 같은 로그에 기록) |
 | POST | `/api/cards/:key/run` | 특정 카드 1건만 즉시 실행(`phase`=plan\|build; `rework:true`+선택 `memo` 시 기존 PR 리뷰 반영; **`resolveConflict:true`+`reworkOwner`/`reworkNumber` 시 그 PR 의 base 충돌을 `rebase`로 해소 후 `--force-with-lease` push**) |
+| POST | `/api/cards/:key/review-loop` | **승인까지 반복 루프 시작** — body `{owner,number,memo?,max?}`. `run-review-loop.sh` 를 detached 로 띄워 그 PR 의 '반영 → 재리뷰'를 승인 마커가 남을 때까지 반복(기본 상한 5, `REVIEW_LOOP_MAX` 주입). 카드당 1개만 실행(이미 실행 중이면 `ok:false`). `memo` 는 **시작 시 1회만** PR 코멘트로 남김 |
+| GET | `/api/cards/:key/review-loop` | 루프 상태 조회(대시보드 5초 폴링) — `{running, pid, owner, number, iter, max, step, stopping, startedAt}`. `.state/<KEY>.reviewloop.json` + 락 PID 생존 확인, 죽은 PID 의 스테일 락·상태파일은 정리 |
+| POST | `/api/cards/:key/review-loop/stop` | **루프 즉시 중지** — `.reviewloop.stop` 플래그를 먼저 쓴 뒤(다음 회차 차단 + 하위 종료를 '실패'로 오인 방지) 루프 프로세스 트리를 SIGTERM→6초 후 SIGKILL·락 정리. 이력에 `review-loop/stopped` 기록 |
 | POST | `/api/cards/:key/repos` | 기존 카드의 대상 repo 라벨(`repo_<name>`) 설정(프로젝트 repo 목록과 교집합만 반영) |
 | GET | `/api/cards/:key/prs` | **카드의 모든 PR(1:N) 조회** — 대상 repo 들에서 카드 키로 검색. PR별 `{repo,owner,number,url,title,state,branch,isDraft,author,isBot}` 반환. `isBot`=봇 계정(GH_TOKEN 사용자)이 만든 자동화 PR 여부, `botLogin` 도 함께 반환 |
 | POST | `/api/cards/:key/merge` | PR 병합(`gh pr merge --rebase --delete-branch`). body `{owner,number}` 지정 시 **그 PR 하나만**(사람 PR 포함), 없으면 **자동화(봇) PR 전체**를 병합. **자동화 PR 이 모두 병합되면**(열린 봇 PR 0) 카드 완료 전환 + `claude-pr` 라벨 제거 + **'완료 내역'을 최종 병합 PR 본문으로 갱신** + 처리 이력 `merge/merged` + **clone 디렉토리 삭제**. 응답 `merged`·`doneStatus`·`removed[]`·`prs[]` |
@@ -246,7 +269,7 @@ Jira 카드를 자동으로 탐지해 **Claude가 개발 → PR 생성 → 카�
 | GET | `/api/livereload` | 라이브 리로드용 SSE 스트림(프론트 파일 변경 시 reload 이벤트 푸시) |
 | GET | `/api/jira/meta` | 카드 등록용 메타(프로젝트 이슈 타입 + 에픽 목록) |
 | GET | `/api/jira/statuses` | 프로젝트 상태 파이프라인(이슈타입별 상태를 이름 기준 dedup) — 설정 '상태 → 단계 매핑' UI 용. `[{name,category}]` |
-| POST | `/api/cards/:key/stop` | 처리 중인 카드의 claude 작업 중지. **`body.phase`** 지정 시 그 단계만(`review`→`<KEY>.review.lock`, `plan`/`build`→`<KEY>.lock`), 없으면 살아있는 락 전부. 해당 PID 프로세스 트리를 SIGTERM→4초후 SIGKILL. 루프/다른 카드는 무영향. 이력에 `stopped` 기록 |
+| POST | `/api/cards/:key/stop` | 처리 중인 카드의 claude 작업 중지. **`body.phase`** 지정 시 그 단계만(`review`→`<KEY>.review.lock`, `plan`/`build`→`<KEY>.lock`), 없으면 살아있는 락 전부(**승인까지 루프 `<KEY>.reviewloop.lock` 포함** — 이때 `.reviewloop.stop` 플래그도 함께 써 다음 회차를 막는다). 해당 PID 프로세스 트리를 SIGTERM→4초후 SIGKILL. 루프/다른 카드는 무영향. 이력에 `stopped` 기록 |
 | POST | `/api/jira/issue` | Jira 카드 생성(요약·설명·이슈타입·상위키·라벨·할당·파일 첨부 — 이미지·HTML·문서 등 모든 타입) |
 | POST | `/api/ai/refine-description` | 러프 설명을 Claude 로 체계적 설명(배경/요구사항/AC)으로 변환 |
 | POST | `/api/jira/issue/:key/enhance` | **기존 카드(툴 생성 여부 무관) 본문 고도화 미리보기 생성.** 현재 Jira 본문을 읽어 Claude 로 "배경/목적·요구사항·완료조건" 구조로 보강한 마크다운을 반환(Jira 미반영, 이전 고도화 섹션은 입력에서 제외해 중복 방지). `claude -p` 실행 |
@@ -283,7 +306,8 @@ Jira 카드를 자동으로 탐지해 **Claude가 개발 → PR 생성 → 카�
   - **단계별 실행·로그·중지**: 펼친 패널 상단에 **`plan`·`build`·`review` 단계마다 [실행]·[로그]·[중지] 를 한 그룹으로** 묶어 표시한다. [실행]은 detect 없이 그 카드 1건만 해당 단계로 즉시 실행(`/api/cards/:key/run`), [로그]는 그 단계의 엔진 실행 로그, **[중지]는 그 단계가 실행 중일 때만 나타나 그 단계만 중지**(`/api/cards/:key/stop {phase}`). `/api/cards` 가 카드별 `procPhases`(현재 실행 중 단계 목록, 예: `["build","review"]`)를 내려주며, 그룹은 실행 중이면 강조된다. 비할당 카드는 review 그룹만 노출.
     - **review 버튼(수동 PR 리뷰)**: 그 카드의 열린 PR 을 즉시 리뷰합니다. Jira 본문·댓글 + PR 완료 내용(본문) + 코드(diff)를 분석해 PR 에 리뷰 코멘트를 남깁니다(`run-review.sh`). 수동 실행은 `FORCE_REVIEW=1` 로 **이미 승인 마커가 있어도 강제 재리뷰**하며(루프 자동 실행은 승인 시 스킵), claude-pr 라벨이 없어도 PR 만 있으면 리뷰합니다. 엔진 실행 로그 `review` 버튼으로 진행을 봅니다.
   - **리뷰 반영·병합·메모 — 모두 PR 별**: PR 이 여러 개일 수 있으므로 **'PR 목록'의 각 PR 항목 안에** `[리뷰 반영]`·`[반영+재리뷰]`·`[이 PR 병합]` 버튼과 **그 PR 전용 '리뷰 반영 메모' 입력**을 둔다(외부 공용 '리뷰 반영 메모'·일괄 'PR 병합' 영역은 제거). rework 버튼은 자동화(봇) PR·열림·담당자 카드일 때만. 누르면 그 PR 하나만(`reworkOwner`/`reworkNumber` → `REWORK_ONLY_OWNER`/`REWORK_ONLY_NUM`) `REWORK` 모드로 build 를 돌린다 — 백엔드가 그 PR repo 만 clone 대상으로 좁히고, 메모(그 PR 전용)는 **그 PR 에만** `gh pr comment` 로 남긴다. claude 는 **새 PR 을 만들지 않고** 그 PR 브랜치를 checkout → GitHub 리뷰 + Jira 코멘트 반영 → 같은 브랜치 push → `gh pr edit --body-file` 로 본문 갱신. `[이 PR 병합]` 은 그 PR 하나만 `POST /api/cards/:key/merge {owner,number}` 로 병합. 상태는 안 바꿈, 스케줄 루프는 rework 안 함. 이력 `rework`.
-    - **반영+재리뷰**: 각 PR 의 두 번째 버튼. 그 PR 리뷰 반영이 성공하면 이어서 리뷰어(`FORCE_REVIEW=1 run-review.sh`, `REVIEW_AFTER=1`)가 갱신된 PR 을 다시 리뷰(같은 프로세스 체인 → 반영 완료 후에만 재리뷰).
+    - **반영+재리뷰**: 각 PR 의 두 번째 버튼. 그 PR 리뷰 반영이 성공하면 이어서 리뷰어(`FORCE_REVIEW=1 run-review.sh`, `REVIEW_AFTER=1`)가 갱신된 PR 을 다시 리뷰(같은 프로세스 체인 → 반영 완료 후에만 재리뷰). **1회만** 돌기 때문에 결과가 '수정 필요'면 사람이 다시 눌러야 한다.
+    - **🔁 승인까지 루프**: '반영+재리뷰' 옆 버튼. **리뷰가 승인될 때까지 '반영 → 재리뷰'를 반복**한다(`run-review-loop.sh`, [4.3c](#43c-run-review-loopsh-승인까지-반복-루프--대시보드-승인까지-루프)). 확인 다이얼로그 후 시작하며, 실행 중에는 버튼 자리에 **`🔁 승인 루프 i/N회차 · 반영 중|리뷰 중` 배지와 `⏹ 루프 중지` 버튼**이 나타난다(5초 폴링, `GET /api/cards/:key/review-loop`). 회차마다 **Slack 으로 결과를 알리며, 미승인이면 `📝 리뷰 루프 i/N회차 — 수정 필요(미승인)`** 처럼 회차를 명시한다. 상한(기본 5회) 도달 시 사람 확인 요청 후 종료. **`⏹ 루프 중지`** 는 진행 중인 반영/리뷰까지 즉시 종료한다(`POST /api/cards/:key/review-loop/stop`). 루프는 카드당 1개만 돌며, 다른 PR 에서 실행 중이면 버튼이 비활성화된다. 메모를 적어두면 **루프 시작 시 1회만** PR 코멘트로 남는다.
   - **엔진 실행 로그**: 같은 줄의 "엔진 실행 로그 plan/build" 버튼으로 그 카드의 claude 상세 전사(도구 호출·메시지·결과)를 펼쳐 봅니다(3초마다 갱신). build 중 claude 가 무엇을 했는지 단계별로 확인할 수 있습니다.
   - **🌿 브랜치 영역**: 펼친 패널 Git·PR 영역 상단에 **이 카드 관련 브랜치를 따로 표시** — plan 이 만든 **타겟(작업) 브랜치**(카드 코멘트 `🌿 타겟 브랜치:` 마커에서 추출)와, ('PR 불러오기' 시) **각 PR 의 head 브랜치 목록**(repo·번호·상태, 타겟과 일치하면 '타겟 일치' 표시).
   - **PR 목록 (카드 1:PR N)**: 펼친 패널 Git·PR 영역의 "PR 불러오기"로 카드의 **모든 PR을 개별 행**으로 본다(`/api/cards/:key/prs`) — repo·번호·상태(OPEN/MERGED/DRAFT)·`head → base` 브랜치·작성자와 **자동화/사람 배지**(봇 계정 author 기준). **병합 가능 상태 배지**도 표시(`gh pr list --json mergeable,mergeStateStatus`): **`⚠️ base 충돌`**(mergeable=CONFLICTING — base/타겟 브랜치가 갱신돼 충돌), `⟳ base 갱신됨`(mergeStateStatus=BEHIND), `✓ 병합 가능`(MERGEABLE·CLEAN), `병합상태 확인중`(UNKNOWN — GitHub 계산 중). 각 PR에 **"이 PR 병합"(그 PR만)·"이 PR 리뷰"(그 PR만)·"열기"** 버튼. **`⚠️ base 충돌`(CONFLICTING) 인 PR에는 "⚠️ 충돌 해소 후 재푸시" 버튼**이 추가로 노출돼(담당자·열림 PR), 누르면 `resolveConflict` 모드로 그 PR 브랜치를 `git rebase origin/<base>` 로 충돌 해소 → PR 전 검증 → `--force-with-lease` push 한다(force-push 경고 확인 다이얼로그 후 실행). 일괄 "PR 병합"·자동 완료·review 루프는 **자동화 PR만** 대상이라, 다른 사람이 같은 카드로 올린 PR이 섞여도 자동으로 병합/리뷰되지 않는다(원하면 개별 버튼으로 처리).
@@ -338,6 +362,7 @@ Jira 카드를 자동으로 탐지해 **Claude가 개발 → PR 생성 → 카�
 | review 주기(초) | `REVIEW_LOOP_INTERVAL` (설정 `reviewIntervalSeconds`) | `3600` | review 루프 주기(별도) |
 | PR 승인 마커 | (고정) `CLAUDE-REVIEW-APPROVED` | — | review 루프가 PR 승인 표시로 남기는 고유 코멘트 텍스트. 존재하면 이후 리뷰 스킵(lib `REVIEW_APPROVED_MARKER`) |
 | 자동 리뷰 반영 상한 | `MAX_AUTO_REWORK` | `3` | 미승인 PR 의 자동 리뷰 반영(rework) 최대 반복 횟수(run-review.sh). 미승인 리뷰가 이 수 이상 쌓이면 자동 반영·리뷰를 멈추고 사람 확인 요청(리뷰 스택 상한) |
+| 승인까지 루프 상한 | `REVIEW_LOOP_MAX` (설정 `reviewLoopMax`) | `5` | 대시보드 '🔁 승인까지 루프'(run-review-loop.sh)의 최대 반복 회차. 초과 시 사람 확인 요청 후 종료(요청 body `max` 로 1~20 범위 재정의 가능) |
 | 동시 처리 상한 | `MAX_PARALLEL` | `5` | 한 주기에 동시에 처리하는 카드 수 |
 | 대시보드 주소 | `DASHBOARD_URL` | (대시보드가 주입) | 루프가 REST 탐지(`/api/detect`)를 호출할 백엔드 주소. 비면 claude 탐지 사용 |
 | 라이브 리로드 끄기 | `DASHBOARD_NO_LIVERELOAD` | (없음) | `1` 이면 대시보드 라이브 리로드 비활성화 |
@@ -463,6 +488,7 @@ loop-work/                     # (= 저장소 루트)
 ├─ LOOP-GUIDE.md               # 루프 사용 가이드
 ├─ run-jira-agent.sh          # 카드 1개 처리 (plan/build)
 ├─ run-review.sh               # 카드의 build PR 자동 리뷰 (review)
+├─ run-review-loop.sh          # 한 PR 을 승인될 때까지 '반영→재리뷰' 반복 (대시보드 '승인까지 루프')
 ├─ detect-cards.sh             # 대상 카드 탐지 (plan/build/review)
 ├─ lib-engine.sh               # LLM 엔진 추상화(claude/codex/gemini) — 위 3개 스크립트가 source
 ├─ loop-plan.sh                # plan 루프

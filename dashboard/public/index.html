@@ -145,6 +145,7 @@ const stageBadge = {
   "failed": ["실패", "bg-rose-500/20 text-rose-300 border-rose-500/40"],
   "done": ["완료", "bg-emerald-500/20 text-emerald-300 border-emerald-500/40"],
 };
+const loopStepLabel = { starting: "준비 중", rework: "반영 중", review: "리뷰 중" };   // 리뷰 승인 루프 진행 단계
 const resultBadge = {
   "success": ["성공", "bg-emerald-500/20 text-emerald-300 border-emerald-500/40"],
   "skip": ["스킵(답변대기)", "bg-slate-500/20 text-slate-300 border-slate-500/40"],
@@ -349,6 +350,7 @@ function ProjectCard({ proj, onDeleted, flash, jumpTo }) {
   const [reviews, setReviews] = useState(null);   // { key, loading, prs:[...] } — PR 리뷰 내용
   const [prs, setPrs] = useState(null);           // { key, loading, list:[...], botLogin } — 카드 1:N PR 목록
   const [prExpanded, setPrExpanded] = useState(""); // PR 목록에서 펼쳐 리뷰/코멘트 보는 PR (owner#number)
+  const [reviewLoop, setReviewLoop] = useState(null); // 펼친 카드의 리뷰 승인 루프 상태 { key, ...loop }
 
   const credSet = (k) => creds[k] === true;
   const openRepoEnv = async (name) => {
@@ -388,6 +390,13 @@ function ProjectCard({ proj, onDeleted, flash, jumpTo }) {
     const t = setInterval(async () => { const r = await api.get(withP(`/api/claude-log/${key}/${phase}?lines=600`)); if (r.ok) setClaudeLog((p) => (p && p.key === key && p.phase === phase) ? { ...p, text: r.log } : p); }, 3000);
     return () => clearInterval(t);
   }, [claudeLog && claudeLog.key, claudeLog && claudeLog.phase]);
+  // 펼친 카드의 리뷰 승인 루프 상태 — 5초 폴링(회차·단계 진행과 종료를 버튼 영역에 반영)
+  useEffect(() => {
+    if (!expandedKey) { setReviewLoop(null); return; }
+    loadReviewLoop(expandedKey);
+    const t = setInterval(() => loadReviewLoop(expandedKey), 5000);
+    return () => clearInterval(t);
+  }, [expandedKey]);
 
   const saveConfig = async () => { const r = await api.post("/api/projects", { ...config, id: PID }); if (r.ok) { setConfig(r.project); flash("설정 저장됨"); } };
   const saveCreds = async () => {
@@ -471,6 +480,23 @@ function ProjectCard({ proj, onDeleted, flash, jumpTo }) {
     const r = await api.post(`/api/cards/${key}/run`, { phase: "build", rework: true, reviewAfter: !!thenReview, memo: reworkMemos[prId] || "", reworkOwner: pr.owner, reworkNumber: pr.number, project: PID });
     flash(r.ok ? `${pr.repo} #${pr.number} 리뷰 반영${thenReview ? " → 재리뷰" : ""} 시작(로그 확인)` : (r.message || "실패"));
     if (r.ok) { setReworkMemos((m) => ({ ...m, [prId]: "" })); showClaudeLog(key, "build"); loadPrs(key); }
+  };
+  // 승인까지 반복: 반영 → 재리뷰 를 승인 마커가 남을 때까지 루프(상한 도달·중지 시 종료).
+  const startReviewLoop = async (key, pr) => {
+    const prId = `${pr.owner}#${pr.number}`;
+    if (!window.confirm(`${pr.repo} #${pr.number} 을(를) 리뷰 승인될 때까지 '반영 → 재리뷰' 반복할까요?\n\n· 최대 5회 반복하며 회차마다 Slack 으로 결과를 알립니다.\n· 중간에 '루프 중지' 버튼으로 즉시 멈출 수 있습니다.`)) return;
+    const r = await api.post(`/api/cards/${key}/review-loop`, { owner: pr.owner, number: pr.number, memo: reworkMemos[prId] || "", project: PID });
+    flash(r.ok ? `${pr.repo} #${pr.number} 리뷰 승인 루프 시작 (최대 ${r.max || 5}회)` : (r.message || "실패"));
+    if (r.ok) { setReworkMemos((m) => ({ ...m, [prId]: "" })); showClaudeLog(key, "build"); loadReviewLoop(key); }
+  };
+  const stopReviewLoop = async (key) => {
+    const r = await api.post(`/api/cards/${key}/review-loop/stop`, { project: PID });
+    flash(r.ok ? r.message : (r.message || "중지 실패"));
+    loadReviewLoop(key);
+  };
+  const loadReviewLoop = async (key) => {
+    const r = await api.get(withP(`/api/cards/${key}/review-loop`));
+    setReviewLoop(r.ok ? { key, ...(r.loop || {}) } : { key, running: false });
   };
   const setCardRepos = async (key, repos) => {
     // 낙관적 갱신: Jira JQL 검색 인덱싱 지연으로 재조회가 늦으므로 로컬 라벨을 즉시 반영
@@ -994,13 +1020,29 @@ function ProjectCard({ proj, onDeleted, flash, jumpTo }) {
                                                 <button onClick={() => reviewOnePr(c.key, pr)} className="text-[11px] px-2 py-0.5 rounded border border-violet-500/40 text-violet-300 hover:bg-violet-500/10 transition">이 PR 리뷰 실행</button>
                                                 {c.assignedToMe && pr.isBot && pr.state === "OPEN" && <button onClick={() => reworkOnePr(c.key, pr, false)} className="text-[11px] px-2 py-0.5 rounded border border-cyan-500/40 text-cyan-300 hover:bg-cyan-500/10 transition">리뷰 반영</button>}
                                                 {c.assignedToMe && pr.isBot && pr.state === "OPEN" && <button onClick={() => reworkOnePr(c.key, pr, true)} className="text-[11px] px-2 py-0.5 rounded border border-cyan-500/40 text-cyan-300 hover:bg-cyan-500/10 transition">반영+재리뷰</button>}
+                                                {/* 승인까지 루프: 미승인이면 '반영 → 재리뷰' 를 승인 마커가 남을 때까지 반복(상한 5회, 회차마다 Slack 알림) */}
+                                                {c.assignedToMe && pr.isBot && pr.state === "OPEN" && (() => {
+                                                  const lp = reviewLoop && reviewLoop.key === c.key && reviewLoop.running ? reviewLoop : null;
+                                                  const mine = lp && lp.owner === pr.owner && String(lp.number) === String(pr.number);
+                                                  if (mine) return (
+                                                    <>
+                                                      <span className="text-[11px] px-2 py-0.5 rounded border border-cyan-500/50 bg-cyan-500/10 text-cyan-200 animate-pulse" title="승인 마커가 남을 때까지 '반영 → 재리뷰' 를 반복합니다.">
+                                                        🔁 승인 루프 {lp.iter || 0}/{lp.max || 5}회차 · {loopStepLabel[lp.step] || lp.step || ""}{lp.stopping ? " (중지 중…)" : ""}
+                                                      </span>
+                                                      <button onClick={() => stopReviewLoop(c.key)} className="text-[11px] px-2 py-0.5 rounded border border-rose-500/50 text-rose-300 hover:bg-rose-500/10 transition" title="진행 중인 반영/리뷰까지 즉시 종료하고 루프를 멈춥니다.">⏹ 루프 중지</button>
+                                                    </>
+                                                  );
+                                                  return <button onClick={() => startReviewLoop(c.key, pr)} disabled={!!lp}
+                                                    title={lp ? `이 카드에서 ${lp.owner}#${lp.number} 루프가 실행 중입니다.` : "리뷰가 승인될 때까지 '반영 → 재리뷰' 를 반복합니다(최대 5회). 회차마다 Slack 알림."}
+                                                    className={`text-[11px] px-2 py-0.5 rounded border transition ${lp ? "border-slate-700 text-slate-600 cursor-not-allowed" : "border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/10"}`}>🔁 승인까지 루프</button>;
+                                                })()}
                                                 {c.assignedToMe && pr.state === "OPEN" && pr.mergeable === "CONFLICTING" && <button onClick={() => resolveConflictPr(c.key, pr)} className="text-[11px] px-2 py-0.5 rounded border border-rose-500/50 text-rose-300 hover:bg-rose-500/10 transition" title="base 충돌을 rebase 로 해소하고 force-push 로 이 PR 을 갱신합니다(검증 후 푸시).">⚠️ 충돌 해소 후 재푸시</button>}
                                                 {c.assignedToMe && pr.state === "OPEN" && <button onClick={() => mergeOnePr(c.key, pr)} className="text-[11px] px-2 py-0.5 rounded border border-teal-500/40 text-teal-300 hover:bg-teal-500/10 transition">이 PR 병합</button>}
                                                 <a href={pr.url} target="_blank" rel="noreferrer" className="text-[11px] px-2 py-0.5 rounded border border-slate-600 text-slate-300 hover:bg-slate-600/20 transition">열기</a>
                                               </div>
                                               {c.assignedToMe && pr.isBot && pr.state === "OPEN" && (
                                                 <textarea value={reworkMemos[`${pr.owner}#${pr.number}`] || ""} onChange={(e) => { const id = `${pr.owner}#${pr.number}`, v = e.target.value; setReworkMemos((m) => ({ ...m, [id]: v })); }} spellCheck={false}
-                                                  placeholder="리뷰 반영 메모 (선택) — 이 PR 코멘트로 남기고 반영. 비우면 GitHub·Jira 코멘트만 보고 반영."
+                                                  placeholder="리뷰 반영 메모 (선택) — 이 PR 코멘트로 남기고 반영. 비우면 GitHub·Jira 코멘트만 보고 반영. (승인까지 루프는 시작 시 1회만 코멘트)"
                                                   className="w-full h-14 mt-1 bg-slate-800 border border-slate-600 rounded px-2 py-1 text-xs focus:outline-none focus:border-cyan-400" />
                                               )}
                                               {prExpanded === `${pr.owner}#${pr.number}` && (

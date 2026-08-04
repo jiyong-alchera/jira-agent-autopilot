@@ -228,6 +228,40 @@ function runCard(key, phase, stamp, projectId, reposLines, rework, reviewAfter, 
   proc.unref();
   return { ok: true, pid: proc.pid };
 }
+// 리뷰 승인까지 반복(rework→재리뷰) 루프 — run-review-loop.sh 를 detached 로 실행.
+// 진행 상태·중지는 <cloneBase>/.state/<KEY>.reviewloop.{lock,json,stop} 로 주고받는다.
+function runReviewLoop(key, stamp, projectId, reposLines, owner, number, max) {
+  const script = path.join(SCRIPTS_DIR, "run-review-loop.sh");
+  if (!fs.existsSync(script)) return { ok: false, message: `스크립트를 찾을 수 없습니다: ${script}` };
+  const logPath = path.join(SCRIPTS_DIR, "loop-review.log");
+  let fd;
+  try {
+    fd = fs.openSync(logPath, "a");
+    fs.writeSync(fd, `[${stamp}] (승인까지 루프) REVIEW-LOOP: ${key} ${owner}#${number} [${projectId}]\n`);
+  } catch (e) { return { ok: false, message: String(e.message || e) }; }
+  const env = scriptEnv(projectId);
+  if (reposLines != null) env.CARD_REPOS = reposLines;
+  if (max) env.REVIEW_LOOP_MAX = String(max);
+  const proc = spawn("bash", [script, key, String(owner), String(number)], { cwd: SCRIPTS_DIR, env, detached: true, stdio: ["ignore", fd, fd] });
+  try { fs.closeSync(fd); } catch {}
+  proc.unref();
+  return { ok: true, pid: proc.pid };
+}
+const stateDirOf = (cfg) => path.join(cfg.cloneBase || path.join(cfg.workDir || SCRIPTS_DIR, "repos"), ".state");
+// 리뷰 승인 루프의 현재 상태(없으면 running:false). 죽은 PID 의 스테일 락은 정리한다.
+function reviewLoopStatus(cfg, key) {
+  const stateDir = stateDirOf(cfg);
+  const lockDir = path.join(stateDir, `${key}.reviewloop.lock`);
+  if (!fs.existsSync(lockDir)) return { running: false };
+  let pid = null; try { pid = parseInt(fs.readFileSync(`${lockDir}.pid`, "utf8").trim(), 10); } catch {}
+  if (!pid || !isAlive(pid)) {   // 스테일 락 정리
+    try { fs.rmSync(lockDir, { recursive: true, force: true }); } catch {}
+    for (const f of [`${lockDir}.pid`, `${lockDir}.phase`, path.join(stateDir, `${key}.reviewloop.json`), path.join(stateDir, `${key}.reviewloop.stop`)]) { try { fs.unlinkSync(f); } catch {} }
+    return { running: false };
+  }
+  let st = {}; try { st = JSON.parse(fs.readFileSync(path.join(stateDir, `${key}.reviewloop.json`), "utf8")); } catch {}
+  return { running: true, pid, stopping: fs.existsSync(path.join(stateDir, `${key}.reviewloop.stop`)), ...st };
+}
 function stopLoop(type) {
   const pid = readPid(type);
   if (!isAlive(pid)) { clearPid(type); loops[type] = null; return { ok: false, message: `${type} 루프가 실행 중이 아닙니다.` }; }
@@ -513,7 +547,9 @@ app.post("/api/cards/:key/stop", (req, res) => {
     const { cfg } = resolveProject(req);
     const stateDir = path.join(cfg.cloneBase || path.join(cfg.workDir || SCRIPTS_DIR, "repos"), ".state");
     const reqPhase = (req.body && req.body.phase) || req.query.phase || "";
-    const suffixes = reqPhase === "review" ? [".review.lock"] : (reqPhase === "plan" || reqPhase === "build") ? [".lock"] : [".lock", ".review.lock"];
+    const suffixes = reqPhase === "review" ? [".review.lock"] : (reqPhase === "plan" || reqPhase === "build") ? [".lock"] : [".lock", ".review.lock", ".reviewloop.lock"];
+    // 리뷰 승인 루프도 함께 멈출 때는 중지 플래그를 먼저 써 다음 회차를 차단(하위 종료를 실패로 오인하지 않도록)
+    if (suffixes.includes(".reviewloop.lock")) { try { fs.writeFileSync(path.join(stateDir, `${key}.reviewloop.stop`), new Date().toISOString()); } catch {} }
     const alive = [];
     for (const suffix of suffixes) {
       const lockDir = path.join(stateDir, `${key}${suffix}`);
@@ -536,6 +572,65 @@ app.post("/api/cards/:key/stop", (req, res) => {
       try { fs.appendFileSync(HISTORY_PATH, JSON.stringify({ ts: new Date().toISOString().replace(/\.\d{3}Z$/, "Z"), project: cfg.id || "", key, phase: phase || "run", result: "stopped", pr: "", branch: "" }) + "\n"); } catch {}
     }
     res.json({ ok: true, killed, message: `중지 요청됨 (${alive.map((a) => a.phase || "run").join(", ")} · pid ${alive.map((a) => a.pid).join(", ")})` });
+  } catch (e) { fail(res, e); }
+});
+
+// 리뷰 승인까지 반복 루프 시작 — body.{owner,number,memo,max}. 한 카드당 1개만 실행된다.
+app.post("/api/cards/:key/review-loop", async (req, res) => {
+  const key = req.params.key;
+  const b = req.body || {};
+  if (!/^[A-Z][A-Z0-9]+-[0-9]+$/.test(key)) return res.status(400).json({ ok: false, message: "이슈 키 형식 오류" });
+  if (!b.owner || b.number == null) return res.status(400).json({ ok: false, message: "owner·number 가 필요합니다" });
+  try {
+    const { id, cfg, cred } = resolveProject(req);
+    const cur = reviewLoopStatus(cfg, key);
+    if (cur.running) return res.json({ ok: false, message: `이미 리뷰 승인 루프가 실행 중입니다 (${cur.owner || ""}#${cur.number || ""} · ${cur.iter || 0}회차)` });
+    const owner = String(b.owner), number = String(b.number);
+    let reposLines = null;
+    try {
+      let repos = normalizeRepos(cfg).filter((r) => ownerRepo(r.url) === owner);
+      if (!repos.length) repos = normalizeRepos(cfg);
+      reposLines = reposToLines(cfg, repos, resolveCardEnv(key, cfg));
+    } catch { reposLines = null; }
+    // 메모는 루프 시작 전 1회만 PR 코멘트로 남긴다(엔진이 코멘트를 읽어 반영).
+    if (String(b.memo || "").trim()) {
+      const r = await gh(["pr", "comment", number, "--repo", owner, "--body", `[리뷰 반영 요청]\n${b.memo}`], cred);
+      if (!r.ok) return res.json({ ok: false, message: `PR 코멘트 실패: ${(r.stderr || "").slice(0, 160)}` });
+    }
+    const max = Math.min(Math.max(parseInt(b.max || cfg.reviewLoopMax || 5, 10) || 5, 1), 20);
+    res.json({ ...runReviewLoop(key, new Date().toISOString(), id, reposLines, owner, number, max), max });
+  } catch (e) { fail(res, e); }
+});
+
+// 리뷰 승인 루프 상태(대시보드 폴링)
+app.get("/api/cards/:key/review-loop", (req, res) => {
+  const key = req.params.key;
+  if (!/^[A-Z][A-Z0-9]+-[0-9]+$/.test(key)) return res.status(400).json({ ok: false, message: "이슈 키 형식 오류" });
+  try { const { cfg } = resolveProject(req); res.json({ ok: true, loop: reviewLoopStatus(cfg, key) }); }
+  catch (e) { fail(res, e); }
+});
+
+// 리뷰 승인 루프 즉시 중지 — 중지 플래그(다음 회차 차단) + 프로세스 트리 종료(진행 중 작업도 중단).
+app.post("/api/cards/:key/review-loop/stop", (req, res) => {
+  const key = req.params.key;
+  if (!/^[A-Z][A-Z0-9]+-[0-9]+$/.test(key)) return res.status(400).json({ ok: false, message: "이슈 키 형식 오류" });
+  try {
+    const { cfg } = resolveProject(req);
+    const st = reviewLoopStatus(cfg, key);
+    if (!st.running) return res.json({ ok: false, message: "실행 중인 리뷰 승인 루프가 없습니다." });
+    const stateDir = stateDirOf(cfg);
+    // 플래그를 먼저 써야 하위가 죽어도 루프 스크립트가 '실패'가 아닌 '중지'로 처리한다.
+    try { fs.writeFileSync(path.join(stateDir, `${key}.reviewloop.stop`), new Date().toISOString()); } catch {}
+    const tree = [...descendantPids(st.pid), st.pid];   // 자식(engine·하위 스크립트) 먼저, 루프 bash 마지막
+    for (const p of tree) { try { process.kill(p, "SIGTERM"); } catch {} }
+    setTimeout(() => {   // SIGKILL 은 trap 미실행 → 락·상태 파일을 직접 정리
+      for (const p of [st.pid, ...descendantPids(st.pid)].filter(isAlive)) { try { process.kill(p, "SIGKILL"); } catch {} }
+      const lockDir = path.join(stateDir, `${key}.reviewloop.lock`);
+      try { fs.rmSync(lockDir, { recursive: true, force: true }); } catch {}
+      for (const f of [`${lockDir}.pid`, `${lockDir}.phase`, path.join(stateDir, `${key}.reviewloop.json`), path.join(stateDir, `${key}.reviewloop.stop`)]) { try { fs.unlinkSync(f); } catch {} }
+    }, 6000);
+    try { fs.appendFileSync(HISTORY_PATH, JSON.stringify({ ts: new Date().toISOString().replace(/\.\d{3}Z$/, "Z"), project: cfg.id || "", key, phase: "review-loop", result: "stopped", pr: st.url || "", branch: "" }) + "\n"); } catch {}
+    res.json({ ok: true, killed: tree.length, message: `리뷰 승인 루프 중지 요청됨 (${st.iter || 0}회차 · pid ${st.pid})` });
   } catch (e) { fail(res, e); }
 });
 
@@ -781,11 +876,12 @@ async function buildProjectCards(cfg, cred) {
   const data = await jiraSearch(`${triggerClause(cfg)}${proj} ORDER BY created DESC`, cfg, cred);
   const myId = await myAccountId(cfg, cred);
   const stateDir = path.join(cfg.cloneBase || path.join(cfg.workDir || SCRIPTS_DIR, "repos"), ".state");
-  // 처리 중 여부: 카드별 락 + '살아있는' PID 확인. build/plan(<KEY>.lock)·review(<KEY>.review.lock) 둘 다 인식.
+  // 처리 중 여부: 카드별 락 + '살아있는' PID 확인. build/plan(<KEY>.lock)·review(<KEY>.review.lock)·
+  // 리뷰 승인 루프(<KEY>.reviewloop.lock) 모두 인식.
   // 여러 단계가 동시에 돌 수 있으므로(예: build+review) 활성 단계 목록을 반환. 스테일 락(죽은 PID)은 제외.
   const procPhases = (key) => {
     const phases = [];
-    for (const suffix of [".lock", ".review.lock"]) {
+    for (const suffix of [".lock", ".review.lock", ".reviewloop.lock"]) {
       const lock = path.join(stateDir, `${key}${suffix}`);
       if (!fs.existsSync(lock)) continue;
       let pid = null; try { pid = parseInt(fs.readFileSync(`${lock}.pid`, "utf8").trim(), 10); } catch {}
