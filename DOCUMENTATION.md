@@ -371,6 +371,7 @@ Jira 카드를 자동으로 탐지해 **Claude가 개발 → PR 생성 → 카�
 | review 주기(초) | `REVIEW_LOOP_INTERVAL` (설정 `reviewIntervalSeconds`) | `3600` | review 루프 주기(별도) |
 | PR 승인 마커 | (고정) `CLAUDE-REVIEW-APPROVED` | — | review 루프가 PR 승인 표시로 남기는 고유 코멘트 텍스트. 존재하면 이후 리뷰 스킵(lib `REVIEW_APPROVED_MARKER`) |
 | 자동 리뷰 반영 상한 | `MAX_AUTO_REWORK` | `3` | 미승인 PR 의 자동 리뷰 반영(rework) 최대 반복 횟수(run-review.sh). 미승인 리뷰가 이 수 이상 쌓이면 자동 반영·리뷰를 멈추고 사람 확인 요청(리뷰 스택 상한) |
+| Atlassian cloudId | `JIRA_CLOUD_ID` (설정 `jiraCloudId`, 없으면 `jiraSite`) | (사이트 호스트명) | plan/build/rework/review 프롬프트에 "cloudId 는 이것이니 `getAccessibleAtlassianResources` 로 다시 찾지 말라"로 주입. 세션마다 반복되던 cloudId 탐색 왕복 제거(사이트 호스트명이 cloudId 자리에 그대로 동작, UUID 를 설정하면 그것이 우선) |
 | 전체 리뷰 강제 | `REVIEW_FULL` | (없음) | `1` 이면 증분 재리뷰를 끄고 **항상 전체 diff·전체 코멘트**를 읽는다(run-review.sh). 기본은 직전 리뷰 이후만 읽는 증분 모드 |
 | 승인까지 루프 상한 | `REVIEW_LOOP_MAX` (설정 `reviewLoopMax`) | `5` | 대시보드 '🔁 승인까지 루프'(run-review-loop.sh)의 최대 반복 회차. 초과 시 사람 확인 요청 후 종료(요청 body `max` 로 1~20 범위 재정의 가능) |
 | 동시 처리 상한 | `MAX_PARALLEL` | `5` | 한 주기에 동시에 처리하는 카드 수 |

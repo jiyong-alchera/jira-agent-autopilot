@@ -170,6 +170,9 @@ function scriptEnv(id) {
   if (cred.slackWebhookUrl) env.SLACK_WEBHOOK_URL = cred.slackWebhookUrl;
   // 완료 내역을 설명 ADF 에 직접 append(이미지 보존)하기 위한 Jira REST 자격증명 — 단건 즉시 실행 경로에도 주입
   env.JIRA_SITE = cfg.jiraSite || "";
+  // Atlassian MCP 의 cloudId — 프롬프트에 미리 박아 getAccessibleAtlassianResources 왕복을 없앤다.
+  // UUID 를 설정했으면 그것을, 없으면 사이트 호스트명(그대로 cloudId 자리에 동작)을 쓴다.
+  env.JIRA_CLOUD_ID = cfg.jiraCloudId || cfg.jiraSite || "";
   if (cred.atlassianEmail) env.ATLASSIAN_EMAIL = cred.atlassianEmail;
   if (cred.atlassianToken) env.ATLASSIAN_TOKEN = cred.atlassianToken;
   return env;

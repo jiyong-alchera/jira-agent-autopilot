@@ -32,6 +32,14 @@ CARD_REPOS="${CARD_REPOS:-}"
 APPROVED_MARKER="CLAUDE-REVIEW-APPROVED"   # lib.js REVIEW_APPROVED_MARKER 와 동일해야 함
 MAX_AUTO_REWORK="${MAX_AUTO_REWORK:-3}"     # 자동 리뷰 반영(rework) 최대 반복 — 초과 시 자동 반영/리뷰 중단(사람 확인)
 
+# Atlassian MCP 는 다른 호출 전에 cloudId 를 얻으려 'getAccessibleAtlassianResources' 를 매번 부른다.
+# 사이트 호스트명이 cloudId 자리에 그대로 동작하므로(설정에 UUID 가 있으면 그것을 우선) 미리 알려 왕복을 없앤다.
+JIRA_CTX=""
+if [[ -n "${JIRA_CLOUD_ID:-}" ]]; then
+  JIRA_CTX="
+[Atlassian MCP] cloudId 는 '${JIRA_CLOUD_ID}' 입니다. 이 값을 그대로 쓰고 'getAccessibleAtlassianResources' 로 다시 찾지 마세요."
+fi
+
 ISSUE_KEY="${1:-}"
 if [[ -z "${ISSUE_KEY}" ]]; then echo "Usage: $0 <JIRA-ISSUE-KEY>" >&2; exit 1; fi
 
@@ -209,7 +217,7 @@ ${LAST_BODY}
 
     PROMPT="당신은 이 GitHub Pull Request 의 '코드 리뷰어'입니다(리뷰 대상 PR 은 자동화가 올린 것이라 직접 approve 는 불가하니 아래 규칙을 따르세요).
 
-대상: repo=${OR}, PR 번호=${N}, PR URL=${PR_URL}, 연동 Jira 이슈=${ISSUE_KEY}
+대상: repo=${OR}, PR 번호=${N}, PR URL=${PR_URL}, 연동 Jira 이슈=${ISSUE_KEY}${JIRA_CTX}
 
 [매우 중요] 헤드리스 1회 실행입니다. 백그라운드로 미루지 말고 이 턴 안에서 리뷰와 코멘트 작성까지 동기적으로 끝내세요.
 

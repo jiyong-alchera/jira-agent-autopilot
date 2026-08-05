@@ -90,6 +90,14 @@ TEST_DESC="${TEST_CMD:-자동 감지(package.json scripts.test, pytest/pytest.in
 BUILD_DESC="${BUILD_CMD:-자동 감지(npm run build, tsc, go build, make 등 빌드/컴파일 수단)}"
 
 # ===== PR 본문 작성 지시(생성·갱신 공통) =====
+# Atlassian MCP 는 다른 호출 전에 cloudId 를 얻으려 'getAccessibleAtlassianResources' 를 매번 부른다.
+# 사이트 호스트명이 cloudId 자리에 그대로 동작하므로(설정에 UUID 가 있으면 그것을 우선) 미리 알려 왕복을 없앤다.
+JIRA_CTX=""
+if [[ -n "${JIRA_CLOUD_ID:-}" ]]; then
+  JIRA_CTX="
+
+[Atlassian MCP] cloudId 는 '${JIRA_CLOUD_ID}' 입니다. 이 값을 그대로 쓰고 'getAccessibleAtlassianResources' 로 다시 찾지 마세요."
+fi
 if [[ -n "${JIRA_SITE:-}" ]]; then
   JIRA_REF_LINE="- Jira: https://${JIRA_SITE}/browse/${ISSUE_KEY} (이슈 키 ${ISSUE_KEY})"
 else
@@ -359,7 +367,7 @@ PR 을 하나도 생성하지 못했다면 절대 완료로 간주하지 말고,
 fi
 
 # 첨부(이미지·문서) 인식 지시를 모든 단계(plan/build/rework) 프롬프트에 공통 추가
-PROMPT="${PROMPT}${IMAGE_INSTR}${DOC_INSTR}"
+PROMPT="${PROMPT}${IMAGE_INSTR}${DOC_INSTR}${JIRA_CTX}"
 
 # ===== 실행 + 실패 재시도/백오프 처리 =====
 # claude 가 0이 아닌 코드로 종료하면 실패로 보고 카드별 실패 카운터를 증가시킨다.
