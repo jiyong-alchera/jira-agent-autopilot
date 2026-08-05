@@ -199,7 +199,14 @@ for idx in "${!R_URL[@]}"; do
   rd="${CLONE_BASE}/${rn}-${ISSUE_KEY}"
   if [[ ! -d "${rd}/.git" ]]; then
     echo ">> [${ISSUE_KEY}] clone ${ru} -> ${rd}"
-    git clone "${ru}" "${rd}"
+    # 부분 클론(blob 지연 가져오기): 히스토리의 모든 파일 내용을 받지 않아 디스크·시간을 크게 줄인다.
+    # 필요한 blob 은 checkout/diff/rebase 시점에 그때 가져오므로 동작에는 영향이 없다.
+    # (--depth 는 rebase 가 깨지므로 쓰지 않는다.) 미지원 서버·구버전 git 이면 전체 클론으로 폴백.
+    if ! git clone --filter=blob:none "${ru}" "${rd}"; then
+      echo ">> [${ISSUE_KEY}] 부분 클론 실패 → 전체 클론으로 재시도" >&2
+      rm -rf "${rd}"
+      git clone "${ru}" "${rd}"
+    fi
   fi
   echo ">> [${ISSUE_KEY}] (${rn}) fetch & 클린업 & checkout ${rb}"
   git -C "${rd}" fetch origin --prune

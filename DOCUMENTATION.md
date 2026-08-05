@@ -150,7 +150,7 @@ Jira 카드를 자동으로 탐지해 **Claude가 개발 → PR 생성 → 카�
 처리 순서:
 1. 설정을 환경변수에서 읽음(없으면 기본값). `REPO_URL`은 필수 — 없으면 에러 종료.
 2. `REPO_NAME`을 `REPO_URL`에서 자동 도출. 작업 디렉토리는 `CLONE_BASE/<REPO_NAME>-<ISSUE_KEY>`.
-3. 디렉토리가 없으면 `git clone`, 있으면 재사용.
+3. 디렉토리가 없으면 `git clone`, 있으면 재사용. clone 은 **부분 클론(`--filter=blob:none`, blob 지연 가져오기)** — 히스토리의 모든 파일 내용을 받지 않고 필요한 blob 만 checkout/diff/rebase 시점에 가져온다. 실측(kyb-api): **전체 61MB·4초 → 부분 14MB·2초**(`.git` 50MB→3.9MB). `rebase`·`diff`·`log` 정상 동작을 확인했으며, `--depth`(얕은 클론)는 rebase 가 깨져 쓰지 않는다. 서버 미지원·구버전 git 이면 **전체 클론으로 자동 폴백**.
 4. `fetch --prune` 후 **클린업**(`git reset --hard` + `git clean -fd`) → `BASE_BRANCH` checkout → `git reset --hard origin/<BASE_BRANCH>` 로 정렬. dir 재사용 시 이전 잔여 변경/브랜치로 checkout 이 막히는 문제를 방지(`git pull` 대신 결정적 정렬).
 5. `ENV_SRC`(기본 `work.env`)를 clone 디렉토리로 복사하고, **clone 의 `.git/info/exclude` 에 env 파일명과 `.env` 를 자동 등록**해 추적/커밋을 구조적으로 차단(프롬프트 의존 제거, repo 에 커밋되지 않는 로컬 전용 ignore).
 6. clone 디렉토리로 `cd` 후 **선택된 엔진**으로 실행(`lib-engine.sh` 의 `engine_exec`). `ENGINE`/`MODEL` env 에 따라 `claude -p`(기본, stream-json 렌더 로그)·`codex exec`·`gemini -p` 로 분기하며, 비-Claude 는 평문 로그로 폴백한다.
