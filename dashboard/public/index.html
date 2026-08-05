@@ -1109,7 +1109,27 @@ function App() {
   const flash = (m) => { setToast(m); setTimeout(() => setToast(""), 2500); };
 
   const loadProjects = async () => { const r = await api.get("/api/projects"); setProjects(r.projects || []); };
-  const loadHistory = async () => { const r = await api.get("/api/history"); if (r.ok) setHistory(r.entries || []); };
+  const histStamp = React.useRef("");        // 마지막으로 받은 이력 파일의 스탬프(size:mtime)
+  const histTitleRetry = React.useRef(0);    // 제목 보강 재시도 잔여 횟수(무한 재요청 방지)
+  const applyHistory = (entries) => {
+    setHistory(entries);
+    if (entries.some((h) => !h.summary)) histTitleRetry.current = Math.max(0, histTitleRetry.current - 1);
+    else histTitleRetry.current = 0;
+  };
+  const loadHistory = async () => {
+    const r = await api.get("/api/history");
+    if (r.ok) { histTitleRetry.current = 3; applyHistory(r.entries || []); histStamp.current = ""; }
+  };
+  // 폴링용: 이력 파일이 바뀐 경우에만 전체를 다시 받는다(전량 파싱 + Jira 제목 보강 비용 회피).
+  // 제목이 아직 안 채워진 항목이 남아 있으면 스탬프가 같아도 최대 3회까지 다시 받아 채운다.
+  const refreshHistoryIfChanged = async () => {
+    const s = await api.get("/api/history/stamp");
+    if (!s.ok) return;
+    const stamp = `${s.size}:${s.mtime}`;
+    if (stamp === histStamp.current && histTitleRetry.current <= 0) return;
+    const r = await api.get("/api/history");
+    if (r.ok) { applyHistory(r.entries || []); histStamp.current = stamp; }
+  };
   const loadActive = async () => { const r = await api.get("/api/active"); if (r.ok) { setActive(r.issues || []); setActiveErr((r.errors || []).length ? `일부 프로젝트 조회 실패: ${r.errors.map((e) => e.project).join(", ")}` : ""); } else setActiveErr(r.message || "조회 실패"); };
   const jumpToCard = (projectId, key) => { jumpNonce.current += 1; setJumpTo({ projectId, key, nonce: jumpNonce.current }); };
   const toggleHist = async (rowId, key, project) => {
@@ -1138,7 +1158,7 @@ function App() {
     const t = setInterval(async () => {
       setStatus(await api.get("/api/loops/status"));
       for (const type of ["plan", "build", "review"]) { const r = await api.get(`/api/logs/${type}?lines=120`); setLogs((p) => ({ ...p, [type]: r.log || "" })); }
-      loadHistory();
+      refreshHistoryIfChanged();
     }, 4000);
     const ta = setInterval(loadActive, 30000);   // 활성 작업은 30초마다(프로젝트별 Jira 조회 비용 고려)
     return () => { clearInterval(t); clearInterval(ta); };

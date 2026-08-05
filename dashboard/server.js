@@ -1204,6 +1204,14 @@ async function enrichSummaries(entries) {
   }
   return entries.map((e) => ({ ...e, summary: summaryCache.get(e.key) || "" }));
 }
+// 이력 변경 감지용 초경량 스탬프 — 프론트가 4초마다 이걸 보고 '바뀐 경우에만' 전체 이력을 받는다.
+// (전체 이력은 파일 파싱 + Jira 제목 보강까지 하므로 매 폴링마다 부르면 낭비)
+app.get("/api/history/stamp", (req, res) => {
+  try {
+    const st = fs.statSync(HISTORY_PATH);
+    res.json({ ok: true, size: st.size, mtime: st.mtimeMs });
+  } catch { res.json({ ok: true, size: 0, mtime: 0 }); }
+});
 app.get("/api/history", async (req, res) => {
   const limit = req.query.limit ? parseInt(req.query.limit, 10) : 0;   // limit 없으면 전체 반환(제한 없음)
   const filter = req.query.project;
