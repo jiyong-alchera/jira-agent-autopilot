@@ -113,8 +113,10 @@ for OR in "${R_OWNER[@]}"; do
   while IFS= read -r N; do
     [[ -z "${N}" ]] && continue
     PR_URL="https://github.com/${OR}/pull/${N}"
+    # 코멘트는 한 번만 조회해 ① 승인 마커 판정 ② 자동 rework 판정 ③ 증분 리뷰 기준점에 공용으로 쓴다.
+    CMTS_JSON="$(gh api "repos/${OR}/issues/${N}/comments?per_page=100" 2>/dev/null || echo '[]')"
     # 승인 마커가 이미 있으면 스킵(승인 완료 → 영구 스킵). 단, 수동 실행(FORCE_REVIEW=1)은 강제 재리뷰.
-    BODIES="$(gh api "repos/${OR}/issues/${N}/comments?per_page=100" --jq '.[].body' 2>/dev/null || true)"
+    BODIES="$(printf '%s' "${CMTS_JSON}" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{JSON.parse(d).forEach(c=>console.log(String(c.body||"")))}catch{}})' 2>/dev/null || true)"
     if [[ "${FORCE_REVIEW:-}" != "1" ]] && printf '%s' "${BODIES}" | grep -q "${APPROVED_MARKER}"; then
       echo ">> [${ISSUE_KEY}] ${OR}#${N} 이미 승인됨(마커 존재) → 스킵"
       continue
@@ -125,7 +127,6 @@ for OR in "${R_OWNER[@]}"; do
     # 지적 코멘트에는 고유 마커가 없으므로 '봇(author=BOT_LOGIN)이 남긴 승인 마커 아닌 코멘트 수'로 판별.
     # 수동 단건 리뷰(REVIEW_ONLY_*)와 rework 후 재리뷰 연쇄(FORCE_REVIEW=1)에는 적용하지 않는다(재귀 방지).
     if [[ "${FORCE_REVIEW:-}" != "1" && -z "${REVIEW_ONLY_OWNER}" ]]; then
-      CMTS_JSON="$(gh api "repos/${OR}/issues/${N}/comments?per_page=100" 2>/dev/null || echo '[]')"
       BOT_REVIEW_CNT="$(printf '%s' "${CMTS_JSON}" | BOT="${BOT_LOGIN}" MARK="${APPROVED_MARKER}" node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{const a=JSON.parse(d),bot=process.env.BOT||"",m=process.env.MARK||"";console.log(a.filter(c=>c.user&&c.user.login===bot).filter(c=>!String(c.body||"").includes(m)).length)}catch{console.log(0)}})' 2>/dev/null || echo 0)"
       if [[ "${BOT_REVIEW_CNT:-0}" -ge 1 ]]; then
         if [[ "${BOT_REVIEW_CNT}" -ge "${MAX_AUTO_REWORK}" ]]; then
@@ -148,19 +149,60 @@ for OR in "${R_OWNER[@]}"; do
     reviewed_any=1
     HEAD_SHA="$(gh pr view "${N}" --repo "${OR}" --json headRefOid --jq '.headRefOid' 2>/dev/null || echo "")"
 
+    # ===== 증분 재리뷰 컨텍스트 (토큰 절감) =====
+    # 재리뷰인데도 매번 '전체 diff + 전체 코멘트'를 읽으면 회차가 쌓일수록 입력이 누적된다.
+    # 별도 마커를 남기지 않고 기존 데이터로 기준점을 구한다:
+    #   직전 리뷰 시각 = 봇이 남긴 마지막 코멘트의 created_at
+    #   직전 리뷰 커밋 = 그 시각 이전의 마지막 PR 커밋
+    # 기준을 못 구하거나(첫 리뷰) 그 커밋이 사라졌으면(force-push/rebase) 전체 리뷰로 폴백한다.
+    # REVIEW_FULL=1 이면 항상 전체.
+    LAST_TS=""; LAST_SHA=""; LAST_BODY=""
+    if [[ "${REVIEW_FULL:-}" != "1" ]]; then
+      LAST_TS="$(printf '%s' "${CMTS_JSON}" | BOT="${BOT_LOGIN}" node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{const b=process.env.BOT||"",a=JSON.parse(d).filter(c=>c.user&&c.user.login===b);if(a.length)process.stdout.write(String(a[a.length-1].created_at||""))}catch{}})' 2>/dev/null || true)"
+    fi
+    if [[ -n "${LAST_TS}" ]]; then
+      # 직전 리뷰 본문(1건)은 프롬프트에 직접 넣는다 — '이전 지적이 반영됐는지' 판단의 핵심 근거라 필터로 잘리면 안 된다.
+      LAST_BODY="$(printf '%s' "${CMTS_JSON}" | BOT="${BOT_LOGIN}" node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{const b=process.env.BOT||"",a=JSON.parse(d).filter(c=>c.user&&c.user.login===b);if(a.length)process.stdout.write(String(a[a.length-1].body||"").slice(0,4000))}catch{}})' 2>/dev/null || true)"
+      LAST_SHA="$(gh api "repos/${OR}/pulls/${N}/commits?per_page=100" 2>/dev/null | TS="${LAST_TS}" node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{const t=process.env.TS||"",a=JSON.parse(d).filter(c=>((c.commit&&c.commit.committer&&c.commit.committer.date)||"")<t);if(a.length)process.stdout.write(String(a[a.length-1].sha||""))}catch{}})' 2>/dev/null || true)"
+      if [[ -n "${LAST_SHA}" ]] && ! gh api "repos/${OR}/commits/${LAST_SHA}" --jq '.sha' >/dev/null 2>&1; then
+        echo ">> [${ISSUE_KEY}] ${OR}#${N} 직전 리뷰 커밋(${LAST_SHA:0:7})이 없음(force-push/rebase) → 전체 리뷰로 폴백"
+        LAST_SHA=""
+      fi
+    fi
+
+    if [[ -n "${LAST_SHA}" && "${LAST_SHA}" != "${HEAD_SHA}" ]]; then
+      echo ">> [${ISSUE_KEY}] ${OR}#${N} 증분 재리뷰: ${LAST_SHA:0:7}...${HEAD_SHA:0:7} (직전 리뷰 ${LAST_TS} 이후)"
+      CTX_INSTR="[증분 재리뷰] 이 PR 은 직전에 이미 리뷰했습니다(리뷰 시점 커밋 \`${LAST_SHA}\`, 시각 ${LAST_TS}).
+   **전체 diff·전체 코멘트를 다시 읽지 마세요.** 아래 '그 이후'만 읽고 판단하세요:
+   - 직전 리뷰 이후 코드 변경(증분 diff): 'gh api repos/${OR}/compare/${LAST_SHA}...${HEAD_SHA}' 응답의 files[] (filename·status·patch).
+     patch 가 필요한 파일만 보면 됩니다. 이 요청이 실패할 때만 'gh pr diff ${N} --repo ${OR}' 로 전체를 보세요.
+   - PR 제목·본문(정리 사항): 'gh pr view ${N} --repo ${OR} --json title,body,headRefName'
+   - 직전 리뷰 이후 새로 달린 코멘트만(사람이 남긴 요청·반론 포함) — created_at 이 '${LAST_TS}' 보다 큰 것만 --jq 로 걸러 읽으세요:
+     'gh api repos/${OR}/issues/${N}/comments?per_page=100' (일반 코멘트)
+     'gh api repos/${OR}/pulls/${N}/comments?per_page=100' (인라인 코멘트, path·line 포함)
+   - 증분 범위 밖의 코드가 꼭 필요하면 그 파일만 'gh api repos/${OR}/contents/<경로>?ref=${HEAD_SHA}' 로 개별 확인하세요(전체 diff 재조회 금지).
+   - 연동 Jira 티켓 ${ISSUE_KEY} 의 요구사항·수용조건(Atlassian MCP). 요구사항 대비 구현이 맞는지 대조하세요.${ATTACH_INSTR}
+
+[직전 리뷰에서 당신이 남긴 지적 — 이번에 반영됐는지 위 증분 diff 로 확인하세요]
+${LAST_BODY}
+"
+    else
+      CTX_INSTR="다음을 모두 읽어 맥락을 파악하세요:
+   - PR 코드 변경(diff): 'gh pr diff ${N} --repo ${OR}'
+   - PR 제목·본문(정리 사항): 'gh pr view ${N} --repo ${OR} --json title,body,headRefName'
+   - 기존 리뷰·코멘트(지금까지 오간 피드백, 사람이 새로 남긴 코멘트 포함):
+     'gh pr view ${N} --repo ${OR} --comments' 및
+     'gh api repos/${OR}/pulls/${N}/comments' · 'gh api repos/${OR}/pulls/${N}/reviews'
+   - 연동 Jira 티켓 ${ISSUE_KEY} 의 설명·수용조건·코멘트(Atlassian MCP 의 getJiraIssue 등으로 조회). 요구사항 대비 구현이 맞는지 대조하세요.${ATTACH_INSTR}"
+    fi
+
     PROMPT="당신은 이 GitHub Pull Request 의 '코드 리뷰어'입니다(리뷰 대상 PR 은 자동화가 올린 것이라 직접 approve 는 불가하니 아래 규칙을 따르세요).
 
 대상: repo=${OR}, PR 번호=${N}, PR URL=${PR_URL}, 연동 Jira 이슈=${ISSUE_KEY}
 
 [매우 중요] 헤드리스 1회 실행입니다. 백그라운드로 미루지 말고 이 턴 안에서 리뷰와 코멘트 작성까지 동기적으로 끝내세요.
 
-1. 다음을 모두 읽어 맥락을 파악하세요:
-   - PR 코드 변경(diff): 'gh pr diff ${N} --repo ${OR}'
-   - PR 제목·본문(정리 사항): 'gh pr view ${N} --repo ${OR} --json title,body,headRefName'
-   - 기존 리뷰·코멘트(지금까지 오간 피드백, 사람이 새로 남긴 코멘트 포함):
-     'gh pr view ${N} --repo ${OR} --comments' 및
-     'gh api repos/${OR}/pulls/${N}/comments' · 'gh api repos/${OR}/pulls/${N}/reviews'
-   - 연동 Jira 티켓 ${ISSUE_KEY} 의 설명·수용조건·코멘트(Atlassian MCP 의 getJiraIssue 등으로 조회). 요구사항 대비 구현이 맞는지 대조하세요.${ATTACH_INSTR}
+1. ${CTX_INSTR}
 2. 코드 리뷰를 수행하세요: 요구사항 충족 여부, 버그·엣지케이스, 보안, 에러 처리, 테스트 유무/타당성, 가독성, 회귀 위험 등. 이미 지적된 항목이 반영됐는지도 확인하세요.
 3. 판단에 따라 '정확히 한 가지'만 수행하세요:
    (A) 문제가 있으면 → 구체적 지적(파일/라인/이유/제안)을 PR 코멘트로 남기세요:

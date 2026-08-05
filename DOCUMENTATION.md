@@ -210,6 +210,12 @@ Jira 카드를 자동으로 탐지해 **Claude가 개발 → PR 생성 → 카�
   - 반영은 `run-review.sh` 가 직접 코드를 못 고치므로(repo clone 안 함) **`REWORK=1 REWORK_ONLY_OWNER/NUM=… run-jira-agent.sh <KEY> build`** 로 위임 → 그 PR 브랜치 checkout·리뷰/Jira 코멘트 반영·push. 이때 `REVIEW_AFTER` 는 주지 않고, **같은 `run-review.sh` 프로세스가 리뷰 락을 쥔 채 아래 리뷰 블록으로 갱신된 PR 을 이어서 리뷰**한다(중첩 spawn·락 재획득·무한 재귀 방지). 판별은 지적 코멘트에 고유 마커가 없으므로 **author=봇 계정 + 승인 마커 아님** 기준.
   - **무한 반영 방지 상한**: 미승인 리뷰가 **`MAX_AUTO_REWORK`(기본 3)회** 이상 쌓여도 승인되지 않으면 자동 반영·리뷰를 멈추고 **사람 확인을 요청**한다(로그 + Slack `⏸`). 이로써 리뷰/반영 스택이 최대 상한 안에서만 쌓인다.
   - **적용 제외**: **수동 단건 리뷰(`REVIEW_ONLY_*`)** 와 **rework 후 재리뷰 연쇄(`FORCE_REVIEW=1`)** 에는 자동 rework 를 적용하지 않는다(사용자 의도 존중 + 재귀 방지).
+- **증분 재리뷰(토큰 절감)**: 재리뷰인데 매번 *전체 diff + 전체 코멘트*를 다시 읽으면 회차가 쌓일수록 입력이 누적된다(코멘트 본문은 프롬프트에 없지만 엔진이 도구로 전량 조회해 결국 컨텍스트에 올라감). 그래서 **직전 리뷰 이후만** 읽도록 프롬프트를 바꾼다.
+  - **기준점은 별도 마커 없이 기존 데이터로 계산**한다(엔진이 마커를 빠뜨려도 깨지지 않음): `직전 리뷰 시각` = **봇이 남긴 마지막 코멘트의 `created_at`**, `직전 리뷰 커밋` = **그 시각 이전의 마지막 PR 커밋**(`pulls/N/commits`).
+  - 증분 모드의 지시: 코드는 **`repos/O/R/compare/<직전SHA>...<HEAD>` 의 files[]** 만, 코멘트는 **`created_at > 직전 리뷰 시각`** 인 것만(일반·인라인 둘 다). 범위 밖 코드가 필요하면 `contents/<경로>?ref=<HEAD>` 로 그 파일만.
+  - **직전 리뷰 본문 1건은 프롬프트에 직접 주입**한다(최대 4000자) — '이전 지적이 반영됐는지' 판단의 핵심 근거라 시간 필터로 잘리면 안 되기 때문.
+  - **전체 리뷰로 폴백**하는 경우: ① 첫 리뷰(봇 코멘트 없음) ② 직전 리뷰 커밋이 사라짐(force-push/rebase 로 SHA 미존재 — `repos/O/R/commits/<SHA>` 로 확인) ③ 직전 리뷰 이후 새 커밋 없음 ④ **`REVIEW_FULL=1`**(강제 전체).
+  - 부수 효과로 PR 코멘트 조회가 **1회로 통합**됐다(승인 마커 판정·자동 rework 판정·증분 기준점이 같은 응답을 공유).
 - **리뷰 수행**: Claude 에게 **PR diff(코드) · PR 본문(정리 사항) · 기존 리뷰/코멘트(사람이 새로 남긴 것 포함) · 연동 Jira 티켓**(요구사항/수용조건)을 읽혀 코드 리뷰. 결과에 따라 **한 가지만**:
   - 문제 있음 → 구체적 지적을 PR 코멘트로 남김(승인 마커 없음 → 다음 주기 재리뷰).
   - 문제 없음 → **고유 승인 마커 코멘트**를 남김. 자기 자신의 PR 은 GitHub formal approve 가 불가하므로 `gh pr review --approve` 대신 마커 코멘트로 "리뷰 완료(승인)"를 표시한다.
@@ -234,6 +240,7 @@ Jira 카드를 자동으로 탐지해 **Claude가 개발 → PR 생성 → 카�
 - **Slack 알림**(모두 회차 표기): 시작 `🔁 … 루프 시작 (최대 N회)`, **미승인 `📝 … 리뷰 루프 i/N회차 — 수정 필요(미승인)`**, 승인 `✅ … 리뷰 승인 완료 (루프 i/N회차)`, 상한 `⏸`, 중지 `⏹`, 반영 실패 `❌`. 하위 스크립트의 Slack 알림은 **끄고**(`SLACK_WEBHOOK_URL=""` 주입) 루프가 대표해서 보내 중복을 막는다.
 - **진행 상태**: 회차·단계를 `.state/<KEY>.reviewloop.json`(`{iter,max,step,owner,number,…}`)에 기록 → 대시보드가 5초마다 폴링해 버튼 옆에 `🔁 승인 루프 2/5회차 · 리뷰 중` 으로 표시한다. 이력은 회차마다 `review-loop/reviewed`, 종료 시 `approved`/`stopped`/`failed`.
 - 루프 진행 로그는 `loop-review.log`, 엔진 상세 로그는 기존대로 `agent-logs/<KEY>-build.log`·`<KEY>-review.log`(대시보드 '엔진 실행 로그'에서 실시간 확인).
+- **토큰**: 2회차부터는 `run-review.sh` 의 [증분 재리뷰](#43b-run-reviewsh-pr-자동-리뷰)가 적용돼 그 회차에 바뀐 코드·새 코멘트만 읽는다(회차가 쌓여도 입력이 누적되지 않음). 반영(rework) 단계는 아직 전량 조회한다.
 
 ### 4.4 대시보드 백엔드 (dashboard/server.js, Express)
 
@@ -362,6 +369,7 @@ Jira 카드를 자동으로 탐지해 **Claude가 개발 → PR 생성 → 카�
 | review 주기(초) | `REVIEW_LOOP_INTERVAL` (설정 `reviewIntervalSeconds`) | `3600` | review 루프 주기(별도) |
 | PR 승인 마커 | (고정) `CLAUDE-REVIEW-APPROVED` | — | review 루프가 PR 승인 표시로 남기는 고유 코멘트 텍스트. 존재하면 이후 리뷰 스킵(lib `REVIEW_APPROVED_MARKER`) |
 | 자동 리뷰 반영 상한 | `MAX_AUTO_REWORK` | `3` | 미승인 PR 의 자동 리뷰 반영(rework) 최대 반복 횟수(run-review.sh). 미승인 리뷰가 이 수 이상 쌓이면 자동 반영·리뷰를 멈추고 사람 확인 요청(리뷰 스택 상한) |
+| 전체 리뷰 강제 | `REVIEW_FULL` | (없음) | `1` 이면 증분 재리뷰를 끄고 **항상 전체 diff·전체 코멘트**를 읽는다(run-review.sh). 기본은 직전 리뷰 이후만 읽는 증분 모드 |
 | 승인까지 루프 상한 | `REVIEW_LOOP_MAX` (설정 `reviewLoopMax`) | `5` | 대시보드 '🔁 승인까지 루프'(run-review-loop.sh)의 최대 반복 회차. 초과 시 사람 확인 요청 후 종료(요청 body `max` 로 1~20 범위 재정의 가능) |
 | 동시 처리 상한 | `MAX_PARALLEL` | `5` | 한 주기에 동시에 처리하는 카드 수 |
 | 대시보드 주소 | `DASHBOARD_URL` | (대시보드가 주입) | 루프가 REST 탐지(`/api/detect`)를 호출할 백엔드 주소. 비면 claude 탐지 사용 |
