@@ -67,12 +67,15 @@ function isReadableDoc(a) {
   return DOC_EXT.has(ext);
 }
 async function fetchAttachmentTo(cfg, auth, a, dir) {
+  const safe = String(a.filename || `att-${a.id}`).replace(/[^\w.\-]/g, "_");
+  const p = path.join(dir, `${a.id}-${safe}`);
+  // 첨부는 불변(같은 id = 같은 파일) — 이미 받아둔 게 크기까지 같으면 재다운로드 생략.
+  // 주기마다 같은 이미지/문서를 다시 받던 낭비를 없앤다.
+  try { if (fs.existsSync(p) && (!a.size || fs.statSync(p).size === Number(a.size))) return p; } catch { /* stat 실패 시 재다운로드 */ }
   let up = await fetch(`https://${cfg.jiraSite}/rest/api/3/attachment/content/${a.id}`, { headers: { Authorization: `Basic ${auth}` }, redirect: "manual", signal: AbortSignal.timeout(30000) });
   const loc = up.headers.get("location");
   if (up.status >= 300 && up.status < 400 && loc) up = await fetch(loc, { signal: AbortSignal.timeout(30000) });
   if (!up.ok) return null;
-  const safe = String(a.filename || `att-${a.id}`).replace(/[^\w.\-]/g, "_");
-  const p = path.join(dir, `${a.id}-${safe}`);
   fs.writeFileSync(p, Buffer.from(await up.arrayBuffer()));
   return p;
 }

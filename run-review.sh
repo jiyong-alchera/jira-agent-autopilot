@@ -93,6 +93,16 @@ if [[ -n "${CARD_DOCS:-}" ]]; then
 ${_docs}"
 fi
 
+# 증분 재리뷰에서는 첨부를 다시 열지 않는다(직전 리뷰에서 이미 검토, 내용도 그대로).
+# 다만 새 코멘트가 특정 첨부를 지목할 수 있으므로 '어디에 있는지'만 한 줄로 알려준다.
+ATTACH_HINT=""
+if [[ -n "${CARD_IMAGES:-}${CARD_DOCS:-}" ]]; then
+  _n_img="$(printf '%s' "${CARD_IMAGES:-}" | grep -c . || true)"
+  _n_doc="$(printf '%s' "${CARD_DOCS:-}" | grep -c . || true)"
+  ATTACH_HINT="
+     (첨부 이미지 ${_n_img}장·문서 ${_n_doc}개는 '${STATE_DIR}/${ISSUE_KEY}.images'·'${STATE_DIR}/${ISSUE_KEY}.docs' 에 그대로 있습니다. 새 코멘트가 특정 첨부를 지목할 때만 그 파일 하나만 Read 하세요.)"
+fi
+
 # 자동화(봇) 계정 로그인 — 기본은 봇이 만든 PR 만 리뷰(사람 PR 은 자동 리뷰하지 않음).
 BOT_LOGIN="$(gh api user --jq .login 2>/dev/null || true)"
 # 개별 PR 리뷰 모드(대시보드 'PR 목록'의 '이 PR 리뷰'): 지정 repo/번호의 PR 만 리뷰(사람 PR 포함).
@@ -181,7 +191,8 @@ for OR in "${R_OWNER[@]}"; do
      'gh api repos/${OR}/issues/${N}/comments?per_page=100' (일반 코멘트)
      'gh api repos/${OR}/pulls/${N}/comments?per_page=100' (인라인 코멘트, path·line 포함)
    - 증분 범위 밖의 코드가 꼭 필요하면 그 파일만 'gh api repos/${OR}/contents/<경로>?ref=${HEAD_SHA}' 로 개별 확인하세요(전체 diff 재조회 금지).
-   - 연동 Jira 티켓 ${ISSUE_KEY} 의 요구사항·수용조건(Atlassian MCP). 요구사항 대비 구현이 맞는지 대조하세요.${ATTACH_INSTR}
+   - 연동 Jira 티켓 ${ISSUE_KEY} 의 요구사항·수용조건(Atlassian MCP). 요구사항 대비 구현이 맞는지 대조하세요.
+   - 카드 첨부(이미지·문서)는 직전 리뷰에서 이미 검토했고 바뀌지 않았습니다. **다시 열지 마세요.**${ATTACH_HINT}
 
 [직전 리뷰에서 당신이 남긴 지적 — 이번에 반영됐는지 위 증분 diff 로 확인하세요]
 ${LAST_BODY}
