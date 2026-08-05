@@ -166,6 +166,7 @@ Jira 카드를 자동으로 탐지해 **Claude가 개발 → PR 생성 → 카�
      - **PR 본문(개발 설명)**: PR 생성 시 구조화된 한국어 개발 설명을 `--body-file` 로 작성한다 — `## 개요`(+ Jira 카드 링크/이슈 키) · `## 변경 사항`(무엇을·왜) · `## 구현 상세` · `## 테스트/검증`(실행 명령·결과) · `## 리뷰 포인트/주의사항`. 본문 템플릿(`PR_BODY_INSTR`)은 build·rework 가 공유한다.
      - **완료 요약(label 모드)**: claude 는 **Jira 설명을 직접 수정하지 않고** 요약(변경 내용·PR·브랜치·완료 일시)을 markdown 으로 `SUMMARY_FILE`(`<CLONE_BASE>/.state/<KEY>.summary.md`)에 저장만 한다. build 성공 후 **`append-summary.js` 가 설명 ADF 를 직접 GET → 기존 노드(특히 붙여넣은 이미지 media)를 그대로 둔 채 맨 아래에 `---`+`## 완료 내역`+요약을 append → PUT** 한다(`mdToADF` 로 제목/불릿/표/링크 서식 보존). 재실행 시 기존 '완료 내역' 섹션은 제거 후 재추가(idempotent). **markdown↔ADF 왕복으로 설명을 통째로 다시 쓰면 본문 이미지가 깨지던 문제를 근본 차단.** (text 모드(레거시)는 종전대로 claude 가 트리거 텍스트 위에 작성)
      - **머지 시점 최종 갱신**: build 완료 내역은 리뷰/rework 로 PR 이 바뀌면 실제 병합 내용과 어긋날 수 있으므로, **PR 병합(수동·개별·외부 병합 자동 감지) 으로 카드가 완료될 때** 백엔드가 **병합된 PR 들의 최종 본문(rework 시 갱신됨)으로 '완료 내역'을 다시 작성**한다(`finalizeCardDone` → `appendCompletionSummary`, 기존 섹션 교체·이미지 보존·병합 일시 포함). 즉 카드의 완료 내역은 항상 최종 머지 기준으로 유지된다.
+   - **rework(리뷰 반영) 프롬프트 — 미반영 피드백만 읽는다**: 반영은 "직전 반영 이후 새로 달린 것"만 대상이다. 기준점은 **그 PR 의 마지막 커밋 시각**(= 직전 반영이 push 한 시점) — 그 이후 `issues/N/comments`·`pulls/N/comments`·`pulls/N/reviews` 만 `created_at`/`submitted_at` 으로 걸러 읽는다. 개별 PR 지정(`REWORK_ONLY_*`)이면 스크립트가 시각을 구해 프롬프트에 박고, 멀티 repo 면 엔진이 repo 마다 직접 구한다. 걸러낸 게 하나도 없을 때만 전체를 읽는다(폴백). 이미 반영한 지적을 매 회차 다시 읽던 비용 제거.
    - **PR 전 검증(#10)**: 테스트 수단(`TEST_CMD` 또는 자동 감지)이 있으면 실행하고 **통과할 때까지 수정 반복**(불가 시 PR 없이 비정상 종료). 테스트가 없으면 빌드/컴파일(`BUILD_CMD` 또는 자동 감지)만 시도(빌드 수단도 없으면 건너뜀). 검증 통과 시에만 PR 단계로 진행. **긴 테스트/빌드는 Bash `timeout` 을 넉넉히(최대 10분) 지정해 포그라운드로 실행**해야 한다(120초 초과 시 자동 백그라운드 → 헤드리스 유실 방지, 11 트러블슈팅 참고).
    - **멱등성 가드(build 전용)**: claude 실행 전에 `git ls-remote` 로 `feature/<KEY>-*` 원격 브랜치를, `gh pr list` 로 해당 이슈 키의 열린 PR 을 점검한다. 하나라도 있으면 `SKIP: 이미 처리됨` 을 출력하고 종료해 중복 브랜치/PR 생성을 막는다(중간 실패 후 재시도 안전).
 7. **실패 재시도/백오프(plan·build 공통)**: claude 가 0이 아닌 코드로 종료하면 실패로 보고 카드별 실패 카운터(`<CLONE_BASE>/.state/<KEY>.fail`)를 증가시킨다. `MAX_RETRIES`(기본 3) 초과 시 claude 로 `claude-failed` 라벨 추가 + 담당자 멘션 실패 코멘트(마지막 오류 로그 요약 포함)를 남긴다. 성공하면 카운터를 리셋한다. build 의 `SKIP: awaiting answers` 는 정상 종료(0)라 실패로 집계되지 않는다.
@@ -242,7 +243,7 @@ Jira 카드를 자동으로 탐지해 **Claude가 개발 → PR 생성 → 카�
 - **Slack 알림**(모두 회차 표기): 시작 `🔁 … 루프 시작 (최대 N회)`, **미승인 `📝 … 리뷰 루프 i/N회차 — 수정 필요(미승인)`**, 승인 `✅ … 리뷰 승인 완료 (루프 i/N회차)`, 상한 `⏸`, 중지 `⏹`, 반영 실패 `❌`. 하위 스크립트의 Slack 알림은 **끄고**(`SLACK_WEBHOOK_URL=""` 주입) 루프가 대표해서 보내 중복을 막는다.
 - **진행 상태**: 회차·단계를 `.state/<KEY>.reviewloop.json`(`{iter,max,step,owner,number,…}`)에 기록 → 대시보드가 5초마다 폴링해 버튼 옆에 `🔁 승인 루프 2/5회차 · 리뷰 중` 으로 표시한다. 이력은 회차마다 `review-loop/reviewed`, 종료 시 `approved`/`stopped`/`failed`.
 - 루프 진행 로그는 `loop-review.log`, 엔진 상세 로그는 기존대로 `agent-logs/<KEY>-build.log`·`<KEY>-review.log`(대시보드 '엔진 실행 로그'에서 실시간 확인).
-- **토큰**: 2회차부터는 `run-review.sh` 의 [증분 재리뷰](#43b-run-reviewsh-pr-자동-리뷰)가 적용돼 그 회차에 바뀐 코드·새 코멘트만 읽는다(회차가 쌓여도 입력이 누적되지 않음). 반영(rework) 단계는 아직 전량 조회한다.
+- **토큰**: 2회차부터 리뷰는 [증분 재리뷰](#43b-run-reviewsh-pr-자동-리뷰), 반영(rework)은 [미반영 피드백만 읽기](#41-run-jira-agentsh-카드-1개-처리)가 적용돼 회차가 쌓여도 입력이 누적되지 않는다.
 
 ### 4.4 대시보드 백엔드 (dashboard/server.js, Express)
 

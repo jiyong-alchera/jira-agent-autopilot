@@ -274,6 +274,27 @@ elif [[ -n "${REWORK:-}" ]]; then
     REWORK_FOCUS="[대상 PR 한정] 이번 리뷰 반영은 오직 '${REWORK_ONLY_OWNER}' 저장소의 PR #${REWORK_ONLY_NUM} 하나에만 수행하세요. 그 외 repo/PR 은 절대 건드리지 마세요.
 "
   fi
+  # 이미 반영한 피드백까지 매번 다시 읽지 않도록 '직전 반영(= PR 의 마지막 커밋) 이후' 코멘트만 보게 한다.
+  # 개별 PR 지정이면 시각을 여기서 구해 박고, 멀티 repo 면 엔진이 repo 마다 직접 구하도록 지시한다.
+  REWORK_SINCE=""
+  if [[ -n "${REWORK_ONLY_OWNER:-}" && -n "${REWORK_ONLY_NUM:-}" ]] && command -v gh >/dev/null 2>&1; then
+    REWORK_SINCE="$(gh api "repos/${REWORK_ONLY_OWNER}/pulls/${REWORK_ONLY_NUM}/commits?per_page=100" --jq '.[-1].commit.committer.date' 2>/dev/null || true)"
+  fi
+  if [[ -n "${REWORK_SINCE}" ]]; then
+    FEEDBACK_INSTR="3. 반영할 피드백을 모으세요 — **직전 반영 이후에 새로 달린 것만** 읽습니다(그 이전 지적은 이미 반영됨).
+   이 PR 의 마지막 커밋 시각은 '${REWORK_SINCE}' 입니다. created_at(리뷰는 submitted_at)이 이 시각보다 **큰 것만** --jq 로 걸러 읽으세요:
+   - 'gh api repos/{owner}/{repo}/issues/{번호}/comments?per_page=100'
+   - 'gh api repos/{owner}/{repo}/pulls/{번호}/comments?per_page=100' (인라인, path·line 포함)
+   - 'gh api repos/{owner}/{repo}/pulls/{번호}/reviews?per_page=100'
+   - Jira: 이슈 ${ISSUE_KEY} 의 '최신 코멘트'(특히 담당자 ${ASSIGNEE_NAME} 가 남긴 리뷰 반영 요청).
+   걸러낸 결과가 하나도 없을 때만 전체 코멘트를 읽어 미반영 항목을 확인하세요."
+  else
+    FEEDBACK_INSTR="3. 반영할 피드백을 모으세요 — **직전 반영 이후에 새로 달린 것만** 읽습니다(그 이전 지적은 이미 반영됨).
+   각 PR 마다 먼저 마지막 커밋 시각을 구하세요: 'gh api repos/{owner}/{repo}/pulls/{번호}/commits?per_page=100' 의 마지막 항목 commit.committer.date.
+   그 시각 이후(created_at·submitted_at 이 더 큰) 코멘트·리뷰만 읽으세요: 'issues/{번호}/comments' · 'pulls/{번호}/comments' · 'pulls/{번호}/reviews'.
+   - Jira: 이슈 ${ISSUE_KEY} 의 '최신 코멘트'(특히 담당자 ${ASSIGNEE_NAME} 가 남긴 리뷰 반영 요청).
+   걸러낸 결과가 하나도 없을 때만 전체 코멘트를 읽어 미반영 항목을 확인하세요."
+  fi
   PROMPT="${REWORK_FOCUS}당신은 Jira 이슈 ${ISSUE_KEY} 의 '기존 PR'에 리뷰 피드백을 반영합니다. 새 PR/새 브랜치는 만들지 마세요.
 대상 repo 들은 아래 경로에 clone 되어 있습니다(여러 repo 일 수 있음):
 ${REPO_LIST_TEXT}
@@ -283,9 +304,7 @@ ${REPO_LIST_TEXT}
 각 repo 에 대해:
 1. 'gh pr list --state open --search \"${ISSUE_KEY}\"' 로 이 이슈의 열린 PR 을 찾으세요. 없으면 그 repo 는 건너뜁니다(반영 대상 아님).
 2. 그 PR 의 head 브랜치를 checkout 하세요 (git fetch origin 후 해당 브랜치로).
-3. 반영할 피드백을 모으세요:
-   - GitHub 리뷰: 'gh pr view <번호> --comments' 및 'gh api repos/{owner}/{repo}/pulls/{번호}/comments' · '.../reviews' 의 리뷰 코멘트/스레드.
-   - Jira: 이슈 ${ISSUE_KEY} 의 '최신 코멘트'(특히 담당자 ${ASSIGNEE_NAME} 가 남긴 리뷰 반영 요청).
+${FEEDBACK_INSTR}
 4. 요청된 변경을 구현하세요.
 5. PR 전 검증: 테스트 수단(${TEST_DESC})이 있으면 통과할 때까지 수정, 없으면 빌드(${BUILD_DESC})만 시도(수단 없으면 생략).
 6. '같은 브랜치'에 커밋(메시지 하단에 '${ISSUE_KEY}' 명시) 후 'origin' 으로 push 하면 기존 PR 이 자동 갱신됩니다. (새 PR 생성 금지)
