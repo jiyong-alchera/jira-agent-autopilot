@@ -40,6 +40,8 @@ npm start
 - **자격증명**: Anthropic / GitHub / Atlassian 토큰을 로컬 저장 (입력란 비우면 기존 값 유지)
 - **work.env 파일**: 대상 repo로 복사되는 env 파일을 대시보드에서 직접 불러와 편집·저장 (저장 시 `.bak` 백업)
 - **카드 상태**: Atlassian REST 로 트리거 카드 목록과 단계(plan대기/build대기/완료) 표시
+  - 카드를 펼치면 `plan`·`build`·`review` 단계별 실행/로그/중지. build 그룹의 **`🔁 승인까지`** 를 켜면
+    개발 → PR → **리뷰 승인까지 반복 루프**(`run-review-loop.sh`)로 이어짐(첫 회차는 반영 없이 리뷰부터)
 - **실시간 로그**: loop-plan.log / loop-build.log 자동 갱신(4초)
 
 ## 토큰이 실제로 쓰이는 곳

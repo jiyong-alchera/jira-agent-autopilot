@@ -15,6 +15,8 @@
 #        - plan  단계: 카드 검토 → 질문 코멘트 작성 → PLANNED_LABEL 라벨 추가
 #        - build 단계: 답변 반영 개발 → 브랜치/커밋/푸시 → BASE_BRANCH 로 PR
 #                      → 카드 설명의 트리거 텍스트 위에 완료 요약 기입 → DONE_STATUS 전환
+#   6) REVIEW_LOOP_AFTER=1 이면 build 로 만든 PR 마다 run-review-loop.sh 를 이어서 실행
+#      (승인될 때까지 '리뷰 → 반영 → 재리뷰' 반복). 락을 놓은 뒤 순차 실행한다.
 #
 # 사용법:
 #   REPO_URL=https://github.com/Org/repo.git ./run-jira-agent.sh <ISSUE-KEY> plan
@@ -52,6 +54,7 @@ MAX_RETRIES="${MAX_RETRIES:-3}"                 # 연속 실패 N회 초과 시 
 TEST_CMD="${TEST_CMD:-}"                        # 테스트 명령(비우면 claude 가 자동 감지)
 BUILD_CMD="${BUILD_CMD:-}"                      # 빌드 명령(비우면 claude 가 자동 감지)
 HISTORY_FILE="${HISTORY_FILE:-${WORK_DIR}/history.jsonl}"  # 처리 이력(JSONL) 기록 파일
+REVIEW_LOOP_AFTER="${REVIEW_LOOP_AFTER:-}"      # 1이면 build 성공(PR 생성) 후 리뷰 승인 루프까지 이어서 진행
 
 ENV_NAME="$(basename "${ENV_SRC}")"
 CARD_REPOS="${CARD_REPOS:-}"   # 대상 repo 목록: 'name<TAB>url<TAB>baseBranch' 줄 단위. 비우면 REPO_URL 단일.
@@ -172,7 +175,12 @@ fi
 # (대시보드가 '처리 중' 표시 + 카드 단위 '중지'(프로세스 트리 종료)에 사용)
 printf '%s' "${PHASE}" > "${LOCK_DIR}.phase" 2>/dev/null || true
 printf '%s' "$$" > "${LOCK_DIR}.pid" 2>/dev/null || true
-trap 'rmdir "${LOCK_DIR}" 2>/dev/null || true; rm -f "${LOCK_DIR}.phase" "${LOCK_DIR}.pid" 2>/dev/null || true' EXIT
+# 리뷰 승인 루프로 이어질 때 락을 먼저 놓아야 하므로 함수로 분리(EXIT 트랩과 중복 호출되어도 안전)
+release_lock() {
+  rmdir "${LOCK_DIR}" 2>/dev/null || true
+  rm -f "${LOCK_DIR}.phase" "${LOCK_DIR}.pid" 2>/dev/null || true
+}
+trap release_lock EXIT
 
 # ===== 대상 repo 목록 파싱 (CARD_REPOS: name\turl\tbaseBranch\tenvSrc\tenvDest; 없으면 REPO_URL 단일) =====
 declare -a R_NAME R_URL R_BRANCH R_ENVSRC R_ENVDEST
@@ -482,8 +490,24 @@ if [[ "${RESULT}" == "success" || "${RESULT}" == "skip" || "${RESULT}" == "rewor
       [[ -n "${BRANCH_OUT}" ]] && MSG="${MSG} · branch: ${BRANCH_OUT}"
     fi
     notify_slack "${MSG}"
+    # 개발→PR 후 리뷰 승인 루프까지 연속 진행: 생성된 PR 마다 승인될 때까지 '리뷰 → 반영 → 재리뷰' 반복.
+    # 루프가 내부에서 이 카드의 락(<KEY>.lock)을 다시 잡으므로 먼저 놓고 실행한다.
+    # 새 PR 이라 반영할 의견이 없으므로 REVIEW_FIRST 로 1회차는 리뷰부터.
+    if [[ "${REVIEW_LOOP_AFTER}" == "1" && "${PHASE}" == "build" && -f "${SELF_DIR}/run-review-loop.sh" ]]; then
+      release_lock
+      while IFS= read -r pr_line; do
+        [[ -z "${pr_line}" ]] && continue
+        pr_or="$(sed -E 's#^https://github\.com/([^/]+/[^/]+)/pull/[0-9]+$#\1#' <<< "${pr_line}")"
+        pr_no="$(sed -E 's#^.*/pull/([0-9]+)$#\1#' <<< "${pr_line}")"
+        if [[ "${pr_or}" == "${pr_line}" || -z "${pr_no}" ]]; then
+          echo ">> [${ISSUE_KEY}] PR URL 파싱 실패 → 리뷰 승인 루프 생략: ${pr_line}" >&2; continue
+        fi
+        echo ">> [${ISSUE_KEY}] PR 생성 완료 → 리뷰 승인 루프 시작: ${pr_or}#${pr_no}"
+        REVIEW_FIRST=1 bash "${SELF_DIR}/run-review-loop.sh" "${ISSUE_KEY}" "${pr_or}" "${pr_no}" \
+          || echo ">> [${ISSUE_KEY}] 리뷰 승인 루프 실행 실패: ${pr_or}#${pr_no}" >&2
+      done <<< "${ALL_PRS}"
     # 리뷰 반영 후 재리뷰: REVIEW_AFTER=1 이면 이어서 리뷰어(run-review.sh)를 실행해 갱신된 PR 을 다시 리뷰.
-    if [[ "${REVIEW_AFTER:-}" == "1" && -f "${SELF_DIR}/run-review.sh" ]]; then
+    elif [[ "${REVIEW_AFTER:-}" == "1" && -f "${SELF_DIR}/run-review.sh" ]]; then
       echo ">> [${ISSUE_KEY}] 리뷰 반영 완료 → 재리뷰 시작"
       FORCE_REVIEW=1 bash "${SELF_DIR}/run-review.sh" "${ISSUE_KEY}" || echo ">> [${ISSUE_KEY}] 재리뷰 실행 실패" >&2
     fi

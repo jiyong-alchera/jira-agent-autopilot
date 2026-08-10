@@ -351,6 +351,7 @@ function ProjectCard({ proj, onDeleted, flash, jumpTo }) {
   const [prs, setPrs] = useState(null);           // { key, loading, list:[...], botLogin } — 카드 1:N PR 목록
   const [prExpanded, setPrExpanded] = useState(""); // PR 목록에서 펼쳐 리뷰/코멘트 보는 PR (owner#number)
   const [reviewLoop, setReviewLoop] = useState(null); // 펼친 카드의 리뷰 승인 루프 상태 { key, ...loop }
+  const [loopAfterBuild, setLoopAfterBuild] = useState({});   // 카드별 'build 후 승인까지 루프' 선택 { KEY: bool }
 
   const credSet = (k) => creds[k] === true;
   const openRepoEnv = async (name) => {
@@ -473,7 +474,14 @@ function ProjectCard({ proj, onDeleted, flash, jumpTo }) {
     if (r.ok) { flash("답변 등록됨" + (replyAnswered ? " (claude-answered" + (r.movedTo ? ` · 상태→${r.movedTo}` : "") + ")" : "")); setReply(""); setReplyTarget(null); const d = await api.get(withP(`/api/jira/issue/${expandedKey}`)); if (d.ok) setDetail(d); loadCards(); }
     else flash(r.message || "등록 실패");
   };
-  const runCardNow = async (key, phase) => { const r = await api.post(`/api/cards/${key}/run`, { phase, project: PID }); flash(r.ok ? `${key} ${phase} 즉시 실행 — 엔진 실행 로그 확인` : (r.message || "실패")); if (r.ok) showClaudeLog(key, phase); };
+  // build 는 '승인까지 루프' 를 켜면 PR 생성 후 리뷰 루프까지 이어서 돈다(서버가 build 단건에서만 수용).
+  const runCardNow = async (key, phase) => {
+    const withLoop = phase === "build" && !!loopAfterBuild[key];
+    if (withLoop && !window.confirm(`${key} 를 개발 → PR 까지 만든 뒤, 그 PR 이 리뷰 승인될 때까지 '리뷰 → 반영 → 재리뷰' 를 반복할까요?\n\n· 새 PR 이므로 첫 회차는 반영 없이 리뷰부터 시작합니다.\n· 회차마다 Slack 알림이 가고, 'PR 목록'의 '루프 중지' 로 언제든 멈출 수 있습니다.`)) return;
+    const r = await api.post(`/api/cards/${key}/run`, { phase, reviewLoopAfter: withLoop, project: PID });
+    flash(r.ok ? `${key} ${phase} 즉시 실행${r.reviewLoopAfter ? ` → PR 후 승인까지 루프(최대 ${r.reviewLoopMax}회)` : ""} — 엔진 실행 로그 확인` : (r.message || "실패"));
+    if (r.ok) showClaudeLog(key, phase);
+  };
   const stopCard = async (key, phase) => { const r = await api.post(`/api/cards/${key}/stop`, { phase, project: PID }); flash(r.ok ? `${key} ${phase ? phase + " " : ""}${r.message}` : (r.message || "중지 실패")); loadCards(); };
   const reworkOnePr = async (key, pr, thenReview) => {
     const prId = `${pr.owner}#${pr.number}`;
@@ -832,6 +840,16 @@ function ProjectCard({ proj, onDeleted, flash, jumpTo }) {
                                     <button onClick={() => runCardNow(c.key, ph)} title={`${ph} 즉시 실행`} className="text-[11px] px-2 py-0.5 rounded border border-indigo-500/40 text-indigo-300 hover:bg-indigo-500/10 transition">실행</button>
                                     <button onClick={() => showClaudeLog(c.key, ph)} title={`${ph} 실행 로그`} className="text-[11px] px-2 py-0.5 rounded border border-slate-600 text-slate-300 hover:bg-slate-600/20 transition">로그</button>
                                     {running && <button onClick={() => stopCard(c.key, ph)} title={`${ph} 중지`} className="text-[11px] px-2 py-0.5 rounded border border-rose-500/50 text-rose-300 hover:bg-rose-500/10 transition">■ 중지</button>}
+                                    {/* build 후 리뷰 승인 루프 연속 진행 — 개발→PR→(리뷰→반영→재리뷰) 승인까지 */}
+                                    {ph === "build" && (
+                                      <label className="flex items-center gap-1 pl-1 ml-1 border-l border-slate-700 text-[11px] text-slate-400 cursor-pointer select-none"
+                                        title="PR 을 만든 뒤 그 PR 이 리뷰 승인될 때까지 '리뷰 → 반영 → 재리뷰' 를 반복합니다(최대 5회). 첫 회차는 반영 없이 리뷰부터.">
+                                        <input type="checkbox" checked={!!loopAfterBuild[c.key]}
+                                          onChange={(e) => { const v = e.target.checked; setLoopAfterBuild((m) => ({ ...m, [c.key]: v })); }}
+                                          className="accent-emerald-500" />
+                                        <span className={loopAfterBuild[c.key] ? "text-emerald-300" : ""}>🔁 승인까지</span>
+                                      </label>
+                                    )}
                                   </div>
                                 );
                               })}

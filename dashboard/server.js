@@ -62,7 +62,7 @@ const DEFAULT_CONFIG = {
 
 // ----- 순수 로직 + 프로젝트 스토어 (단위 테스트 대상은 lib.js 로 분리) -----
 const lib = require("./lib");
-const { slugify, triggerClause, detectJql, adfToText, adfSegments, toADF, mdToADF, buildReplyADF, maskCreds, applyCreds, normalizeRepos, cardRepos, REPO_LABEL_PREFIX, doneStatusList, effectiveDoneStatuses } = lib;
+const { slugify, triggerClause, detectJql, adfToText, adfSegments, toADF, mdToADF, buildReplyADF, maskCreds, applyCreds, normalizeRepos, cardRepos, REPO_LABEL_PREFIX, doneStatusList, effectiveDoneStatuses, clampReviewLoopMax } = lib;
 // repo 별 env 파일 경로(repo 전용 env 만 사용; 없으면 미복사 — run-jira 가 -f 로 확인)
 function repoEnvFile(cfg, repoName) { return path.join(cfg.workDir || SCRIPTS_DIR, `work-${cfg.id}-${repoName}.env`); }
 function repoEnvSrc(cfg, repoName) { return repoEnvFile(cfg, repoName); }
@@ -205,7 +205,9 @@ function runOnce(type) {
   return { ok: true, pid: proc.pid };
 }
 // 특정 카드 1건 즉시 실행(프로젝트 env 주입)
-function runCard(key, phase, stamp, projectId, reposLines, rework, reviewAfter, reviewOnly, reworkOnly, resolveConflict) {
+// opts: { reposLines, rework, reviewAfter, reviewLoopAfter, reviewLoopMax, reviewOnly, reworkOnly, resolveConflict }
+function runCard(key, phase, stamp, projectId, opts) {
+  const { reposLines, rework, reviewAfter, reviewLoopAfter, reviewLoopMax, reviewOnly, reworkOnly, resolveConflict } = opts || {};
   const isReview = phase === "review";   // review 는 run-review.sh(PR 자동 리뷰), 그 외는 run-jira-agent.sh
   const script = path.join(SCRIPTS_DIR, isReview ? "run-review.sh" : "run-jira-agent.sh");
   if (!fs.existsSync(script)) return { ok: false, message: `스크립트를 찾을 수 없습니다: ${script}` };
@@ -213,7 +215,8 @@ function runCard(key, phase, stamp, projectId, reposLines, rework, reviewAfter, 
   let fd;
   try {
     fd = fs.openSync(logPath, "a");
-    fs.writeSync(fd, `[${stamp}] (단건 즉시 실행) ${resolveConflict ? "RESOLVE-CONFLICT" : rework ? "REWORK" : phase.toUpperCase()}: ${key} [${projectId}]\n`);
+    const mode = resolveConflict ? "RESOLVE-CONFLICT" : rework ? "REWORK" : phase.toUpperCase();
+    fs.writeSync(fd, `[${stamp}] (단건 즉시 실행) ${mode}${reviewLoopAfter ? ` +REVIEW-LOOP(최대 ${reviewLoopMax}회)` : ""}: ${key} [${projectId}]\n`);
   } catch (e) { return { ok: false, message: String(e.message || e) }; }
   const env = scriptEnv(projectId);
   if (reposLines != null) env.CARD_REPOS = reposLines;   // 카드 라벨로 좁힌 대상 repo
@@ -221,6 +224,10 @@ function runCard(key, phase, stamp, projectId, reposLines, rework, reviewAfter, 
   if (resolveConflict) env.RESOLVE_CONFLICT = "1";       // base 충돌 rebase 해소 + force-push 모드
   if (reworkOnly && reworkOnly.owner && reworkOnly.number != null) { env.REWORK_ONLY_OWNER = String(reworkOnly.owner); env.REWORK_ONLY_NUM = String(reworkOnly.number); }  // 개별 PR 반영
   if (reviewAfter) env.REVIEW_AFTER = "1";               // 리뷰 반영 후 이어서 재리뷰(run-review.sh)
+  if (reviewLoopAfter) {                                 // PR 생성 후 승인까지 리뷰 루프 연속 진행(run-review-loop.sh)
+    env.REVIEW_LOOP_AFTER = "1";
+    env.REVIEW_LOOP_MAX = String(reviewLoopMax);
+  }
   if (isReview) env.FORCE_REVIEW = "1";                  // 수동 review: 승인 마커 있어도 강제 재리뷰
   if (isReview && reviewOnly && reviewOnly.owner && reviewOnly.number != null) {  // 개별 PR 리뷰(사람 PR 포함)
     env.REVIEW_ONLY_OWNER = String(reviewOnly.owner); env.REVIEW_ONLY_NUM = String(reviewOnly.number);
@@ -507,6 +514,8 @@ app.post("/api/cards/:key/run", async (req, res) => {
   const phase = b.phase;
   const rework = !!b.rework;
   const resolveConflict = !!b.resolveConflict;   // base 충돌 rebase 해소 모드(build 스크립트, force-push)
+  // 개발→PR 후 승인까지 리뷰 루프 연속 진행 — 새 PR 을 만드는 build 단건 실행에서만 의미가 있다.
+  const reviewLoopAfter = !!b.reviewLoopAfter && phase === "build" && !rework && !resolveConflict;
   if (!/^[A-Z][A-Z0-9]+-[0-9]+$/.test(key)) return res.status(400).json({ ok: false, message: "이슈 키 형식 오류" });
   if (!["plan", "build", "review"].includes(phase)) return res.status(400).json({ ok: false, message: "phase 는 plan|build|review" });
   try {
@@ -536,7 +545,13 @@ app.post("/api/cards/:key/run", async (req, res) => {
       }
     }
     const reviewOnly = (b.reviewOwner && b.reviewNumber != null) ? { owner: b.reviewOwner, number: b.reviewNumber } : null;
-    res.json(runCard(key, phase, new Date().toISOString(), id, reposLines, rework, !!b.reviewAfter, reviewOnly, reworkOnly, resolveConflict));
+    const reviewLoopMax = clampReviewLoopMax(b.reviewLoopMax, cfg);
+    res.json({
+      ...runCard(key, phase, new Date().toISOString(), id, {
+        reposLines, rework, reviewAfter: !!b.reviewAfter, reviewLoopAfter, reviewLoopMax, reviewOnly, reworkOnly, resolveConflict,
+      }),
+      reviewLoopAfter, ...(reviewLoopAfter ? { reviewLoopMax } : {}),
+    });
   } catch (e) { fail(res, e); }
 });
 
@@ -600,7 +615,7 @@ app.post("/api/cards/:key/review-loop", async (req, res) => {
       const r = await gh(["pr", "comment", number, "--repo", owner, "--body", `[리뷰 반영 요청]\n${b.memo}`], cred);
       if (!r.ok) return res.json({ ok: false, message: `PR 코멘트 실패: ${(r.stderr || "").slice(0, 160)}` });
     }
-    const max = Math.min(Math.max(parseInt(b.max || cfg.reviewLoopMax || 5, 10) || 5, 1), 20);
+    const max = clampReviewLoopMax(b.max, cfg);
     res.json({ ...runReviewLoop(key, new Date().toISOString(), id, reposLines, owner, number, max), max });
   } catch (e) { fail(res, e); }
 });

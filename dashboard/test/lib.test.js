@@ -319,3 +319,14 @@ test("resolveEngine: 기본값·override·잘못된 값 폴백", () => {
   // 지원 엔진 목록
   assert.deepEqual(lib.ENGINES, ["claude", "codex", "gemini"]);
 });
+
+test("clampReviewLoopMax: 요청값 → 프로젝트 설정 → 기본 5, 1~20 clamp", () => {
+  assert.equal(lib.clampReviewLoopMax(undefined, {}), 5);              // 아무 것도 없으면 기본값
+  assert.equal(lib.clampReviewLoopMax(undefined, { reviewLoopMax: 8 }), 8);   // 프로젝트 설정
+  assert.equal(lib.clampReviewLoopMax(3, { reviewLoopMax: 8 }), 3);    // 요청값이 우선
+  assert.equal(lib.clampReviewLoopMax("7", {}), 7);                    // 문자열 수용(JSON body)
+  assert.equal(lib.clampReviewLoopMax(99, {}), 20);                    // 상한 clamp
+  assert.equal(lib.clampReviewLoopMax(0, { reviewLoopMax: 6 }), 6);    // 0·음수는 무시하고 다음 후보
+  assert.equal(lib.clampReviewLoopMax(-1, {}), 5);
+  assert.equal(lib.clampReviewLoopMax("abc", null), 5);                // 파싱 실패·cfg 없음 → 기본값
+});

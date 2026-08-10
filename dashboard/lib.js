@@ -69,6 +69,18 @@ function resolveEngine(cfg) {
   return { engine, model };
 }
 
+const REVIEW_LOOP_MAX_DEFAULT = 5;
+const REVIEW_LOOP_MAX_LIMIT = 20;
+
+// 리뷰 승인 루프 반복 상한: 요청값 → 프로젝트 설정 → 기본 5. 1~20 으로 clamp.
+// (승인까지 루프 API 와 build 후 자동 연결 양쪽에서 같은 규칙을 쓴다)
+function clampReviewLoopMax(requested, cfg) {
+  const pick = [requested, cfg && cfg.reviewLoopMax, REVIEW_LOOP_MAX_DEFAULT]
+    .map((v) => parseInt(v, 10))
+    .find((v) => Number.isFinite(v) && v > 0);
+  return Math.min(pick || REVIEW_LOOP_MAX_DEFAULT, REVIEW_LOOP_MAX_LIMIT);
+}
+
 // 카드 라벨로 대상 repo 결정: repo_<name> 라벨과 매칭. 없으면 첫 repo(기본).
 function cardRepos(p, labels) {
   const repos = normalizeRepos(p);
@@ -308,4 +320,5 @@ module.exports = {
   REPO_LABEL_PREFIX, repoNameFromUrl, normalizeRepos, cardRepos, REVIEW_APPROVED_MARKER,
   loadOrCreateEnvKey, encryptEnv, decryptEnv,
   ENGINES, DEFAULT_ENGINE, DEFAULT_MODEL, resolveEngine,
+  REVIEW_LOOP_MAX_DEFAULT, REVIEW_LOOP_MAX_LIMIT, clampReviewLoopMax,
 };

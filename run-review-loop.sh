@@ -11,6 +11,9 @@
 #   3) FORCE_REVIEW=1 run-review.sh <KEY>       (그 PR 하나만 재리뷰)
 #   4) 마커 재확인 → 있으면 성공 종료, 없으면 Slack 에 '회차 + 수정 필요' 알림 후 다음 회차
 #
+# REVIEW_FIRST=1 이면 1회차의 (2) 반영을 건너뛰고 리뷰부터 시작한다. 방금 개발해 올린 새 PR 은
+# 아직 반영할 리뷰 의견이 없으므로, build 직후 이 루프로 이어지는 경우(REVIEW_LOOP_AFTER)에 쓴다.
+#
 # REVIEW_LOOP_MAX(기본 5) 회를 넘겨도 미승인이면 사람 확인을 요청하고 종료한다.
 # 중지: <CLONE_BASE>/.state/<KEY>.reviewloop.stop 파일 생성(대시보드 '루프 중지' 버튼) 또는
 #       프로세스 트리 종료(SIGTERM). 둘 다 진행 상태를 정리하고 Slack 에 중지 알림을 보낸다.
@@ -18,7 +21,8 @@
 # 하위 스크립트의 Slack 알림은 끄고(SLACK_WEBHOOK_URL 비움) 이 스크립트가 회차를 명시해 보낸다.
 #
 # env: PROJECT_ID, CARD_REPOS, GH_TOKEN, CLONE_BASE, HISTORY_FILE, SLACK_WEBHOOK_URL,
-#      REVIEW_LOOP_MAX(기본 5) — 그 외는 하위 스크립트가 쓰는 값 그대로 상속
+#      REVIEW_LOOP_MAX(기본 5), REVIEW_FIRST(1이면 1회차 반영 생략)
+#      — 그 외는 하위 스크립트가 쓰는 값 그대로 상속
 # --------------------------------------------------------------------------
 set -uo pipefail
 
@@ -28,6 +32,7 @@ CLONE_BASE="${CLONE_BASE:-${WORK_DIR}/repos}"
 HISTORY_FILE="${HISTORY_FILE:-${WORK_DIR}/history.jsonl}"
 APPROVED_MARKER="CLAUDE-REVIEW-APPROVED"   # run-review.sh · lib.js 와 동일해야 함
 REVIEW_LOOP_MAX="${REVIEW_LOOP_MAX:-5}"
+REVIEW_FIRST="${REVIEW_FIRST:-}"           # 1이면 1회차는 반영 없이 리뷰부터(방금 올린 새 PR)
 
 ISSUE_KEY="${1:-}"
 OR="${2:-}"
@@ -98,8 +103,9 @@ is_approved() {
 stop_requested() { [[ -f "${STOP_FILE}" ]]; }
 
 write_status "starting"
-echo ">> [${ISSUE_KEY}] 리뷰 승인 루프 시작 · ${OR}#${PR_NUM} (최대 ${REVIEW_LOOP_MAX}회) · ${PR_URL}"
-notify_slack "🔁 [${ISSUE_KEY}] 리뷰 승인 루프 시작 (최대 ${REVIEW_LOOP_MAX}회) · ${OR}#${PR_NUM} · ${PR_URL}"
+MODE_NOTE=""; [[ "${REVIEW_FIRST}" == "1" ]] && MODE_NOTE=" · 리뷰부터 시작"
+echo ">> [${ISSUE_KEY}] 리뷰 승인 루프 시작 · ${OR}#${PR_NUM} (최대 ${REVIEW_LOOP_MAX}회${MODE_NOTE}) · ${PR_URL}"
+notify_slack "🔁 [${ISSUE_KEY}] 리뷰 승인 루프 시작 (최대 ${REVIEW_LOOP_MAX}회${MODE_NOTE}) · ${OR}#${PR_NUM} · ${PR_URL}"
 
 if is_approved; then
   echo ">> [${ISSUE_KEY}] ${OR}#${PR_NUM} 이미 승인 마커 존재 → 루프 불필요"
@@ -121,27 +127,32 @@ while (( ITER < REVIEW_LOOP_MAX )); do
   fi
 
   # 1) 리뷰 반영(rework) — 그 PR 하나만. 하위 Slack 알림은 끄고 회차 알림으로 대체.
-  echo ">> [${ISSUE_KEY}] === 루프 ${ITER}/${REVIEW_LOOP_MAX} 회차: 리뷰 반영(rework) ==="
-  write_status "rework"
-  REWORK_OUT="${STATE_DIR}/${ISSUE_KEY}.reviewloop.rework.out"
-  # 파이프(| tee) 대신 파일로 받는다 — 파이프라인 서브셸이 중지 시그널을 함께 받아 중지 처리가 꼬이는 것을 막는다.
-  # (엔진 진행 상황은 agent-logs/<KEY>-build.log 에서 실시간으로 볼 수 있다)
-  SLACK_WEBHOOK_URL="" REWORK=1 REWORK_ONLY_OWNER="${OR}" REWORK_ONLY_NUM="${PR_NUM}" \
-    bash "${SELF_DIR}/run-jira-agent.sh" "${ISSUE_KEY}" build > "${REWORK_OUT}" 2>&1
-  RC=$?
-  cat "${REWORK_OUT}" 2>/dev/null || true
-  stop_requested && on_term   # 중지 요청으로 하위가 죽은 경우 — 실패 알림 대신 중지 처리
-  if (( RC != 0 )); then
-    echo ">> [${ISSUE_KEY}] ${ITER}회차 리뷰 반영 실패(exit ${RC}) → 루프 중단" >&2
-    notify_slack "❌ [${ISSUE_KEY}] 리뷰 승인 루프 ${ITER}/${REVIEW_LOOP_MAX}회차 — 리뷰 반영 실패로 중단 · ${OR}#${PR_NUM} · ${PR_URL}"
-    FINAL="failed"; break
+  # REVIEW_FIRST 1회차는 건너뛴다: 방금 올린 PR 이라 반영할 리뷰 의견이 아직 없다.
+  if [[ "${REVIEW_FIRST}" == "1" && ${ITER} -eq 1 ]]; then
+    echo ">> [${ISSUE_KEY}] === 루프 1/${REVIEW_LOOP_MAX} 회차: 새 PR → 반영 생략, 리뷰부터 ==="
+  else
+    echo ">> [${ISSUE_KEY}] === 루프 ${ITER}/${REVIEW_LOOP_MAX} 회차: 리뷰 반영(rework) ==="
+    write_status "rework"
+    REWORK_OUT="${STATE_DIR}/${ISSUE_KEY}.reviewloop.rework.out"
+    # 파이프(| tee) 대신 파일로 받는다 — 파이프라인 서브셸이 중지 시그널을 함께 받아 중지 처리가 꼬이는 것을 막는다.
+    # (엔진 진행 상황은 agent-logs/<KEY>-build.log 에서 실시간으로 볼 수 있다)
+    SLACK_WEBHOOK_URL="" REWORK=1 REWORK_ONLY_OWNER="${OR}" REWORK_ONLY_NUM="${PR_NUM}" \
+      bash "${SELF_DIR}/run-jira-agent.sh" "${ISSUE_KEY}" build > "${REWORK_OUT}" 2>&1
+    RC=$?
+    cat "${REWORK_OUT}" 2>/dev/null || true
+    stop_requested && on_term   # 중지 요청으로 하위가 죽은 경우 — 실패 알림 대신 중지 처리
+    if (( RC != 0 )); then
+      echo ">> [${ISSUE_KEY}] ${ITER}회차 리뷰 반영 실패(exit ${RC}) → 루프 중단" >&2
+      notify_slack "❌ [${ISSUE_KEY}] 리뷰 승인 루프 ${ITER}/${REVIEW_LOOP_MAX}회차 — 리뷰 반영 실패로 중단 · ${OR}#${PR_NUM} · ${PR_URL}"
+      FINAL="failed"; break
+    fi
+    if grep -q "^SKIP: " "${REWORK_OUT}" 2>/dev/null; then
+      echo ">> [${ISSUE_KEY}] ${ITER}회차 리뷰 반영이 스킵됨(다른 작업이 이 카드를 처리 중) → 루프 중단" >&2
+      notify_slack "⏸ [${ISSUE_KEY}] 리뷰 승인 루프 ${ITER}/${REVIEW_LOOP_MAX}회차 — 카드가 이미 처리 중이라 중단 · ${OR}#${PR_NUM} · ${PR_URL}"
+      FINAL="skipped"; break
+    fi
+    stop_requested && on_term
   fi
-  if grep -q "^SKIP: " "${REWORK_OUT}" 2>/dev/null; then
-    echo ">> [${ISSUE_KEY}] ${ITER}회차 리뷰 반영이 스킵됨(다른 작업이 이 카드를 처리 중) → 루프 중단" >&2
-    notify_slack "⏸ [${ISSUE_KEY}] 리뷰 승인 루프 ${ITER}/${REVIEW_LOOP_MAX}회차 — 카드가 이미 처리 중이라 중단 · ${OR}#${PR_NUM} · ${PR_URL}"
-    FINAL="skipped"; break
-  fi
-  stop_requested && on_term
 
   # 2) 재리뷰 — 승인 마커가 있어도 강제(FORCE_REVIEW), 그 PR 하나만(REVIEW_ONLY_*)
   echo ">> [${ISSUE_KEY}] === 루프 ${ITER}/${REVIEW_LOOP_MAX} 회차: 재리뷰 ==="
