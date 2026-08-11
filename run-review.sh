@@ -157,7 +157,8 @@ for OR in "${R_OWNER[@]}"; do
         reviewed_any=1
         # run-review.sh 는 repo 를 clone 하지 않으므로 실제 코드 반영은 run-jira-agent.sh(build+REWORK)에 위임한다.
         # REVIEW_AFTER 는 주지 않는다 — 이 스크립트가 아래 리뷰 블록으로 갱신된 PR 을 이어서 리뷰하므로(review 락 재획득·재귀 방지).
-        REWORK=1 REWORK_ONLY_OWNER="${OR}" REWORK_ONLY_NUM="${N}" \
+        REVIEW_LOOP_AFTER="" REVIEW_AFTER="" IN_REVIEW_LOOP=1 \
+          REWORK=1 REWORK_ONLY_OWNER="${OR}" REWORK_ONLY_NUM="${N}" \
           bash "${SELF_DIR}/run-jira-agent.sh" "${ISSUE_KEY}" build \
           || echo ">> [${ISSUE_KEY}] ${OR}#${N} 리뷰 반영(rework) 실패/스킵 — 이어서 리뷰만 진행" >&2
       fi

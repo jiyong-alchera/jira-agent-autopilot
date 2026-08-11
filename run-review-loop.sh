@@ -136,7 +136,11 @@ while (( ITER < REVIEW_LOOP_MAX )); do
     REWORK_OUT="${STATE_DIR}/${ISSUE_KEY}.reviewloop.rework.out"
     # 파이프(| tee) 대신 파일로 받는다 — 파이프라인 서브셸이 중지 시그널을 함께 받아 중지 처리가 꼬이는 것을 막는다.
     # (엔진 진행 상황은 agent-logs/<KEY>-build.log 에서 실시간으로 볼 수 있다)
-    SLACK_WEBHOOK_URL="" REWORK=1 REWORK_ONLY_OWNER="${OR}" REWORK_ONLY_NUM="${PR_NUM}" \
+    # 연쇄 플래그(REVIEW_LOOP_AFTER/REVIEW_AFTER/REVIEW_FIRST)는 반드시 끊는다 — 대시보드가 최상위 build 에
+    # 넣은 값을 하위가 그대로 물려받으면 rework 가 끝나고 이 루프를 '또' 띄워, 그 중첩 실행이 락에 막혀 남긴
+    # SKIP 줄 때문에 정작 성공한 반영이 '카드 처리 중'으로 오인돼 루프가 죽는다.
+    SLACK_WEBHOOK_URL="" REVIEW_LOOP_AFTER="" REVIEW_AFTER="" REVIEW_FIRST="" IN_REVIEW_LOOP=1 \
+      REWORK=1 REWORK_ONLY_OWNER="${OR}" REWORK_ONLY_NUM="${PR_NUM}" \
       bash "${SELF_DIR}/run-jira-agent.sh" "${ISSUE_KEY}" build > "${REWORK_OUT}" 2>&1
     RC=$?
     cat "${REWORK_OUT}" 2>/dev/null || true
@@ -146,9 +150,16 @@ while (( ITER < REVIEW_LOOP_MAX )); do
       notify_slack "❌ [${ISSUE_KEY}] 리뷰 승인 루프 ${ITER}/${REVIEW_LOOP_MAX}회차 — 리뷰 반영 실패로 중단 · ${OR}#${PR_NUM} · ${PR_URL}"
       FINAL="failed"; break
     fi
-    if grep -q "^SKIP: " "${REWORK_OUT}" 2>/dev/null; then
+    # 스킵 판정은 '이 카드의 락에 막혔다'는 그 한 줄로만 한다. 하위가 찍는 다른 SKIP(중첩 루프·질문 대기)까지
+    # 싸잡으면 반영이 성공했는데도 루프가 중단된다.
+    if grep -qF "SKIP: [${ISSUE_KEY}] 이미 처리 중(lock)" "${REWORK_OUT}" 2>/dev/null; then
       echo ">> [${ISSUE_KEY}] ${ITER}회차 리뷰 반영이 스킵됨(다른 작업이 이 카드를 처리 중) → 루프 중단" >&2
       notify_slack "⏸ [${ISSUE_KEY}] 리뷰 승인 루프 ${ITER}/${REVIEW_LOOP_MAX}회차 — 카드가 이미 처리 중이라 중단 · ${OR}#${PR_NUM} · ${PR_URL}"
+      FINAL="skipped"; break
+    fi
+    if grep -qF "SKIP: awaiting answers" "${REWORK_OUT}" 2>/dev/null; then
+      echo ">> [${ISSUE_KEY}] ${ITER}회차 리뷰 반영이 질문 답변을 기다림 → 루프 중단" >&2
+      notify_slack "⏸ [${ISSUE_KEY}] 리뷰 승인 루프 ${ITER}/${REVIEW_LOOP_MAX}회차 — 카드 질문 답변 대기로 중단 · ${OR}#${PR_NUM} · ${PR_URL}"
       FINAL="skipped"; break
     fi
     stop_requested && on_term
@@ -157,7 +168,8 @@ while (( ITER < REVIEW_LOOP_MAX )); do
   # 2) 재리뷰 — 승인 마커가 있어도 강제(FORCE_REVIEW), 그 PR 하나만(REVIEW_ONLY_*)
   echo ">> [${ISSUE_KEY}] === 루프 ${ITER}/${REVIEW_LOOP_MAX} 회차: 재리뷰 ==="
   write_status "review"
-  SLACK_WEBHOOK_URL="" FORCE_REVIEW=1 REVIEW_ONLY_OWNER="${OR}" REVIEW_ONLY_NUM="${PR_NUM}" \
+  SLACK_WEBHOOK_URL="" REVIEW_LOOP_AFTER="" REVIEW_AFTER="" IN_REVIEW_LOOP=1 \
+    FORCE_REVIEW=1 REVIEW_ONLY_OWNER="${OR}" REVIEW_ONLY_NUM="${PR_NUM}" \
     bash "${SELF_DIR}/run-review.sh" "${ISSUE_KEY}" \
     || echo ">> [${ISSUE_KEY}] ${ITER}회차 재리뷰 실행 오류 — 승인 여부로 계속 판정" >&2
   stop_requested && on_term

@@ -174,6 +174,7 @@ Jira 카드를 자동으로 탐지해 **Claude가 개발 → PR 생성 → 카�
 **개발 → PR → 리뷰 승인 루프 연속 진행(`REVIEW_LOOP_AFTER=1`)**: build 가 성공하면 이 실행에서 만든 **PR 마다** `run-review-loop.sh <KEY> <owner/repo> <번호>` 를 `REVIEW_FIRST=1` 로 이어서 돌린다([4.3c](#43c-run-review-loopsh-승인까지-반복-루프--대시보드-승인까지-루프)). 멀티 repo 로 PR 이 여러 개면 **순차** 실행한다(승인 루프 락이 카드당 하나라 동시 실행 불가). PR URL 파싱에 실패한 줄은 건너뛰고 로그에 남긴다.
 
 - **락을 먼저 놓는다**: 승인 루프는 회차마다 내부에서 `REWORK=1 run-jira-agent.sh … build` 로 이 카드의 `<KEY>.lock` 을 다시 잡으므로, 루프를 띄우기 전에 `release_lock` 으로 락·`.pid`/`.phase` 를 해제한다(EXIT 트랩과 중복 호출돼도 안전). 이 시점부터 대시보드의 '처리 중' 표시는 build 락이 아니라 **승인 루프 상태**(`.reviewloop.json`)로 넘어간다.
+- **자기 중첩 방지 가드**: `REWORK=1` 이거나 `IN_REVIEW_LOOP=1` 이면 `REVIEW_LOOP_AFTER=1` 이어도 루프를 띄우지 않는다. 이 플래그는 대시보드가 **최상위 build 프로세스 env** 에 넣는 값이라 자손이 그대로 상속하는데, 루프가 회차마다 부르는 rework 실행이 이를 물려받아 루프를 또 띄우면 중첩 실행이 루프 락에 막혀 `SKIP` 을 남기고 부모 루프가 그 줄을 반영 실패로 오인해 멈춘다(4.3c 의 '연쇄 플래그 차단'과 한 쌍).
 - `REVIEW_AFTER`(rework 후 1회 재리뷰)와는 **배타적**이다 — 대시보드는 rework·충돌 해소가 아닌 순수 build 단건 실행에만 이 옵션을 붙인다.
 
 매 실행 종료 시 결과(성공/스킵/실패 + PR URL·브랜치)를 `HISTORY_FILE`(기본 `history.jsonl`)에 JSONL 로 기록한다. **성공/rework 시 생성된 PR 이 여러 개면(멀티 repo) PR 마다 한 줄씩** 기록해 처리 이력에 개별 행으로 보이게 한다(PR 없는 skip 은 1줄). **브랜치명은 각 PR URL 로 `gh pr view --json headRefName` 을 조회해 PR 의 실제 head 브랜치를 사용**하므로 `feat/`·`fix/` 등 접두사에 무관하게 정확히 기록된다(조회 실패 시 claude 출력에서 접두사 포괄 추출로 폴백). 대시보드 병합(`/api/cards/:key/merge`)도 동일하게 병합된 PR 의 head 브랜치를 이력에 남긴다.
@@ -246,7 +247,8 @@ Jira 카드를 자동으로 탐지해 **Claude가 개발 → PR 생성 → 카�
 - **상한**: `REVIEW_LOOP_MAX`(기본 5, 대시보드가 주입 · 설정 `reviewLoopMax`). 상한을 넘겨도 미승인이면 **사람 확인 요청**(`⏸`) 후 종료. `run-review.sh` 의 `MAX_AUTO_REWORK`(자동 주기용 상한)와는 별개다.
 - **중지**: `.state/<KEY>.reviewloop.stop` 파일(대시보드 '루프 중지' 버튼이 생성) 또는 프로세스 트리 SIGTERM. 둘 다 **진행 중인 반영/리뷰까지 즉시 종료**하고 이력에 `stopped` 를 남긴다. 중지 처리는 마커 디렉토리(`.reviewloop.term`)로 **1회만** 수행된다.
 - **동시 실행 방지**: 카드당 하나 — `.state/<KEY>.reviewloop.lock`(+`.pid`/`.phase`). 대시보드는 이 락도 '처리 중'으로 인식한다. 하위 `run-jira-agent.sh`/`run-review.sh` 는 각자 `<KEY>.lock`/`<KEY>.review.lock` 을 회차마다 잡았다 놓는다.
-- **중단 조건**: PR 이 OPEN 이 아님(병합·닫힘), 반영 실패(exit≠0), 다른 작업이 카드 락을 쥐고 있어 반영이 `SKIP` 됨 — 모두 Slack 알림 후 루프를 멈춘다.
+- **중단 조건**: PR 이 OPEN 이 아님(병합·닫힘), 반영 실패(exit≠0), 다른 작업이 **카드 락**을 쥐고 있어 반영이 스킵됨(`SKIP: [KEY] 이미 처리 중(lock)`), 카드가 **질문 답변 대기**(`SKIP: awaiting answers`) — 모두 Slack 알림 후 루프를 멈춘다. 스킵 판정은 이 두 문구를 **정확히 매칭**한다(하위가 찍는 다른 `SKIP:` 줄에 오인 중단되지 않도록).
+- **연쇄 플래그 차단**: 회차마다 띄우는 하위 실행에는 `REVIEW_LOOP_AFTER`/`REVIEW_AFTER`/`REVIEW_FIRST` 를 **빈 값으로 덮고 `IN_REVIEW_LOOP=1`** 을 준다. 대시보드가 최상위 build 프로세스 env 에 넣은 `REVIEW_LOOP_AFTER=1` 은 자손 프로세스에 그대로 상속되므로, 끊지 않으면 rework 가 끝난 뒤 이 루프를 **또** 띄운다(→ 중첩 실행이 루프 락에 막혀 `SKIP` 을 찍고, 성공한 반영이 '카드 처리 중'으로 오인돼 2회차에서 루프가 죽는다). `run-jira-agent.sh` 쪽에도 대칭 가드가 있다(4.1).
 - **Slack 알림**(모두 회차 표기): 시작 `🔁 … 루프 시작 (최대 N회)`, **미승인 `📝 … 리뷰 루프 i/N회차 — 수정 필요(미승인)`**, 승인 `✅ … 리뷰 승인 완료 (루프 i/N회차)`, 상한 `⏸`, 중지 `⏹`, 반영 실패 `❌`. 하위 스크립트의 Slack 알림은 **끄고**(`SLACK_WEBHOOK_URL=""` 주입) 루프가 대표해서 보내 중복을 막는다.
 - **진행 상태**: 회차·단계를 `.state/<KEY>.reviewloop.json`(`{iter,max,step,owner,number,…}`)에 기록 → 대시보드가 5초마다 폴링해 버튼 옆에 `🔁 승인 루프 2/5회차 · 리뷰 중` 으로 표시한다. 이력은 회차마다 `review-loop/reviewed`, 종료 시 `approved`/`stopped`/`failed`.
 - 루프 진행 로그는 `loop-review.log`, 엔진 상세 로그는 기존대로 `agent-logs/<KEY>-build.log`·`<KEY>-review.log`(대시보드 '엔진 실행 로그'에서 실시간 확인).
@@ -531,6 +533,7 @@ loop-work/                     # (= 저장소 루트)
    ├─ server.js                # Express 백엔드 (라우팅·루프·Jira REST)
    ├─ lib.js                   # 순수 로직 + 프로젝트 스토어 (단위 테스트 대상)
    ├─ test/lib.test.js         # 단위 테스트 (node:test) — `npm test`
+   ├─ test/review-loop.test.js # run-review-loop.sh 회귀 테스트 (하위 스크립트·gh 스텁, 네트워크 불필요)
    ├─ package.json
    ├─ public/index.html        # React 대시보드 (CDN)
    ├─ projects.json            # 프로젝트 목록(설정) (gitignore)
@@ -571,6 +574,7 @@ loop-work/                     # (= 저장소 루트)
 | PR 에서 "This branch cannot be rebased due to conflicts" · merge/Rebase 버튼 비활성화 | 자동화가 base(main)와 충돌하거나 뒤처졌을 때 **base 를 브랜치로 `git merge` 해서 해소** → 브랜치에 **merge 커밋**이 생김. GitHub 는 merge 커밋이 있는 브랜치를 'Rebase and merge' 할 수 없어 버튼을 막고, 실제 base 충돌 시엔 모든 merge 버튼이 비활성화됨 | (해결됨) **예방**: build·rework 프롬프트에 **"브랜치 위생 — base 를 브랜치로 merge 금지, `git rebase origin/<base>` 만 사용, merge 커밋 만들지 말 것"** 명시(rebase 후 `--force-with-lease` push). **복구**: PR 목록의 `⚠️ base 충돌` PR에 **"⚠️ 충돌 해소 후 재푸시"** 버튼(`resolveConflict` 모드) → 그 PR 브랜치를 base 위로 rebase·충돌 해소·검증 후 force-push 해 선형·병합가능 상태로 되돌림 |
 | 처리 이력 "PR 브랜치" 열이 비어 있음(`–`) | (해결됨) 브랜치 추출이 `feature/` 접두사로 고정돼 `feat/`·`fix/` 등 다른 접두사 브랜치를 못 잡음 | 수정됨: PR URL 로 `gh pr view --json headRefName` 을 조회해 실제 head 브랜치 기록(접두사 무관), merge 경로도 동일. 과거 누락분은 PR URL 로 역산해 `history.jsonl` 백필 가능 |
 | build 후 카드 본문 이미지가 깨짐(Jira·대시보드 모두 안 보임) | (해결됨) 완료 내역을 추가할 때 claude 가 설명을 markdown 으로 읽고 통째로 다시 써넣어, 붙여넣은 이미지 media 노드가 죽은 `external blob:` 참조로 재인코딩됨 | 수정됨: 완료 요약은 `SUMMARY_FILE` 에 저장하고 `append-summary.js` 가 설명 ADF 에 직접 append(기존 이미지/노드 보존). **단, 이미 깨진 blob 이미지는 복구 불가 — 작성자가 카드에 이미지를 다시 첨부해야 함** |
+| 리뷰 승인 루프가 **2회차에서 항상 멈춤** — Slack `⏸ … 2/5회차 — 카드가 이미 처리 중이라 중단`, 직전 로그에 `PR 생성 완료 → 리뷰 승인 루프 시작` + `SKIP: … 리뷰 승인 루프가 이미 실행 중입니다(lock)` | (해결됨) 대시보드가 최상위 build 의 env 에 넣은 `REVIEW_LOOP_AFTER=1` 이 자손 프로세스에 상속돼, 루프가 2회차에 부른 rework(`run-jira-agent.sh build`)가 **반영에 성공한 뒤 승인 루프를 또 띄움** → 중첩 실행이 루프 락에 막혀 `SKIP:` 을 찍고, 부모 루프의 `grep "^SKIP: "` 가 이를 **자기 카드 락 스킵으로 오인**해 중단. 반영은 이미 성공했으므로 재리뷰만 유실됨 | 수정됨: ① 루프가 하위를 부를 때 `REVIEW_LOOP_AFTER`/`REVIEW_AFTER`/`REVIEW_FIRST` 를 비우고 `IN_REVIEW_LOOP=1` 주입 ② `run-jira-agent.sh` 는 `REWORK`/`IN_REVIEW_LOOP` 이면 루프를 띄우지 않음 ③ 스킵 판정을 `SKIP: [KEY] 이미 처리 중(lock)` / `SKIP: awaiting answers` 정확 매칭으로 좁힘. 중단된 카드는 PR 목록의 `🔁 승인까지 루프` 로 이어서 진행 |
 | build 완료인데 카드 설명에 '완료 내역' 이 안 기재됨 | (해결됨) ① `set -u` 환경에서 append 단계가 `${JIRA_SITE}` 를 기본값 없이 참조해 변수 미설정 시 그 줄에서 스크립트가 죽음 ② 대시보드 단건 실행(`scriptEnv`)이 `JIRA_SITE`·`ATLASSIAN_EMAIL`·`ATLASSIAN_TOKEN` 을 주입하지 않아 자격증명이 비어 append 가 생략됨 | 수정됨: append 블록의 모든 변수 참조를 `${VAR:-}` 로 안전화 + `scriptEnv`(단건 실행)에도 Jira REST 자격증명 주입. 누락된 과거 카드는 '리뷰 반영(rework)' 재실행으로 요약 재생성·기재 가능 |
 
 ---

@@ -493,7 +493,9 @@ if [[ "${RESULT}" == "success" || "${RESULT}" == "skip" || "${RESULT}" == "rewor
     # 개발→PR 후 리뷰 승인 루프까지 연속 진행: 생성된 PR 마다 승인될 때까지 '리뷰 → 반영 → 재리뷰' 반복.
     # 루프가 내부에서 이 카드의 락(<KEY>.lock)을 다시 잡으므로 먼저 놓고 실행한다.
     # 새 PR 이라 반영할 의견이 없으므로 REVIEW_FIRST 로 1회차는 리뷰부터.
-    if [[ "${REVIEW_LOOP_AFTER}" == "1" && "${PHASE}" == "build" && -f "${SELF_DIR}/run-review-loop.sh" ]]; then
+    # 이미 루프 안(IN_REVIEW_LOOP)이거나 rework 실행이면 띄우지 않는다 — 루프가 자기 자신을 중첩 실행하게 된다.
+    if [[ "${REVIEW_LOOP_AFTER}" == "1" && "${PHASE}" == "build" && -z "${REWORK:-}" && -z "${IN_REVIEW_LOOP:-}" \
+          && -f "${SELF_DIR}/run-review-loop.sh" ]]; then
       release_lock
       while IFS= read -r pr_line; do
         [[ -z "${pr_line}" ]] && continue
