@@ -50,6 +50,7 @@ FAILED_LABEL="${FAILED_LABEL:-claude-failed}"   # 반복 실패 카드 표시(�
 PR_OPEN_LABEL="${PR_OPEN_LABEL:-claude-pr}"     # PR 올림(병합 대기) 표시 — build 가 추가, 병합 시 완료 전환
 TARGET_BRANCH_LABEL="${TARGET_BRANCH_LABEL:-claude-branched}"   # plan 이 타겟(작업) 브랜치를 만들었음을 표시하는 라벨
 TARGET_BRANCH_MARK="🌿 타겟 브랜치:"           # Jira 코멘트에 타겟 브랜치명을 남기는 마커(build 가 이걸로 브랜치 인식)
+NO_REWORK_MARK="NO_REWORK_NEEDED"               # rework 무변경(반영할 새 피드백 없음) 마커 — run-review-loop.sh 와 동일해야 함
 MAX_RETRIES="${MAX_RETRIES:-3}"                 # 연속 실패 N회 초과 시 실패 처리
 TEST_CMD="${TEST_CMD:-}"                        # 테스트 명령(비우면 claude 가 자동 감지)
 BUILD_CMD="${BUILD_CMD:-}"                      # 빌드 명령(비우면 claude 가 자동 감지)
@@ -328,7 +329,9 @@ ${FEEDBACK_INSTR}
    - push 후 'gh pr edit <번호> --body-file <파일>' 로 그 PR 의 본문을 이번 리뷰 반영까지 포함한 최신 내용으로 갱신하세요.
      ${PR_BODY_INSTR}
 7. 반영 후 Jira 이슈 ${ISSUE_KEY} 에 '리뷰 반영 완료' 코멘트(반영 항목 요약 + 갱신된 PR URL)를 남기세요. 이슈 '상태는 변경하지 마세요'.
-PR 을 하나도 갱신하지 못했으면(반영할 PR 없음 등) 사유를 출력하고 비정상 종료하세요.
+[종료 규칙] 아래 둘을 구분하세요.
+ - '반영할 새 피드백이 없음'(지적이 이미 모두 반영돼 고칠 것이 없음): 정상입니다. 확인 근거를 쓴 뒤 마지막 줄에 정확히 '${NO_REWORK_MARK}' 한 줄만 출력하고 '정상 종료'하세요. 커밋·푸시·Jira 코멘트는 하지 마세요(반영 사실이 없는데 '반영 완료'를 남기지 않습니다).
+ - '반영할 PR 자체가 없음 / 반영을 시도했으나 실패': 비정상입니다. 사유를 출력하고 비정상 종료하세요.
 완료 후 갱신한 PR URL 들을 출력하세요."
 elif [[ -n "${RESOLVE_CONFLICT:-}" ]]; then
   echo ">> [${ISSUE_KEY}] [RESOLVE-CONFLICT] base 충돌 rebase 해소 + 재푸시${REWORK_ONLY_OWNER:+ · 대상 PR ${REWORK_ONLY_OWNER}#${REWORK_ONLY_NUM:-}}"
@@ -441,6 +444,13 @@ if [[ "${CLAUDE_OK}" -eq 0 ]]; then
   fi
   if grep -q 'SKIP:' "${CLAUDE_OUT}"; then
     RESULT="skip"
+  elif [[ -n "${REWORK:-}" ]] && grep -qF "${NO_REWORK_MARK}" "${CLAUDE_OUT}"; then
+    # 반영할 새 피드백이 없어 아무것도 고치지 않은 정상 종료. PR 이 갱신되지 않는 게 맞으므로
+    # '미완료(재시도 대상)' 로 몰면 안 된다 — 승인 루프가 이걸 반영 실패로 보고 중단했었다.
+    RESULT="noop"
+    [[ -z "${PR_URL}" && -n "${REWORK_ONLY_OWNER:-}" && -n "${REWORK_ONLY_NUM:-}" ]] \
+      && PR_URL="https://github.com/${REWORK_ONLY_OWNER}/pull/${REWORK_ONLY_NUM}"
+    echo ">> [${ISSUE_KEY}] 반영할 새 리뷰 피드백 없음 → 변경 없이 종료(정상)"
   elif [[ "${PHASE}" == "build" && -z "${PR_URL}" ]]; then
     # build/rework 인데 PR URL 이 없으면 미완료(예: 작업을 백그라운드로 미루고 종료) → 재시도 대상
     RESULT="incomplete"
@@ -452,7 +462,7 @@ if [[ "${CLAUDE_OK}" -eq 0 ]]; then
   fi
 fi
 
-if [[ "${RESULT}" == "success" || "${RESULT}" == "skip" || "${RESULT}" == "rework" ]]; then
+if [[ "${RESULT}" == "success" || "${RESULT}" == "skip" || "${RESULT}" == "rework" || "${RESULT}" == "noop" ]]; then
   rm -f "${FAIL_FILE}"
   echo ">> [${ISSUE_KEY}] 완료 (phase=${PHASE}, result=${RESULT})"
   record_history_prs "${RESULT}"   # 생성된 PR 을 repo 별로 각각 이력에 기록(멀티 repo)

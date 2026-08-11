@@ -31,6 +31,7 @@ WORK_DIR="${WORK_DIR:-${SELF_DIR}}"
 CLONE_BASE="${CLONE_BASE:-${WORK_DIR}/repos}"
 HISTORY_FILE="${HISTORY_FILE:-${WORK_DIR}/history.jsonl}"
 APPROVED_MARKER="CLAUDE-REVIEW-APPROVED"   # run-review.sh · lib.js 와 동일해야 함
+NO_REWORK_MARK="NO_REWORK_NEEDED"          # run-jira-agent.sh 의 '반영할 새 피드백 없음' 마커와 동일해야 함
 REVIEW_LOOP_MAX="${REVIEW_LOOP_MAX:-5}"
 REVIEW_FIRST="${REVIEW_FIRST:-}"           # 1이면 1회차는 반영 없이 리뷰부터(방금 올린 새 PR)
 
@@ -115,6 +116,7 @@ if is_approved; then
 fi
 
 FINAL="exhausted"
+NOOP_STREAK=0   # 연속 무변경 반영 횟수(2회면 진전 없음으로 판단)
 while (( ITER < REVIEW_LOOP_MAX )); do
   ITER=$(( ITER + 1 ))
   stop_requested && on_term
@@ -161,6 +163,19 @@ while (( ITER < REVIEW_LOOP_MAX )); do
       echo ">> [${ISSUE_KEY}] ${ITER}회차 리뷰 반영이 질문 답변을 기다림 → 루프 중단" >&2
       notify_slack "⏸ [${ISSUE_KEY}] 리뷰 승인 루프 ${ITER}/${REVIEW_LOOP_MAX}회차 — 카드 질문 답변 대기로 중단 · ${OR}#${PR_NUM} · ${PR_URL}"
       FINAL="skipped"; break
+    fi
+    # 반영할 새 피드백이 없어 아무것도 안 고친 회차(정상). 직전 리뷰가 이미 반영된 상태일 수 있으므로
+    # 재리뷰로 넘겨 판정한다. 다만 두 회차 연속 무변경이면 더 진전될 게 없으므로 사람 확인으로 넘긴다.
+    if grep -qF "${NO_REWORK_MARK}" "${REWORK_OUT}" 2>/dev/null; then
+      NOOP_STREAK=$(( NOOP_STREAK + 1 ))
+      if (( NOOP_STREAK >= 2 )); then
+        echo ">> [${ISSUE_KEY}] ${ITER}회차도 반영할 새 피드백 없음(연속 ${NOOP_STREAK}회) → 진전 없음, 루프 중단" >&2
+        notify_slack "⏸ [${ISSUE_KEY}] 리뷰 승인 루프 ${ITER}/${REVIEW_LOOP_MAX}회차 — 반영할 새 피드백이 없어 진전 없음, 사람 확인 필요 · ${OR}#${PR_NUM} · ${PR_URL}"
+        FINAL="noop"; break
+      fi
+      echo ">> [${ISSUE_KEY}] ${ITER}회차 반영할 새 피드백 없음 → 재리뷰로 판정"
+    else
+      NOOP_STREAK=0
     fi
     stop_requested && on_term
   fi

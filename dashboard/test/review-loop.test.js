@@ -35,7 +35,7 @@ printf '%s|REVIEW_LOOP_AFTER=%s|REVIEW_AFTER=%s|IN_REVIEW_LOOP=%s\\n' \\
   return { root, bin };
 }
 
-function runLoop(reworkStdout) {
+function runLoop(reworkStdout, envOverrides) {
   const { root, bin } = makeSandbox(reworkStdout);
   const r = spawnSync("bash", [path.join(root, "run-review-loop.sh"), KEY, OR, PR], {
     encoding: "utf8",
@@ -50,6 +50,7 @@ function runLoop(reworkStdout) {
       REVIEW_FIRST: "1",          // 1회차는 반영 생략(개발 직후 새 PR)
       REVIEW_LOOP_AFTER: "1",     // 대시보드가 최상위 build 에 넣는 값 — 하위로 새면 안 된다
       REVIEW_AFTER: "1",
+      ...(envOverrides || {}),
     },
   });
   const calls = fs.existsSync(path.join(root, "calls.log"))
@@ -91,4 +92,19 @@ test("review-loop: 질문 답변 대기(SKIP: awaiting answers)면 그 사유로
   const { stdout } = runLoop(`echo "SKIP: awaiting answers"`);
   assert.match(stdout, /질문 답변을 기다림/);
   assert.doesNotMatch(stdout, /다른 작업이 이 카드를 처리 중/);
+});
+
+test("review-loop: 반영할 새 피드백이 없는 회차는 실패가 아니라 재리뷰로 넘어간다", () => {
+  // 직전 회차가 이미 반영·push 한 뒤라 고칠 게 없는 상태 — 판정은 재리뷰가 해야 한다
+  const { stdout, calls } = runLoop(`echo NO_REWORK_NEEDED`, { REVIEW_FIRST: "" });
+  assert.doesNotMatch(stdout, /리뷰 반영 실패/);
+  assert.match(stdout, /1회차 반영할 새 피드백 없음 → 재리뷰로 판정/);
+  assert.equal(calls.filter((l) => l.startsWith("review|")).length, 1);
+});
+
+test("review-loop: 무변경 반영이 2회 연속이면 진전 없음으로 중단한다", () => {
+  const { stdout, calls } = runLoop(`echo NO_REWORK_NEEDED`, { REVIEW_FIRST: "", REVIEW_LOOP_MAX: "4" });
+  assert.match(stdout, /연속 2회.*진전 없음, 루프 중단/);
+  assert.equal(calls.filter((l) => l.startsWith("rework|")).length, 2);   // 3회차는 없음
+  assert.equal(calls.filter((l) => l.startsWith("review|")).length, 1);   // 1회차 재리뷰만
 });
