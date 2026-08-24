@@ -10,6 +10,8 @@
 // --------------------------------------------------------------------------
 const fs = require("fs");
 const path = require("path");
+// docx·xlsx·pptx 는 Read 로 열어도 의미가 없어 텍스트로 변환해 넘긴다.
+const { extractOfficeText, isConvertibleOffice } = require(path.join(__dirname, "lib-office"));
 
 const MAX_CARD_IMAGES = 10;
 const MAX_CARD_DOCS = 10;
@@ -41,18 +43,32 @@ const isImage = (a) => String(a.mimeType || "").startsWith("image/");
 async function fetchAttachmentTo(cfg, auth, a, dir) {
   const safe = String(a.filename || `att-${a.id}`).replace(/[^\w.\-]/g, "_");
   const p = path.join(dir, `${a.id}-${safe}`);
-  // 첨부는 불변(같은 id = 같은 파일) — 이미 받아둔 게 크기까지 같으면 재다운로드 생략.
-  try { if (fs.existsSync(p) && (!a.size || fs.statSync(p).size === Number(a.size))) return p; } catch { /* stat 실패 시 재다운로드 */ }
+  const txtPath = `${p}.txt`;   // 오피스 변환 결과 경로
+  // 첨부는 불변(같은 id = 같은 파일) — 이미 받아둔 게 있으면 재다운로드/재변환 생략.
+  // 오피스는 변환 결과라 원본 크기와 비교할 수 없으므로 존재 여부로만 판단한다.
+  if (isConvertibleOffice(a)) {
+    try { if (fs.existsSync(txtPath) && fs.statSync(txtPath).size > 0) return txtPath; } catch { /* 재변환 */ }
+  } else {
+    try { if (fs.existsSync(p) && (!a.size || fs.statSync(p).size === Number(a.size))) return p; } catch { /* stat 실패 시 재다운로드 */ }
+  }
   let up = await fetch(`https://${cfg.jiraSite}/rest/api/3/attachment/content/${a.id}`, { headers: { Authorization: `Basic ${auth}` }, redirect: "manual", signal: AbortSignal.timeout(30000) });
   const loc = up.headers.get("location");
   if (up.status >= 300 && up.status < 400 && loc) up = await fetch(loc, { signal: AbortSignal.timeout(30000) });
   if (!up.ok) return null;
-  fs.writeFileSync(p, Buffer.from(await up.arrayBuffer()));
+  const body = Buffer.from(await up.arrayBuffer());
+  if (isConvertibleOffice(a)) {
+    // 원본 바이너리는 남기지 않는다 — Claude 가 읽는 건 변환된 .txt 뿐이다.
+    const text = extractOfficeText(body, a.filename);
+    if (!text) return null;
+    fs.writeFileSync(txtPath, `[${a.filename} 에서 추출한 텍스트]\n\n${text}\n`);
+    return txtPath;
+  }
+  fs.writeFileSync(p, body);
   return p;
 }
 
 // cfg: { jiraSite, cloneBase, workDir }  cred: { atlassianEmail, atlassianToken }
-// 읽을 수 없는 바이너리(오피스 문서·압축 등)는 받지 않고 로그로만 남긴다.
+// 오피스(docx·xlsx·pptx)는 텍스트로 변환해 넘기고, 그래도 읽을 수 없는 것(압축·영상 등)은 받지 않고 로그로만 남긴다.
 async function downloadCardAttachments(cfg, cred, key, log = () => {}) {
   const empty = { images: [], docs: [] };
   if (!cred || !cred.atlassianEmail || !cred.atlassianToken || !cfg.jiraSite) return empty;
@@ -63,8 +79,11 @@ async function downloadCardAttachments(cfg, cred, key, log = () => {}) {
     const d = await r.json();
     const all = (d.fields && d.fields.attachment) || [];
     let imgs = all.filter(isImage);
-    let docs = all.filter(isReadableDoc);
-    const skipped = all.filter((a) => !isImage(a) && !isReadableDoc(a));
+    // 오피스(docx·xlsx·pptx)는 그대로는 못 읽지만 텍스트로 변환해 넘기므로 문서에 포함한다.
+    let docs = all.filter((a) => isReadableDoc(a) || isConvertibleOffice(a));
+    const nOffice = docs.filter(isConvertibleOffice).length;
+    if (nOffice) log(`[${key}] 오피스 첨부 ${nOffice}개는 텍스트로 변환해 인식`);
+    const skipped = all.filter((a) => !isImage(a) && !isReadableDoc(a) && !isConvertibleOffice(a));
     if (skipped.length) log(`[${key}] 첨부 ${skipped.length}개는 Claude 가 읽을 수 없어 제외: ${skipped.map((a) => a.filename).join(", ")}`);
     if (imgs.length > MAX_CARD_IMAGES) { log(`[${key}] 이미지 ${imgs.length}장 중 ${MAX_CARD_IMAGES}장만 인식(상한)`); imgs = imgs.slice(0, MAX_CARD_IMAGES); }
     const tooBig = docs.filter((a) => Number(a.size || 0) > MAX_DOC_BYTES);
@@ -83,7 +102,7 @@ async function downloadCardAttachments(cfg, cred, key, log = () => {}) {
   } catch { return empty; }
 }
 
-module.exports = { downloadCardAttachments, isReadableDoc, MAX_CARD_IMAGES, MAX_CARD_DOCS, MAX_DOC_BYTES };
+module.exports = { downloadCardAttachments, isReadableDoc, isConvertibleOffice, MAX_CARD_IMAGES, MAX_CARD_DOCS, MAX_DOC_BYTES };
 
 // ===== CLI: node lib-attachments.js <ISSUE-KEY> =====
 if (require.main === module) {

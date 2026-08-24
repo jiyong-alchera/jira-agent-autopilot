@@ -105,7 +105,7 @@ if [[ -n "${CARD_DOCS:-}" ]]; then
   _docs=""
   while IFS= read -r _p; do [[ -n "${_p}" ]] && _docs+="       - ${_p}"$'\n'; done <<< "${CARD_DOCS}"
   ATTACH_INSTR="${ATTACH_INSTR}
-   - 연동 Jira 이슈 첨부 '문서'(PDF·텍스트·스펙·코드 등) — 'Read' 도구로 열어 내용을 파악하고 요구사항 대비 구현 검토에 활용하세요:
+   - 연동 Jira 이슈 첨부 '문서'(PDF·텍스트·스펙·코드 등. '.docx.txt' 류는 오피스 첨부에서 추출한 텍스트) — 'Read' 도구로 열어 내용을 파악하고 요구사항 대비 구현 검토에 활용하세요:
 ${_docs}"
 fi
 

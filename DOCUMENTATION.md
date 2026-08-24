@@ -159,7 +159,12 @@ Jira 카드를 자동으로 탐지해 **Claude가 개발 → PR 생성 → 카�
      - **그 외 모든 경로**(대시보드 **단건 즉시 실행**·승인 루프의 rework/재리뷰·수동 실행): `run-cycle` 를 거치지 않아 env 가 비어 있으므로, `run-jira-agent.sh`·`run-review.sh` 가 **`node lib-attachments.js <KEY>` 를 직접 호출**해 받는다(`IMG:`/`DOC:` 접두사 줄을 파싱). **이 폴백이 없을 때는 대시보드에서 plan/build 를 단건 실행하면 카드 본문 이미지를 못 보고 작업했다**(11 트러블슈팅).
      - **이미지**(`image/*`): `<CLONE_BASE>/.state/<KEY>.images/`, 최대 `MAX_CARD_IMAGES`=10장 → `CARD_IMAGES`. "이미지를 `Read` 로 열어 **시각 인식**하라"(스크린샷·다이어그램·UI 시안·오류 화면 등).
      - **문서**(Claude 가 읽을 수 있는 비이미지 — PDF·텍스트·마크다운·JSON·CSV·소스코드 등): `<CLONE_BASE>/.state/<KEY>.docs/`, 최대 `MAX_CARD_DOCS`=10개, 파일당 `MAX_DOC_BYTES`=25MB 초과 제외 → `CARD_DOCS`. "문서를 `Read` 로 열어 내용을 파악하라". 판정은 `mimeType` 우선(+확장자 폴백, `isReadableDoc`).
-     - **제외**: 오피스 바이너리(.docx/.xlsx/.pptx)·압축(.zip) 등 `Read` 로 의미 있게 열 수 없는 첨부는 다운로드하지 않고 로그로만 남긴다(어떤 파일이 제외됐는지 표시).
+     - **오피스 변환**(`lib-office.js`): **docx·xlsx·pptx** 는 `Read` 로 열어도 압축 바이너리라 의미가 없으므로 **텍스트로 변환해 `<원본이름>.txt` 로 저장한 뒤 그 경로를 넘긴다**(원본 바이너리는 저장하지 않음). 외부 의존성 없이 최소 zip 리더(중앙 디렉터리 + `zlib.inflateRawSync`) + XML 태그 스트리핑으로 처리한다.
+       - **docx**: 문단(`<w:p>`)·줄바꿈·탭·표 셀 경계를 살려 본문 추출
+       - **xlsx**: 시트별 TSV — `workbook.xml`+rels 로 **시트 표시 이름**을 해석하고 공유 문자열(`sharedStrings`)·`inlineStr`·숫자 셀을 모두 처리
+       - **pptx**: 슬라이드별로 텍스트 런(`<a:t>`)을 문단 단위로 병합
+       - 변환 결과는 **1MB 상한**(초과 시 잘림 표시). 깨진/암호화 파일은 변환 실패로 **조용히 목록에서 빠진다**(본 작업을 막지 않음). 구형 바이너리(.doc/.xls/.ppt)는 OOXML 이 아니라 대상이 아니다.
+     - **제외**: 압축(.zip)·영상·디자인 파일(.fig) 등 위 어디에도 해당하지 않는 첨부는 다운로드하지 않고 로그로만 남긴다(어떤 파일이 제외됐는지 표시).
      - 즉 plan·review 모두 카드 텍스트뿐 아니라 첨부(이미지·문서)를 추론에 활용한다. review 는 PR diff·Jira 텍스트에 더해 **연동 이슈 첨부**까지 대조한다.
      - **다운로드 캐시**: 첨부는 불변(같은 `id`=같은 파일)이라 **이미 받아둔 파일이 크기까지 같으면 재다운로드하지 않는다**(`fetchAttachmentTo`). 주기마다 같은 이미지·문서를 다시 받던 낭비 제거.
      - **재리뷰에서는 다시 열지 않는다**: [증분 재리뷰](#43b-run-reviewsh-pr-자동-리뷰) 모드면 "첨부는 직전 리뷰에서 이미 검토했고 바뀌지 않았으니 다시 열지 말라"고 지시하고 **경로만 한 줄로** 알려준다(새 코멘트가 특정 첨부를 지목할 때만 그 파일 하나만 `Read`). 이미지 1장이 수천 토큰이라 회차마다 최대 10장을 다시 읽던 비용이 사라진다.
@@ -530,6 +535,7 @@ loop-work/                     # (= 저장소 루트)
 ├─ loop-*.log                  # 루프 로그 (gitignore)
 ├─ run-cycle.js                # 한 사이클: 모든 프로젝트 순회 detect→실행 (루프가 호출)
 ├─ lib-attachments.js          # 카드 첨부(이미지·문서) 다운로드 — run-cycle 는 모듈로, 셸은 CLI 로 사용
+├─ lib-office.js               # docx·xlsx·pptx → 텍스트 변환(최소 zip 리더 + XML 파싱, 무의존성)
 ├─ append-summary.js           # 완료 요약을 설명 ADF 에 안전 append(기존 이미지/노드 보존)
 ├─ render-claude-stream.js     # claude stream-json → 사람이 읽는 전사 + 결과 추출
 ├─ history.jsonl               # 처리 이력 JSONL (gitignore, 런타임 생성)
@@ -541,6 +547,7 @@ loop-work/                     # (= 저장소 루트)
    ├─ test/lib.test.js         # 단위 테스트 (node:test) — `npm test`
    ├─ test/review-loop.test.js # run-review-loop.sh 회귀 테스트 (하위 스크립트·gh 스텁, 네트워크 불필요)
    ├─ test/attachments.test.js # 카드 첨부(이미지·문서) 인식 회귀 테스트 (fetch 스텁, 네트워크 불필요)
+   ├─ test/office.test.js      # docx·xlsx·pptx 변환 테스트 (실제 zip 컨테이너를 만들어 검증)
    ├─ package.json
    ├─ public/index.html        # React 대시보드 (CDN)
    ├─ projects.json            # 프로젝트 목록(설정) (gitignore)
@@ -582,6 +589,7 @@ loop-work/                     # (= 저장소 루트)
 | 처리 이력 "PR 브랜치" 열이 비어 있음(`–`) | (해결됨) 브랜치 추출이 `feature/` 접두사로 고정돼 `feat/`·`fix/` 등 다른 접두사 브랜치를 못 잡음 | 수정됨: PR URL 로 `gh pr view --json headRefName` 을 조회해 실제 head 브랜치 기록(접두사 무관), merge 경로도 동일. 과거 누락분은 PR URL 로 역산해 `history.jsonl` 백필 가능 |
 | build 후 카드 본문 이미지가 깨짐(Jira·대시보드 모두 안 보임) | (해결됨) 완료 내역을 추가할 때 claude 가 설명을 markdown 으로 읽고 통째로 다시 써넣어, 붙여넣은 이미지 media 노드가 죽은 `external blob:` 참조로 재인코딩됨 | 수정됨: 완료 요약은 `SUMMARY_FILE` 에 저장하고 `append-summary.js` 가 설명 ADF 에 직접 append(기존 이미지/노드 보존). **단, 이미 깨진 blob 이미지는 복구 불가 — 작성자가 카드에 이미지를 다시 첨부해야 함** |
 | 리뷰 승인 루프가 **2회차에서 항상 멈춤** — Slack `⏸ … 2/5회차 — 카드가 이미 처리 중이라 중단`, 직전 로그에 `PR 생성 완료 → 리뷰 승인 루프 시작` + `SKIP: … 리뷰 승인 루프가 이미 실행 중입니다(lock)` | (해결됨) 대시보드가 최상위 build 의 env 에 넣은 `REVIEW_LOOP_AFTER=1` 이 자손 프로세스에 상속돼, 루프가 2회차에 부른 rework(`run-jira-agent.sh build`)가 **반영에 성공한 뒤 승인 루프를 또 띄움** → 중첩 실행이 루프 락에 막혀 `SKIP:` 을 찍고, 부모 루프의 `grep "^SKIP: "` 가 이를 **자기 카드 락 스킵으로 오인**해 중단. 반영은 이미 성공했으므로 재리뷰만 유실됨 | 수정됨: ① 루프가 하위를 부를 때 `REVIEW_LOOP_AFTER`/`REVIEW_AFTER`/`REVIEW_FIRST` 를 비우고 `IN_REVIEW_LOOP=1` 주입 ② `run-jira-agent.sh` 는 `REWORK`/`IN_REVIEW_LOOP` 이면 루프를 띄우지 않음 ③ 스킵 판정을 `SKIP: [KEY] 이미 처리 중(lock)` / `SKIP: awaiting answers` 정확 매칭으로 좁힘. 중단된 카드는 PR 목록의 `🔁 승인까지 루프` 로 이어서 진행 |
+| 카드에 붙인 **docx·xlsx·pptx 요구사항이 추론에 반영되지 않음**. 로그에 `읽을 수 없어 제외: 요구사항.docx` | (해결됨) 오피스 파일은 압축된 XML 바이너리라 `Read` 로 열어도 의미 있는 텍스트가 나오지 않아 다운로드 대상에서 빼고 있었다 | 수정됨: `lib-office.js` 가 **텍스트로 변환**해 `<이름>.docx.txt` 로 넘긴다(docx=문단, xlsx=시트별 TSV, pptx=슬라이드별). 서식·이미지·차트는 빠지고 본문 텍스트만 들어간다. 구형 `.doc/.xls/.ppt` 와 암호화 파일은 여전히 제외 |
 | **plan/build 가 카드 본문 이미지를 인식하지 못함**(스크린샷·UI 시안을 못 본 채 작업). 로그에 `카드 첨부 인식` 줄이 없음 | (해결됨) 첨부 다운로드가 `run-cycle.js`(스케줄 루프 전용) 안에만 있어서, **대시보드 '단건 즉시 실행'·승인 루프의 rework/재리뷰**처럼 `run-cycle` 를 거치지 않는 경로는 `CARD_IMAGES`/`CARD_DOCS` 가 비어 프롬프트에 첨부가 아예 주입되지 않았다 | 수정됨: 다운로드 로직을 `lib-attachments.js` 로 분리(모듈+CLI 겸용)하고, `run-jira-agent.sh`·`run-review.sh` 가 첨부 env 가 비어 있으면 **직접 CLI 로 받아 채운다**. 스케줄 루프는 종전대로 `run-cycle` 가 미리 넣어주므로 중복 다운로드 없음 |
 | 리뷰 승인 루프가 **1회차에서 `❌ 리뷰 반영 실패로 중단`**(exit 1). 로그에는 반영할 게 없다는 정상 판단(`PR 없이 종료됨 → 미완료(재시도 대상)`)만 있음 | (해결됨) 직전 회차가 **이미 반영·push 를 끝낸 뒤 재리뷰 전에 루프가 죽은** 상태에서 다시 돌리면, rework 가 고칠 게 없어 PR 을 갱신하지 않는다. 그런데 rework 프롬프트가 "PR 을 하나도 갱신하지 못했으면 비정상 종료"라고만 지시했고 스크립트도 `PR URL 없음 → incomplete` + `exit 1` + `.fail` 증가로 처리해, **정상 무변경이 실패로 둔갑**했다 | 수정됨: rework 프롬프트에 종료 규칙을 둘로 분리(반영할 새 피드백 없음 → `NO_REWORK_NEEDED` 출력 후 **정상 종료** / 반영할 PR 없음·반영 실패 → 비정상 종료), 스크립트는 이를 `noop` 으로 분류(exit 0, `.fail` 초기화), 승인 루프는 무변경 회차를 **재리뷰로 넘겨 판정**하고 **2회 연속**일 때만 사람 확인으로 종료. 오탐으로 쌓인 `repos/.state/<KEY>.fail` 은 삭제하면 됨 |
 | build 완료인데 카드 설명에 '완료 내역' 이 안 기재됨 | (해결됨) ① `set -u` 환경에서 append 단계가 `${JIRA_SITE}` 를 기본값 없이 참조해 변수 미설정 시 그 줄에서 스크립트가 죽음 ② 대시보드 단건 실행(`scriptEnv`)이 `JIRA_SITE`·`ATLASSIAN_EMAIL`·`ATLASSIAN_TOKEN` 을 주입하지 않아 자격증명이 비어 append 가 생략됨 | 수정됨: append 블록의 모든 변수 참조를 `${VAR:-}` 로 안전화 + `scriptEnv`(단건 실행)에도 Jira REST 자격증명 주입. 누락된 과거 카드는 '리뷰 반영(rework)' 재실행으로 요약 재생성·기재 가능 |

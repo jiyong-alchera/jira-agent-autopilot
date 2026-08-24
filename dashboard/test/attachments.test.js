@@ -12,6 +12,7 @@ const { execFileSync } = require("child_process");
 const ROOT = path.join(__dirname, "..", "..");
 const MODULE = path.join(ROOT, "lib-attachments.js");
 const { downloadCardAttachments, isReadableDoc } = require(MODULE);
+const zlib = require("zlib");
 
 const ATT = [
   { id: 1, filename: "screen.png", mimeType: "image/png", size: 3 },
@@ -95,4 +96,65 @@ test("run-jira-agent.sh / run-review.sh: 첨부가 비면 CLI 로 직접 받는 
     assert.match(s, /lib-attachments\.js/, `${f} 에 첨부 폴백이 있어야 한다`);
     assert.match(s, /sed -n 's\/\^IMG:\/\/p'/, `${f} 이 IMG: 접두사를 파싱해야 한다`);
   }
+});
+
+// ===== 오피스 첨부(docx 등)는 텍스트로 변환해 문서 목록에 들어가야 한다 =====
+const CRC_T = (() => { const t = new Int32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c; } return t; })();
+const crc32 = (b) => { let x = 0xFFFFFFFF; for (const v of b) x = CRC_T[(x ^ v) & 0xFF] ^ (x >>> 8); return (x ^ 0xFFFFFFFF) >>> 0; };
+function makeZip(files) {
+  const chunks = [], cd = []; let off = 0;
+  for (const [name, content] of files) {
+    const raw = Buffer.from(content, "utf8"), def = zlib.deflateRawSync(raw), crc = crc32(raw), nb = Buffer.from(name, "utf8");
+    const lfh = Buffer.alloc(30);
+    lfh.writeUInt32LE(0x04034b50, 0); lfh.writeUInt16LE(20, 4); lfh.writeUInt16LE(8, 8);
+    lfh.writeUInt32LE(crc, 14); lfh.writeUInt32LE(def.length, 18); lfh.writeUInt32LE(raw.length, 22); lfh.writeUInt16LE(nb.length, 26);
+    chunks.push(lfh, nb, def);
+    const c = Buffer.alloc(46);
+    c.writeUInt32LE(0x02014b50, 0); c.writeUInt16LE(20, 4); c.writeUInt16LE(20, 6); c.writeUInt16LE(8, 10);
+    c.writeUInt32LE(crc, 16); c.writeUInt32LE(def.length, 20); c.writeUInt32LE(raw.length, 24);
+    c.writeUInt16LE(nb.length, 28); c.writeUInt32LE(off, 42);
+    cd.push(c, nb); off += 30 + nb.length + def.length;
+  }
+  const cdBuf = Buffer.concat(cd), eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50, 0); eocd.writeUInt16LE(files.length, 8); eocd.writeUInt16LE(files.length, 10);
+  eocd.writeUInt32LE(cdBuf.length, 12); eocd.writeUInt32LE(off, 16);
+  return Buffer.concat([...chunks, cdBuf, eocd]);
+}
+const DOCX_BUF = () => makeZip([["word/document.xml", "<w:document><w:body><w:p><w:r><w:t>요구사항 본문</w:t></w:r></w:p></w:body></w:document>"]]);
+
+test("downloadCardAttachments: docx 는 .txt 로 변환돼 문서 목록에 들어간다", async () => {
+  const orig = global.fetch;
+  const sb = sandbox();
+  try {
+    const att = [{ id: 9, filename: "요구사항.docx", mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document", size: 1 }];
+    const buf = DOCX_BUF();
+    global.fetch = async (url) => String(url).includes("/rest/api/3/issue/")
+      ? { ok: true, status: 200, headers: { get: () => null }, json: async () => ({ fields: { attachment: att } }) }
+      : { ok: true, status: 200, headers: { get: () => null }, arrayBuffer: async () => buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength) };
+    const logs = [];
+    const r = await downloadCardAttachments({ jiraSite: "x.atlassian.net", cloneBase: sb.cloneBase },
+      { atlassianEmail: "a@b.c", atlassianToken: "t" }, "TEST-3", (m) => logs.push(m));
+    assert.equal(r.docs.length, 1, "오피스 첨부가 문서로 잡혀야 한다");
+    assert.match(r.docs[0], /\.docx\.txt$/, "Read 로 열 수 있게 .txt 로 저장돼야 한다");
+    const body = fs.readFileSync(r.docs[0], "utf8");
+    assert.match(body, /요구사항 본문/);
+    assert.match(body, /요구사항\.docx 에서 추출한 텍스트/);
+    assert.ok(logs.some((m) => m.includes("텍스트로 변환")), "변환 사실을 로그로 남겨야 한다");
+    assert.ok(!logs.some((m) => m.includes("읽을 수 없어 제외")), "더 이상 제외 대상이 아니다");
+  } finally { global.fetch = orig; sb.cleanup(); }
+});
+
+test("downloadCardAttachments: 변환 실패한 오피스는 조용히 빠진다", async () => {
+  const orig = global.fetch;
+  const sb = sandbox();
+  try {
+    const att = [{ id: 10, filename: "깨진.docx", mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document", size: 1 }];
+    const junk = Buffer.from("이건 zip 이 아님");
+    global.fetch = async (url) => String(url).includes("/rest/api/3/issue/")
+      ? { ok: true, status: 200, headers: { get: () => null }, json: async () => ({ fields: { attachment: att } }) }
+      : { ok: true, status: 200, headers: { get: () => null }, arrayBuffer: async () => junk.buffer.slice(junk.byteOffset, junk.byteOffset + junk.byteLength) };
+    const r = await downloadCardAttachments({ jiraSite: "x.atlassian.net", cloneBase: sb.cloneBase },
+      { atlassianEmail: "a@b.c", atlassianToken: "t" }, "TEST-4");
+    assert.deepEqual(r.docs, [], "변환 실패는 목록에서 빠지고 본 작업은 계속돼야 한다");
+  } finally { global.fetch = orig; sb.cleanup(); }
 });
