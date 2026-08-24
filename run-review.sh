@@ -84,7 +84,15 @@ if [[ ${#R_OWNER[@]} -eq 0 ]]; then echo "SKIP: [${ISSUE_KEY}] 대상 repo 없�
 
 CLAUDE_LOG_DIR="${WORK_DIR}/agent-logs"; mkdir -p "${CLAUDE_LOG_DIR}"
 
-# 카드 첨부(이미지+문서) — run-cycle 가 CARD_IMAGES/CARD_DOCS 로 전달. Claude 가 Read 로 인식하도록 리뷰 프롬프트에 경로 주입.
+# 카드 첨부(이미지+문서) — Claude 가 Read 로 인식하도록 리뷰 프롬프트에 경로 주입.
+# 스케줄 루프는 run-cycle 가 CARD_IMAGES/CARD_DOCS 를 넣어주지만, 대시보드 단건 리뷰·승인 루프의
+# 재리뷰는 run-cycle 를 거치지 않아 비어 있다 → 여기서 직접 받는다(run-jira-agent.sh 와 동일).
+if [[ -z "${CARD_IMAGES:-}${CARD_DOCS:-}" && -f "${SELF_DIR}/lib-attachments.js" ]] \
+   && command -v node >/dev/null 2>&1 && [[ -n "${JIRA_SITE:-}" && -n "${ATLASSIAN_EMAIL:-}" && -n "${ATLASSIAN_TOKEN:-}" ]]; then
+  _att="$(node "${SELF_DIR}/lib-attachments.js" "${ISSUE_KEY}" 2>/dev/null || true)"
+  CARD_IMAGES="$(printf '%s\n' "${_att}" | sed -n 's/^IMG://p')"
+  CARD_DOCS="$(printf '%s\n' "${_att}" | sed -n 's/^DOC://p')"
+fi
 ATTACH_INSTR=""
 if [[ -n "${CARD_IMAGES:-}" ]]; then
   _imgs=""

@@ -239,7 +239,19 @@ cd "${CLONE_BASE}"
 echo ">> [${ISSUE_KEY}] 작업 베이스: $(pwd)"
 
 # ===== 5) claude 실행 (+ 실패 재시도/백오프) =====
-# 카드 첨부(run-cycle 가 내려받아 CARD_IMAGES/CARD_DOCS 로 전달)를 프롬프트에 주입 → Read 도구로 인식.
+# 카드 첨부(이미지·문서)를 프롬프트에 주입 → Read 도구로 인식.
+# 스케줄 루프는 run-cycle 가 CARD_IMAGES/CARD_DOCS 를 미리 넣어주지만, 대시보드 '단건 즉시 실행'·
+# 리뷰 승인 루프의 rework·수동 실행은 run-cycle 를 거치지 않아 비어 있다. 그때는 여기서 직접 받는다
+# (안 그러면 plan/build 가 카드 본문 이미지를 못 보고 작업한다).
+if [[ -z "${CARD_IMAGES:-}${CARD_DOCS:-}" && -f "${SELF_DIR}/lib-attachments.js" ]] \
+   && command -v node >/dev/null 2>&1 && [[ -n "${JIRA_SITE:-}" && -n "${ATLASSIAN_EMAIL:-}" && -n "${ATLASSIAN_TOKEN:-}" ]]; then
+  _att="$(node "${SELF_DIR}/lib-attachments.js" "${ISSUE_KEY}" 2>/dev/null || true)"
+  CARD_IMAGES="$(printf '%s\n' "${_att}" | sed -n 's/^IMG://p')"
+  CARD_DOCS="$(printf '%s\n' "${_att}" | sed -n 's/^DOC://p')"
+  _n_i="$(printf '%s' "${CARD_IMAGES}" | grep -c . || true)"
+  _n_d="$(printf '%s' "${CARD_DOCS}" | grep -c . || true)"
+  if (( _n_i + _n_d > 0 )); then echo ">> [${ISSUE_KEY}] 카드 첨부 인식: 이미지 ${_n_i}장 · 문서 ${_n_d}개"; fi
+fi
 IMAGE_INSTR=""
 if [[ -n "${CARD_IMAGES:-}" ]]; then
   _imgs=""
