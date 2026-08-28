@@ -144,6 +144,15 @@ function Btn({ children, onClick, color = "indigo", disabled }) {
   );
 }
 
+const CARD_PAGE_SIZE = 10;
+// 카드 검색 필터 — 렌더와 "활성 패널에서 점프" 로직이 반드시 같은 판정을 써야 한다.
+const cardMatches = (c, q) => !q || c.key.toLowerCase().includes(q) || (c.summary || "").toLowerCase().includes(q) || (c.status || "").toLowerCase().includes(q);
+// 검색어 q 가 걸린 목록에서 key 카드가 몇 페이지에 있는지. 목록에 없으면 -1.
+const cardJumpPage = (cards, key, q) => {
+  const i = cards.filter((c) => cardMatches(c, q)).findIndex((c) => c.key === key);
+  return i < 0 ? -1 : Math.floor(i / CARD_PAGE_SIZE);
+};
+
 const stageBadge = {
   "plan-ready": ["질문 대기", "bg-sky-500/20 text-sky-300 border-sky-500/40"],
   "awaiting-answer": ["답변 대기", "bg-violet-500/20 text-violet-300 border-violet-500/40"],
@@ -469,14 +478,28 @@ function ProjectCard({ proj, onDeleted, flash, jumpTo }) {
     if (expandedKey === key) { setExpandedKey(""); setDetail(null); setCardHistory(null); setEnhance(null); return; }
     setExpandedKey(key); await loadCardDetail(key);
   };
-  // 활성 패널에서 이 프로젝트의 카드로 점프: Section·'카드 상태' 열기 + 검색으로 노출 + 펼치기 + 스크롤
+  // 활성 패널에서 이 프로젝트의 카드로 점프: Section·'카드 상태' 열기 + 펼치기 + 스크롤.
+  // 검색어는 건드리지 않는다 — 예전엔 대상 키를 검색창에 써넣어서, 점프 이후 목록이
+  // 그 카드 1건만 남은 채로 계속 유지됐다(사용자는 검색창을 봐야만 이유를 알 수 있었다).
   useEffect(() => {
     if (!jumpTo || jumpTo.projectId !== PID) return;
     setOpenSig((n) => n + 1);
-    setCardQuery(jumpTo.key); setCardPage(0);
     setExpandedKey(jumpTo.key); loadCardDetail(jumpTo.key);
     requestAnimationFrame(() => { try { rootRef.current && rootRef.current.scrollIntoView({ behavior: "smooth", block: "start" }); } catch {} });
   }, [jumpTo]);
+  // 점프 대상이 몇 번째 페이지인지 찾아 그 페이지로 넘긴다(목록은 전체 유지).
+  // 카드 목록이 늦게 로드될 수 있어 cards 도 의존성에 두되, nonce 로 점프당 1회만 수행한다
+  // (60초 폴링마다 cards 가 새 배열로 바뀌므로, 안 그러면 사용자가 넘긴 페이지를 계속 되돌린다).
+  const jumpDone = React.useRef(0);
+  useEffect(() => {
+    if (!jumpTo || jumpTo.projectId !== PID || jumpDone.current === jumpTo.nonce) return;
+    if (!cards.some((c) => c.key === jumpTo.key)) return;   // 아직 목록에 없으면(첫 로드 전) 다음 갱신 때 다시 시도
+    let q = cardQuery.trim().toLowerCase();
+    // 사용자가 친 검색어에 대상 카드가 안 걸리면 페이지를 옮겨도 보이지 않으므로 그때만 검색 해제.
+    if (cardJumpPage(cards, jumpTo.key, q) < 0) { setCardQuery(""); q = ""; }
+    jumpDone.current = jumpTo.nonce;
+    setCardPage(cardJumpPage(cards, jumpTo.key, q));
+  }, [jumpTo, cards]);
   const changeStatus = async (key, transitionId, toName) => {
     if (!transitionId) return;
     const r = await api.post(`/api/jira/issue/${key}/transition`, { transitionId, project: PID });
@@ -816,9 +839,8 @@ function ProjectCard({ proj, onDeleted, flash, jumpTo }) {
           <p className="text-slate-500 text-sm">조회 버튼을 눌러 카드 상태를 확인하세요. (Atlassian 자격증명 필요)</p>
         ) : (() => {
           const q = cardQuery.trim().toLowerCase();
-          const filtered = q ? cards.filter((c) => c.key.toLowerCase().includes(q) || (c.summary || "").toLowerCase().includes(q) || (c.status || "").toLowerCase().includes(q)) : cards;
+          const filtered = cards.filter((c) => cardMatches(c, q));
           if (filtered.length === 0) return <p className="text-slate-500 text-sm">검색 결과가 없습니다 (‘{cardQuery}’).</p>;
-          const CARD_PAGE_SIZE = 10;
           const totalCardPages = Math.max(1, Math.ceil(filtered.length / CARD_PAGE_SIZE));
           const cpage = Math.min(cardPage, totalCardPages - 1);   // 갱신/검색으로 건수 변해도 안전 클램프
           const cstart = cpage * CARD_PAGE_SIZE;
