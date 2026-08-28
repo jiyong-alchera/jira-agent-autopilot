@@ -989,6 +989,24 @@ function ProjectCard({ proj, onDeleted, flash, jumpTo }) {
                                 {c.assignedToMe && (
                                 <React.Fragment>
                                 <div className="text-xs text-slate-400 mb-1">답변 작성</div>
+                                {/* plan 이 질문과 함께 남긴 제안 답변 — 그대로 채택하거나 고쳐서 쓰도록 답변란에 채워 준다. */}
+                                {detail.suggested && (
+                                  <div className="bg-amber-500/10 border border-amber-500/30 rounded p-2 mb-2">
+                                    <div className="flex items-center justify-between mb-1">
+                                      <span className="text-[11px] text-amber-200">💡 plan 제안 답변 {detail.suggested.count}건</span>
+                                      <button onClick={() => { if (!reply.trim() || window.confirm("작성 중인 답변을 제안 답변으로 덮어쓸까요?")) setReply(detail.suggested.draft); }}
+                                        className="text-[11px] px-2 py-0.5 rounded border border-amber-500/40 text-amber-300 hover:bg-amber-500/10 transition">답변란에 불러오기</button>
+                                    </div>
+                                    <ul className="space-y-1">
+                                      {detail.suggested.items.map((it) => (
+                                        <li key={it.n} className="text-[11px] text-slate-300 leading-relaxed">
+                                          <b className="text-amber-300">{it.n}.</b> {it.suggestion}
+                                          {it.rationale && <span className="text-slate-500"> · 근거: {it.rationale}</span>}
+                                        </li>
+                                      ))}
+                                    </ul>
+                                  </div>
+                                )}
                                 {replyTarget && <div className="flex items-center justify-between bg-indigo-500/10 border border-indigo-500/30 rounded px-2 py-1 mb-1 text-xs text-indigo-200"><span>↳ <b>{replyTarget.author}</b> 의 코멘트에 답글</span><button onClick={() => setReplyTarget(null)} className="text-slate-400 hover:text-rose-300">취소</button></div>}
                                 <textarea value={reply} onChange={(e) => setReply(e.target.value)} spellCheck={false} placeholder="질문에 대한 답변/추가 설계를 적으세요."
                                   className="w-full h-24 bg-slate-800 border border-slate-600 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-indigo-400" />

@@ -1142,6 +1142,8 @@ app.get("/api/jira/issue/:key", async (req, res) => {
       // 인라인 임베드 여부와 무관하게 이슈의 '모든' 첨부(이미지·문서)를 목록으로 제공(프록시로 열람/다운로드)
       attachments: ((issue.fields && issue.fields.attachment) || []).map((a) => ({ id: a.id, filename: a.filename, mimeType: a.mimeType, size: a.size })),
       comments, transitions, url: `https://${cfg.jiraSite}/browse/${key}`,
+      // plan 질문 코멘트에 담긴 "💡 제안:" 답변 → 대시보드가 답변란에 바로 채워 넣는다.
+      suggested: lib.parseSuggestedAnswers(comments),
     });
   } catch (e) { fail(res, e); }
 });

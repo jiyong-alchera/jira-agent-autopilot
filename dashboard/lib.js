@@ -314,6 +314,43 @@ function createStore({ projectsPath, credsPath, configPath, credPath, defaultCon
   return { migrateIfNeeded, listProjects, getProject, defaultProjectId, saveProject, removeProject, getProjectCreds, setProjectCreds };
 }
 
+// plan 질문 코멘트의 "제안:" 줄을 뽑아 답변 초안을 만든다.
+// 권장 형식(run-jira-agent.sh plan 프롬프트가 지시):
+//   1. <질문>
+//      💡 제안: <제안 답변> (근거: <한 줄 근거>)
+// 엔진이 번호 대신 불릿(•/-/*)을 쓰거나 💡·근거를 빼는 경우도 흔해서 둘 다 받는다.
+// 여러 plan 회차가 쌓일 수 있으므로 제안이 담긴 '마지막' 코멘트만 본다.
+const SUGGEST_MARK = "💡 제안:";
+const SUGGEST_RE = /^[\s>]*(?:[•·\-*]\s*)?(?:💡\s*)?제안\s*[:：]\s*(.+?)\s*$/;
+const QUESTION_RE = /^[\s>]*(?:(\d+)\s*[.)]|[•·\-*])\s*(.+?)\s*$/;
+function parseSuggestedAnswers(comments) {
+  const hasSuggestion = (c) => String((c && c.body) || "").split(/\r?\n/).some((l) => SUGGEST_RE.test(l));
+  const src = (Array.isArray(comments) ? comments : []).filter(hasSuggestion).pop();
+  if (!src) return null;
+  const items = [];
+  let num = 0, question = "";
+  for (const raw of String(src.body).split(/\r?\n/)) {
+    const sug = raw.match(SUGGEST_RE);
+    if (!sug) {
+      const q = raw.match(QUESTION_RE);
+      if (q) { num = q[1] ? parseInt(q[1], 10) : 0; question = q[2]; }
+      continue;
+    }
+    // 근거는 답변 초안에서 빼고 따로 보관 — 초안은 그대로 Jira 코멘트로 나가기 때문.
+    let text = sug[1], rationale = "";
+    const m = text.match(/^(.*?)\s*[(（]\s*근거\s*[:：]\s*(.+?)\s*[)）][.。]?\s*$/);
+    if (m) { text = m[1].trim(); rationale = m[2].trim(); }
+    if (!text) continue;
+    items.push({ n: num || items.length + 1, question, suggestion: text, rationale });
+    num = 0; question = "";
+  }
+  if (!items.length) return null;
+  return {
+    commentId: src.id, count: items.length, items,
+    draft: items.map((it, i) => `${it.n || i + 1}. ${it.suggestion}`).join("\n"),
+  };
+}
+
 module.exports = {
   DEFAULT_CREDS, readJson, writeJson, slugify, triggerClause, detectJql,
   adfToText, adfSegments, toADF, mdInline, mdToADF, buildReplyADF, maskCreds, applyCreds, createStore, doneStatusList, effectiveDoneStatuses,
@@ -321,4 +358,5 @@ module.exports = {
   loadOrCreateEnvKey, encryptEnv, decryptEnv,
   ENGINES, DEFAULT_ENGINE, DEFAULT_MODEL, resolveEngine,
   REVIEW_LOOP_MAX_DEFAULT, REVIEW_LOOP_MAX_LIMIT, clampReviewLoopMax,
+  SUGGEST_MARK, parseSuggestedAnswers,
 };
