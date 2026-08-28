@@ -40,13 +40,21 @@
   <script type="text/babel">
 const { useState, useEffect, useCallback } = React;
 
+// 네트워크 실패·비 JSON 응답도 서버 에러와 같은 { ok:false, message } 로 돌려준다.
+// 여기서 reject 되면 호출부의 await 가 throw 되어 setLoading(false) 를 건너뛰고
+// 버튼이 "…중" 상태로 영구 고착된다(에러 토스트조차 못 띄움).
+async function request(p, init) {
+  let r;
+  try { r = await fetch(p, init); }
+  catch (e) { return { ok: false, message: `서버에 연결할 수 없습니다: ${e.message}` }; }
+  const body = await r.text().catch(() => "");
+  try { return JSON.parse(body); }
+  catch { return { ok: false, message: `HTTP ${r.status} ${r.statusText}: ${body.slice(0, 200)}` }; }
+}
 const api = {
-  async get(p) { const r = await fetch(p); return r.json(); },
-  async post(p, body) {
-    const r = await fetch(p, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
-    return r.json();
-  },
-  async del(p) { const r = await fetch(p, { method: "DELETE" }); return r.json(); },
+  get: (p) => request(p),
+  post: (p, body) => request(p, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) }),
+  del: (p) => request(p, { method: "DELETE" }),
 };
 
 function Section({ title, children, right, collapsible, defaultOpen = false, openSignal }) {
@@ -409,9 +417,10 @@ function ProjectCard({ proj, onDeleted, flash, jumpTo }) {
   const refineDesc = async () => {
     if (!newCard.description.trim()) { flash("정리할 설명을 먼저 입력하세요"); return; }
     setRefining(true);
-    const r = await api.post("/api/ai/refine-description", { text: newCard.description, summary: newCard.summary, project: PID });
-    setRefining(false);
-    if (r.ok) { setNewCard((p) => ({ ...p, description: r.description })); flash("Claude가 설명을 정리했습니다"); } else flash(r.message || "변환 실패");
+    try {
+      const r = await api.post("/api/ai/refine-description", { text: newCard.description, summary: newCard.summary, project: PID });
+      if (r.ok) { setNewCard((p) => ({ ...p, description: r.description })); flash("Claude가 설명을 정리했습니다"); } else flash(r.message || "변환 실패");
+    } finally { setRefining(false); }
   };
   const pickFiles = (fileList) => {
     const files = Array.from(fileList || []); if (!files.length) return;
@@ -423,30 +432,37 @@ function ProjectCard({ proj, onDeleted, flash, jumpTo }) {
   const createCard = async () => {
     if (!newCard.summary.trim()) { flash("요약을 입력하세요"); return; }
     setCreating(true);
-    const r = await api.post("/api/jira/issue", { summary: newCard.summary, description: newCard.description, issueType: newCard.issueType, parentKey: newCard.parentInput.trim() || newCard.epicKey, addTriggerLabel: newCard.addTriggerLabel, assignSelf: newCard.assignSelf, attachments: newCard.attachments, repos: newCard.repos, env: newCard.env, project: PID });
-    setCreating(false);
-    if (r.ok) { let m = `카드 생성됨: ${r.key}`; if (r.note) m += ` · ${r.note}`; if (r.attached?.length) m += ` · 첨부 ${r.attached.length}`; if (r.attachErrors?.length) m += ` · 첨부실패 ${r.attachErrors.length}`; flash(m); setNewCard((p) => ({ ...p, summary: "", description: "", parentInput: "", attachments: [], repos: [], env: "" })); loadCards(); }
-    else flash(r.message || "생성 실패");
+    try {
+      const r = await api.post("/api/jira/issue", { summary: newCard.summary, description: newCard.description, issueType: newCard.issueType, parentKey: newCard.parentInput.trim() || newCard.epicKey, addTriggerLabel: newCard.addTriggerLabel, assignSelf: newCard.assignSelf, attachments: newCard.attachments, repos: newCard.repos, env: newCard.env, project: PID });
+      if (r.ok) { let m = `카드 생성됨: ${r.key}`; if (r.note) m += ` · ${r.note}`; if (r.attached?.length) m += ` · 첨부 ${r.attached.length}`; if (r.attachErrors?.length) m += ` · 첨부실패 ${r.attachErrors.length}`; flash(m); setNewCard((p) => ({ ...p, summary: "", description: "", parentInput: "", attachments: [], repos: [], env: "" })); loadCards(); }
+      else flash(r.message || "생성 실패");
+    } finally { setCreating(false); }
   };
   const loadCards = async () => { const r = await api.get(withP("/api/cards")); if (r.ok) { setCards(r.issues); setCardsErr(""); } else setCardsErr(r.message || "조회 실패"); };
   const runEnhance = async (key) => {
     setEnhance({ key, loading: true, preview: "", applying: false });
-    const r = await api.post(withP(`/api/jira/issue/${key}/enhance`), {});
-    setEnhance((p) => (p && p.key === key) ? (r.ok ? { key, loading: false, preview: r.description, applying: false } : null) : p);
-    if (!r.ok) flash(r.message || "고도화 실패");
+    try {
+      const r = await api.post(withP(`/api/jira/issue/${key}/enhance`), {});
+      setEnhance((p) => (p && p.key === key) ? (r.ok ? { key, loading: false, preview: r.description, applying: false } : null) : p);
+      if (!r.ok) flash(r.message || "고도화 실패");
+    } finally { setEnhance((p) => (p && p.key === key && p.loading) ? null : p); }
   };
   const applyEnhance = async (key) => {
     setEnhance((p) => (p && p.key === key) ? { ...p, applying: true } : p);
-    const r = await api.post(withP(`/api/jira/issue/${key}/enhance/apply`), { description: enhance.preview });
-    if (r.ok) {
-      flash("고도화 설명을 Jira 본문 하단에 반영했습니다");
-      setEnhance(null);
-      const d = await api.get(withP(`/api/jira/issue/${key}`)); if (d.ok) setDetail(d);   // 반영된 본문 재조회
-    } else { flash(r.message || "반영 실패"); setEnhance((p) => (p && p.key === key) ? { ...p, applying: false } : p); }
+    try {
+      const r = await api.post(withP(`/api/jira/issue/${key}/enhance/apply`), { description: enhance.preview });
+      if (r.ok) {
+        flash("고도화 설명을 Jira 본문 하단에 반영했습니다");
+        setEnhance(null);
+        const d = await api.get(withP(`/api/jira/issue/${key}`)); if (d.ok) setDetail(d);   // 반영된 본문 재조회
+      } else { flash(r.message || "반영 실패"); setEnhance((p) => (p && p.key === key) ? { ...p, applying: false } : p); }
+    } finally { setEnhance((p) => (p && p.key === key && p.applying) ? { ...p, applying: false } : p); }
   };
   const loadCardDetail = async (key) => {
     setDetail(null); setCardHistory(null); setReply(""); setReplyAnswered(true); setReplyTarget(null); setClaudeLog(null); setEnhance(null); setDetailLoading(true);
-    const r = await api.get(withP(`/api/jira/issue/${key}`)); setDetailLoading(false); setDetail(r.ok ? r : { error: r.message || "조회 실패" });
+    try {
+      const r = await api.get(withP(`/api/jira/issue/${key}`)); setDetail(r.ok ? r : { error: r.message || "조회 실패" });
+    } finally { setDetailLoading(false); }
     try { const h = await api.get(withP(`/api/history`)); setCardHistory({ key, entries: h.ok ? (h.entries || []).filter((e) => e.key === key) : [] }); } catch { setCardHistory({ key, entries: [] }); }
   };
   const toggleCard = async (key) => {
@@ -470,10 +486,11 @@ function ProjectCard({ proj, onDeleted, flash, jumpTo }) {
   const postReply = async () => {
     if (!reply.trim()) { flash("답변 내용을 입력하세요"); return; }
     setPosting(true);
-    const r = await api.post(`/api/jira/issue/${expandedKey}/comment`, { body: reply, markAnswered: replyAnswered, replyTo: replyTarget || undefined, project: PID });
-    setPosting(false);
-    if (r.ok) { flash("답변 등록됨" + (replyAnswered ? " (claude-answered" + (r.movedTo ? ` · 상태→${r.movedTo}` : "") + ")" : "")); setReply(""); setReplyTarget(null); const d = await api.get(withP(`/api/jira/issue/${expandedKey}`)); if (d.ok) setDetail(d); loadCards(); }
-    else flash(r.message || "등록 실패");
+    try {
+      const r = await api.post(`/api/jira/issue/${expandedKey}/comment`, { body: reply, markAnswered: replyAnswered, replyTo: replyTarget || undefined, project: PID });
+      if (r.ok) { flash("답변 등록됨" + (replyAnswered ? " (claude-answered" + (r.movedTo ? ` · 상태→${r.movedTo}` : "") + ")" : "")); setReply(""); setReplyTarget(null); const d = await api.get(withP(`/api/jira/issue/${expandedKey}`)); if (d.ok) setDetail(d); loadCards(); }
+      else flash(r.message || "등록 실패");
+    } finally { setPosting(false); }
   };
   // build 는 '승인까지 루프' 를 켜면 PR 생성 후 리뷰 루프까지 이어서 돈다(서버가 build 단건에서만 수용).
   const runCardNow = async (key, phase) => {
