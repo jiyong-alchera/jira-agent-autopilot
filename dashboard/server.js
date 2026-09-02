@@ -62,7 +62,7 @@ const DEFAULT_CONFIG = {
 
 // ----- 순수 로직 + 프로젝트 스토어 (단위 테스트 대상은 lib.js 로 분리) -----
 const lib = require("./lib");
-const { slugify, triggerClause, detectJql, adfToText, adfSegments, toADF, mdToADF, buildReplyADF, maskCreds, applyCreds, normalizeRepos, cardRepos, REPO_LABEL_PREFIX, doneStatusList, effectiveDoneStatuses, clampReviewLoopMax } = lib;
+const { slugify, triggerClause, detectJql, adfToText, adfSegments, toADF, mdToADF, buildReplyADF, maskCreds, applyCreds, normalizeRepos, cardRepos, REPO_LABEL_PREFIX, doneStatusList, effectiveDoneStatuses, clampReviewLoopMax, REVIEW_APPROVED_MARKER } = lib;
 // repo 별 env 파일 경로(repo 전용 env 만 사용; 없으면 미복사 — run-jira 가 -f 로 확인)
 function repoEnvFile(cfg, repoName) { return path.join(cfg.workDir || SCRIPTS_DIR, `work-${cfg.id}-${repoName}.env`); }
 function repoEnvSrc(cfg, repoName) { return repoEnvFile(cfg, repoName); }
@@ -878,7 +878,10 @@ async function finalizeCardDone(id, cfg, cred, key, mergedPRs, errors) {
 }
 // 자동화(봇) PR 이 모두 병합됐으면(열린 봇 PR 0 · 병합 봇 PR ≥1) 카드 완료. 사람 PR 은 완료 판정에서 제외.
 async function maybeFinalizeCard(id, cfg, cred, key, repos, botLogin) {
-  const bot = (await listCardPRs(repos, key, cred)).filter((p) => !botLogin || p.author === botLogin);
+  // prBelongsToCard: gh --search 가 PR 본문까지 훑어 형제 카드의 PR 까지 끌어오므로 브랜치/제목으로 재확인.
+  // 이게 없으면 '다른 카드의 PR 이 병합됨' 만으로 이 카드가 완료 처리될 수 있다(자동화 PR 은 항상 브랜치에 키가 있다).
+  const bot = (await listCardPRs(repos, key, cred))
+    .filter((p) => (!botLogin || p.author === botLogin) && lib.prBelongsToCard(p, key));
   const openBot = bot.filter((p) => p.state === "OPEN");
   const mergedBot = bot.filter((p) => p.state === "MERGED");
   if (mergedBot.length && openBot.length === 0) {
@@ -896,7 +899,21 @@ app.get("/api/cards/:key/prs", async (req, res) => {
     const { cfg, cred } = resolveProject(req);
     const repos = normalizeRepos(cfg);   // PR 탐색: build 대상 라벨과 무관하게 프로젝트 전 repo 검색(연동 PR 이 어느 repo 에 있든 인식)
     const botLogin = await ghUserLogin(cred);
-    const prs = (await listCardPRs(repos, key, cred)).map((p) => ({ ...p, isBot: !botLogin || p.author === botLogin }));
+    let prs = (await listCardPRs(repos, key, cred)).map((p) => ({ ...p, isBot: !botLogin || p.author === botLogin }));
+    // ?strict=1 — 브랜치/제목에 키가 있는 PR 만. gh 의 --search 는 PR 본문까지 전문 검색해
+    // 본문이 다른 카드 키를 언급한 PR 까지 끌어오므로, 정확한 목록이 필요한 곳에서 쓴다.
+    if (req.query.strict === "1") prs = prs.filter((p) => lib.prBelongsToCard(p, key));
+    // ?approved=1 — 열린 PR 마다 리뷰 승인 마커를 확인해 approved 를 붙인다(PR 당 API 1회라 opt-in).
+    // 에픽 연속 개발의 '병합 대기 PR' 목록이 "리뷰 승인됐는지" 를 함께 보여주기 위해 사용.
+    if (req.query.approved === "1") {
+      prs = await Promise.all(prs.map(async (p) => {
+        if (p.state !== "OPEN") return p;
+        const r = await gh(["api", `repos/${p.owner}/issues/${p.number}/comments?per_page=100`, "--jq", "[.[].body]"], cred);
+        let approved = false;
+        try { approved = (JSON.parse(r.stdout || "[]") || []).some((b) => String(b).includes(REVIEW_APPROVED_MARKER)); } catch {}
+        return { ...p, approved };
+      }));
+    }
     res.json({ ok: true, prs, botLogin });
   } catch (e) { fail(res, e); }
 });
@@ -917,8 +934,10 @@ app.post("/api/cards/:key/merge", async (req, res) => {
     if (body.owner && body.number != null) {   // 개별 PR 지정(사용자가 명시 선택 — 사람 PR 도 가능)
       targets = allPRs.filter((p) => p.owner === body.owner && String(p.number) === String(body.number));
       if (!targets.length) return res.json({ ok: false, message: "지정한 PR 을 찾을 수 없습니다." });
-    } else {                                    // 기본: 자동화(봇) PR 전체
-      targets = allPRs.filter((p) => !botLogin || p.author === botLogin);
+    } else {                                    // 기본: 이 카드의 자동화(봇) PR 전체
+      // 개별 지정이 아닐 때는 '이 카드의 PR' 로 한정한다 — 본문에 이 키를 언급한 형제 카드의 PR 이
+      // --search 로 섞여 들어와 함께 병합되는 것을 막는다.
+      targets = allPRs.filter((p) => (!botLogin || p.author === botLogin) && lib.prBelongsToCard(p, key));
     }
     const mergedUrls = [], branches = [], errors = [];
     for (const pr of targets) {

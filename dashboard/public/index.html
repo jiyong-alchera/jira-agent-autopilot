@@ -1241,6 +1241,138 @@ function EpicLogs({ pid, cardKey, step }) {
   );
 }
 
+// 에픽 현재 태스크의 PR 목록 + 병합 조작.
+// 이 카드의 PR 을 모두 병합해야 다음 태스크로 넘어가므로(await-merge), repo 마다 하나씩 생기는
+// 여러 PR 을 한 자리에서 보고 개별/일괄로 병합할 수 있게 한다.
+function EpicPrs({ pid, cardKey, step, flash, onMerged }) {
+  const [prs, setPrs] = useState(null);
+  const [botLogin, setBotLogin] = useState("");
+  const [busy, setBusy] = useState("");
+  const [sel, setSel] = useState([]);   // 선택 병합 대상 "owner#number"
+
+  const idOf = (p) => `${p.owner}#${p.number}`;
+  const load = useCallback(async () => {
+    if (!cardKey) { setPrs(null); return; }
+    // strict=1 — 브랜치/제목에 이 카드 키가 있는 PR 만. gh --search 는 PR 본문까지 훑어서
+    // 본문이 이 키를 언급한 '다른 카드의 PR' 까지 끌어오는데, 병합 버튼이 달린 목록에는 섞이면 안 된다.
+    const r = await api.get(`/api/cards/${cardKey}/prs?approved=1&strict=1&project=${encodeURIComponent(pid)}`);
+    if (r.ok) { setPrs(r.prs || []); setBotLogin(r.botLogin || ""); }
+    else { setPrs([]); flash(r.message || "PR 조회 실패"); }
+  }, [cardKey, pid]);
+  useEffect(() => { setSel([]); load(); }, [load]);
+  useEffect(() => { const t = setInterval(load, 15000); return () => clearInterval(t); }, [load]);
+
+  if (!cardKey || prs === null) return null;
+  const open = prs.filter((p) => p.state === "OPEN");
+  const merged = prs.filter((p) => p.state === "MERGED");
+  if (!prs.length) return null;
+
+  const openBot = open.filter((p) => p.isBot);
+  const allApproved = openBot.length > 0 && openBot.every((p) => p.approved);
+  const blocked = open.filter((p) => p.mergeable === "CONFLICTING");
+
+  const afterMerge = async (msg) => { flash(msg); await load(); if (onMerged) onMerged(); };
+  const mergeOne = async (p) => {
+    if (!window.confirm(`${p.repo} #${p.number} — "${p.title}"\n${p.approved ? "" : "⚠️ 아직 리뷰 승인 마커가 없습니다.\n"}${p.mergeable === "CONFLICTING" ? "⚠️ base 충돌 상태입니다.\n" : ""}\nrebase merge 하고 브랜치를 삭제합니다. 진행할까요?`)) return;
+    setBusy(idOf(p));
+    try {
+      const r = await api.post(`/api/cards/${cardKey}/merge`, { owner: p.owner, number: p.number, project: pid });
+      await afterMerge(r.ok ? `#${p.number} 병합${r.doneStatus ? ` · 카드 완료(${r.doneStatus})` : ""}` : (r.message || (r.errors || [])[0] || "병합 실패"));
+    } finally { setBusy(""); }
+  };
+  const mergeMany = async (targets, label) => {
+    if (!targets.length) return;
+    const list = targets.map((p) => `  · ${p.repo} #${p.number}${p.approved ? "" : " (미승인)"}${p.mergeable === "CONFLICTING" ? " (충돌)" : ""}`).join("\n");
+    if (!window.confirm(`${label} — PR ${targets.length}건을 rebase merge 합니다.\n\n${list}\n\n진행할까요?`)) return;
+    setBusy(label);
+    try {
+      const results = [];
+      for (const p of targets) {   // 순차 — 실패한 것만 남겨 사유를 보여준다
+        const r = await api.post(`/api/cards/${cardKey}/merge`, { owner: p.owner, number: p.number, project: pid });
+        results.push({ p, ok: r.ok, msg: r.message || (r.errors || [])[0] || "", doneStatus: r.doneStatus });
+      }
+      const okN = results.filter((x) => x.ok).length;
+      const failed = results.filter((x) => !x.ok);
+      const done = results.find((x) => x.doneStatus);
+      await afterMerge(`${okN}/${targets.length}건 병합${done ? ` · 카드 완료(${done.doneStatus})` : ""}${failed.length ? ` · 실패: ${failed.map((x) => `#${x.p.number}(${x.msg.slice(0, 40)})`).join(", ")}` : ""}`);
+    } finally { setBusy(""); }
+  };
+
+  const Badge = ({ cls, title, children }) => <span title={title} className={`text-[10px] px-1.5 py-0.5 rounded-full border ${cls}`}>{children}</span>;
+  const selected = open.filter((p) => sel.includes(idOf(p)));
+
+  return (
+    <div className="rounded-lg border border-slate-700 bg-slate-800/40 p-3 mb-3">
+      <div className="flex items-center justify-between gap-2 flex-wrap mb-2">
+        <div className="text-sm text-slate-300">
+          <b className="text-teal-300">{cardKey}</b> PR — 열림 <b>{open.length}</b>건{merged.length ? ` · 병합됨 ${merged.length}건` : ""}
+          {step === "await-merge" && <span className="text-xs text-teal-300/80"> · 모두 병합하면 다음 태스크로 진행합니다</span>}
+        </div>
+        <div className="flex gap-2">
+          <button onClick={load} className="text-[11px] px-2 py-1 rounded border border-slate-600 text-slate-300 hover:border-indigo-500/60 transition">새로고침</button>
+          <button disabled={!selected.length || !!busy}
+            onClick={() => mergeMany(selected, "선택 병합")}
+            className="text-[11px] px-2 py-1 rounded border border-teal-500/40 text-teal-300 hover:bg-teal-500/10 disabled:opacity-35 transition">
+            {busy === "선택 병합" ? "병합 중…" : `선택 병합 (${selected.length})`}
+          </button>
+          <button disabled={!openBot.length || !!busy}
+            onClick={() => mergeMany(openBot, "전체 병합(자동화 PR)")}
+            title={allApproved ? "열린 자동화 PR 을 모두 병합합니다" : "아직 리뷰 승인되지 않은 PR 이 있습니다"}
+            className={`text-[11px] px-2 py-1 rounded border disabled:opacity-35 transition ${allApproved ? "border-emerald-500/50 text-emerald-300 hover:bg-emerald-500/10" : "border-amber-500/50 text-amber-300 hover:bg-amber-500/10"}`}>
+            {busy === "전체 병합(자동화 PR)" ? "병합 중…" : `전체 병합 (${openBot.length})${allApproved ? "" : " ⚠️"}`}
+          </button>
+        </div>
+      </div>
+
+      {blocked.length > 0 && (
+        <div className="text-[11px] text-rose-300 mb-2">
+          ⚠️ base 충돌 {blocked.length}건({blocked.map((p) => `${p.repo}#${p.number}`).join(", ")}) — 카드 상세의 <b>‘충돌 해소 후 재푸시’</b> 로 먼저 해소하세요.
+        </div>
+      )}
+
+      <div className="space-y-1.5">
+        {open.length === 0 && <div className="text-xs text-slate-500">열린 PR 이 없습니다.</div>}
+        {open.map((p) => {
+          const id = idOf(p);
+          return (
+            <div key={id} className="flex items-center gap-2 flex-wrap bg-slate-900/50 border border-slate-700/70 rounded px-2 py-1.5">
+              <input type="checkbox" checked={sel.includes(id)} disabled={!!busy}
+                onChange={(e) => setSel((s) => e.target.checked ? [...s, id] : s.filter((x) => x !== id))} />
+              <span className="text-xs font-mono text-slate-400 shrink-0">{p.repo}</span>
+              <a href={p.url} target="_blank" rel="noreferrer" className="text-xs text-indigo-300 hover:underline shrink-0">#{p.number}</a>
+              <span className="text-xs text-slate-300 truncate flex-1 min-w-[8rem]" title={p.title}>{p.title}</span>
+              {p.approved
+                ? <Badge cls="bg-emerald-500/15 text-emerald-300 border-emerald-500/40" title="리뷰 승인 마커 있음">✓ 리뷰 승인</Badge>
+                : <Badge cls="bg-amber-500/20 text-amber-300 border-amber-500/50" title="아직 CLAUDE-REVIEW-APPROVED 마커가 없습니다">미승인</Badge>}
+              {!p.isBot && <Badge cls="bg-slate-600/30 text-slate-400 border-slate-600" title={`사람 PR (@${p.author})`}>사람 @{p.author}</Badge>}
+              {p.mergeable === "CONFLICTING" && <Badge cls="bg-rose-500/20 text-rose-300 border-rose-500/50" title="base 브랜치와 충돌">⚠️ 충돌</Badge>}
+              {p.mergeable !== "CONFLICTING" && p.mergeState === "BEHIND" && <Badge cls="bg-amber-500/20 text-amber-300 border-amber-500/50" title="base 가 앞서 있음(충돌 아님)">⟳ base 갱신됨</Badge>}
+              {p.mergeable === "MERGEABLE" && p.mergeState === "CLEAN" && <Badge cls="bg-emerald-500/15 text-emerald-300 border-emerald-500/40" title="충돌 없이 병합 가능">✓ 병합 가능</Badge>}
+              {p.mergeable === "UNKNOWN" && <Badge cls="bg-slate-600/30 text-slate-400 border-slate-600" title="GitHub 가 계산 중">확인중</Badge>}
+              <button disabled={!!busy} onClick={() => mergeOne(p)}
+                className="text-[11px] px-2 py-0.5 rounded border border-teal-500/40 text-teal-300 hover:bg-teal-500/10 disabled:opacity-35 transition shrink-0">
+                {busy === id ? "병합 중…" : "병합"}
+              </button>
+            </div>
+          );
+        })}
+        {merged.map((p) => (
+          <div key={idOf(p)} className="flex items-center gap-2 px-2 py-1 text-xs text-slate-500">
+            <span className="font-mono shrink-0">{p.repo}</span>
+            <a href={p.url} target="_blank" rel="noreferrer" className="text-slate-400 hover:underline shrink-0">#{p.number}</a>
+            <span className="truncate flex-1" title={p.title}>{p.title}</span>
+            <Badge cls="bg-emerald-500/20 text-emerald-300 border-emerald-500/40">병합 완료</Badge>
+          </div>
+        ))}
+      </div>
+      <p className="text-[10px] text-slate-500 mt-2">
+        ‘전체 병합’은 자동화(봇 {botLogin || "?"}) PR 만 대상입니다. 사람 PR 은 개별/선택 병합으로만 처리됩니다.
+        병합은 rebase + 브랜치 삭제로 진행되며, 자동화 PR 이 모두 병합되면 카드가 완료 처리됩니다.
+      </p>
+    </div>
+  );
+}
+
 // 에픽 연속 개발 패널 — 에픽 하위 태스크를 생성순으로 하나씩 개발→PR→리뷰 승인→병합 대기로 이어간다.
 // 진행 상태는 <EPIC>.epic.json 을 5초 폴링. 중단(paused)되면 사유와 [이어서 진행]/[건너뛰기] 를 띄운다.
 const EPIC_STEP_LABEL = {
@@ -1381,6 +1513,12 @@ function EpicPanel({ projects, flash }) {
               )}
               {paused && <div className="text-xs text-amber-300/80 mt-1">멈춘 단계: <b>{EPIC_STEP_LABEL[run.step] || run.step || "-"}</b>{cur ? ` · ${cur.key}` : ""} — 조치 후 [이어서 진행]을 누르면 이 단계부터 다시 실행합니다.</div>}
             </div>
+          )}
+
+          {/* 현재 태스크의 PR — 병합해야 다음 태스크로 넘어가므로 여기서 바로 조작 */}
+          {(run.running || paused) && cur && cur.key && (
+            <EpicPrs pid={pid} cardKey={cur.key} step={run.step} flash={flash}
+              onMerged={() => { loadRun(); loadChildren(epicKey); }} />
           )}
 
           {/* 진행/엔진 로그 — 실행 중이거나 직전 실행 기록이 있을 때 */}

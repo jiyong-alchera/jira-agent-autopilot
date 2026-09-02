@@ -82,3 +82,15 @@ test("buildAdoptedAnswerBody: 제안이 없으면 빈 문자열", () => {
   assert.equal(lib.buildAdoptedAnswerBody(null, "E-1"), "");
   assert.equal(lib.buildAdoptedAnswerBody({ items: [] }, "E-1"), "");
 });
+
+test("prBelongsToCard: 브랜치·제목의 키로 이 카드 PR 을 가린다", () => {
+  // gh pr list --search <KEY> 는 PR '본문'까지 전문 검색하므로, 본문이 다른 카드 키를 언급하면
+  // 그 카드의 PR 로도 잡힌다. 자동화 규칙(브랜치 feat/<KEY>-…, 제목 …(<KEY>))으로 걸러낸다.
+  const pr819 = { branch: "feat/EKYB-819-partner-api", title: "feat(partner): 인증 체계 도입 (EKYB-819)" };
+  assert.equal(lib.prBelongsToCard(pr819, "EKYB-819"), true);
+  assert.equal(lib.prBelongsToCard(pr819, "EKYB-820"), false);   // 본문에만 언급된 형제 카드
+  assert.equal(lib.prBelongsToCard({ branch: "feat/ekyb-820-x", title: "" }, "EKYB-820"), true);  // 대소문자 무관
+  assert.equal(lib.prBelongsToCard({ branch: "", title: "무관한 PR" }, "EKYB-820"), false);
+  assert.equal(lib.prBelongsToCard(null, "EKYB-820"), false);
+  assert.equal(lib.prBelongsToCard({ branch: "feat/EKYB-820-x" }, ""), false);
+});

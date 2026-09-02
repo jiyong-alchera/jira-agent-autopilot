@@ -395,6 +395,17 @@ function buildAdoptedAnswerBody(suggested, epicKey) {
   return `${head}\n\n${lines.join("\n\n")}`;
 }
 
+// PR 이 정말 이 카드의 것인지 판정.
+// `gh pr list --search <KEY>` 는 PR 본문까지 전문 검색하므로, 본문에 다른 카드 키를 언급한 PR
+// (예: "후속: EKYB-820")이 그 카드의 PR 로도 잡힌다. 자동화는 브랜치를 `feat/<KEY>-…`,
+// 제목을 `… (<KEY>)` 로 만들므로 둘 중 하나에 키가 있으면 그 카드의 PR 로 본다.
+function prBelongsToCard(pr, key) {
+  if (!pr || !key) return false;
+  const k = String(key).toUpperCase();
+  const has = (v) => String(v || "").toUpperCase().includes(k);
+  return has(pr.branch) || has(pr.title);
+}
+
 module.exports = {
   DEFAULT_CREDS, readJson, writeJson, slugify, triggerClause, detectJql,
   adfToText, adfSegments, toADF, mdInline, mdToADF, buildReplyADF, maskCreds, applyCreds, createStore, doneStatusList, effectiveDoneStatuses,
@@ -403,5 +414,5 @@ module.exports = {
   ENGINES, DEFAULT_ENGINE, DEFAULT_MODEL, resolveEngine,
   REVIEW_LOOP_MAX_DEFAULT, REVIEW_LOOP_MAX_LIMIT, clampReviewLoopMax,
   SUGGEST_MARK, parseSuggestedAnswers,
-  EPIC_STEPS, epicChildrenJql, epicTaskStep, nextEpicTask, nextEpicStep, buildAdoptedAnswerBody,
+  EPIC_STEPS, epicChildrenJql, epicTaskStep, nextEpicTask, nextEpicStep, buildAdoptedAnswerBody, prBelongsToCard,
 };

@@ -221,6 +221,8 @@ async function cardOpenPRs(key) {
     const list = await ghJson(["pr", "list", "--repo", or, "--search", key, "--state", "open", "--json", "number,url,title,headRefName,isDraft"]);
     for (const p of (list || [])) {
       if (p.isDraft) continue;
+      // --search 는 PR 본문까지 훑어 형제 카드의 PR 까지 잡는다 → 브랜치/제목으로 이 카드 것만 남긴다.
+      if (!lib.prBelongsToCard({ branch: p.headRefName, title: p.title }, key)) continue;
       const comments = await ghJson(["api", `repos/${or}/issues/${p.number}/comments?per_page=100`, "--jq", "[.[].body]"]);
       const approved = (comments || []).some((b) => String(b).includes(APPROVED_MARKER));
       prs.push({ owner: or, number: p.number, url: p.url, approved });
