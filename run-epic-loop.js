@@ -25,7 +25,8 @@
 //
 // env: PROJECT_ID(필수), EPIC_REPOS(쉼표 구분 repo name), REVIEW_LOOP_MAX,
 //      EPIC_MERGE_POLL(병합 대기 폴링 초, 기본 60), EPIC_RESUME_STEP·EPIC_RESUME_KEY(재개 지점),
-//      DASHBOARD_URL(있으면 병합 동기화를 앞당김) — 그 외는 하위 스크립트가 쓰는 값 그대로
+//      EPIC_AUTO_MERGE(1=승인 후 자동 병합)·EPIC_AUTO_MERGE_AFTER_MIN(대기 분, 기본 60),
+//      DASHBOARD_URL(병합 동기화 가속 + 자동 병합 경로) — 그 외는 하위 스크립트가 쓰는 값 그대로
 // --------------------------------------------------------------------------
 const fs = require("fs");
 const path = require("path");
@@ -63,6 +64,18 @@ const LOCK_DIR = path.join(STATE_DIR, `${EPIC_KEY}.epic.lock`);
 const STOP_FILE = path.join(STATE_DIR, `${EPIC_KEY}.epic.stop`);
 const STATUS_FILE = path.join(STATE_DIR, `${EPIC_KEY}.epic.json`);
 const DESIGN_FILE = path.join(STATE_DIR, `${EPIC_KEY}.epic-design.md`);
+// 실행 중에도 대시보드가 바꿀 수 있는 옵션(자동 병합 on/off·대기 시간). 러너는 폴링할 때마다 다시 읽는다.
+const OPTS_FILE = path.join(STATE_DIR, `${EPIC_KEY}.epic.opts.json`);
+const DEFAULT_OPTS = {
+  autoMerge: process.env.EPIC_AUTO_MERGE === "1",
+  autoMergeAfterMin: lib.clampAutoMergeMin(process.env.EPIC_AUTO_MERGE_AFTER_MIN),
+};
+function readOpts() {
+  try {
+    const o = JSON.parse(fs.readFileSync(OPTS_FILE, "utf8"));
+    return { autoMerge: !!o.autoMerge, autoMergeAfterMin: lib.clampAutoMergeMin(o.autoMergeAfterMin) };
+  } catch { return DEFAULT_OPTS; }
+}
 
 // 대상 repo — 시작 시 사용자가 고른 것. 비면 프로젝트 전체.
 const allRepos = lib.normalizeRepos(cfg);
@@ -231,6 +244,22 @@ async function cardOpenPRs(key) {
   return prs;
 }
 
+// 대시보드를 통해 이 카드의 자동화 PR 을 병합한다.
+// gh 로 직접 머지하지 않는 이유: 대시보드 병합 경로가 '병합 + 카드 완료 전환 + 완료 내역 최종 갱신 +
+// clone 정리' 를 함께 처리하기 때문. 카드가 완료돼야 await-merge 가 통과하므로 이 경로를 써야 한다.
+async function mergeViaDashboard() {
+  const dash = process.env.DASHBOARD_URL;
+  if (!dash) return { ok: false, message: "DASHBOARD_URL 이 없어 자동 병합을 할 수 없습니다(대시보드 필요)." };
+  try {
+    const r = await fetch(`${dash}/api/cards/${encodeURIComponent(STATE.current.key)}/merge?project=${encodeURIComponent(project.id)}`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: "{}", signal: AbortSignal.timeout(300000),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!j || !j.ok) return { ok: false, message: (j && (j.message || (j.errors || [])[0])) || `HTTP ${r.status}` };
+    return { ok: true, merged: j.merged || 0, doneStatus: j.doneStatus || "", errors: j.errors || [] };
+  } catch (e) { return { ok: false, message: String((e && e.message) || e) }; }
+}
+
 // ----- 단계 구현 -----
 async function stepPrepare(task) {
   const want = [cfg.triggerLabel || "claude-work", ...epicRepos.map((r) => lib.REPO_LABEL_PREFIX + r.name)];
@@ -283,8 +312,13 @@ async function stepApprove(task) {
   return { ok: true, note: `PR ${prs.length}건 리뷰 승인 완료` };
 }
 // 사용자가 PR 을 모두 병합할 때까지 대기. 대시보드가 있으면 병합 동기화를 앞당겨 호출한다.
+// 자동 병합이 켜져 있으면, 대기 시간이 지나고 열린 PR 이 '모두 리뷰 승인' 된 경우 대신 병합한다.
 async function stepAwaitMerge(task) {
-  await slack(`⏳ [${EPIC_KEY}] ${task.key} PR 병합 대기 중 — 병합하면 다음 태스크로 넘어갑니다.`);
+  const waitStartedAt = STATE.stepStartedAt || nowIso();
+  const o0 = readOpts();
+  await slack(`⏳ [${EPIC_KEY}] ${task.key} PR 병합 대기 중 — 병합하면 다음 태스크로 넘어갑니다.`
+    + (o0.autoMerge ? ` (승인 상태로 ${o0.autoMergeAfterMin}분 경과 시 자동 병합)` : ""));
+  let autoMergeTried = false;
   for (;;) {
     if (stopRequested()) return { ok: false, stop: true };
     const dash = process.env.DASHBOARD_URL;
@@ -294,7 +328,31 @@ async function stepAwaitMerge(task) {
     let cur;
     try { cur = await fetchTask(task.key); } catch (e) { log(`상태 조회 실패(재시도): ${e.message}`); await sleep(MERGE_POLL_MS); continue; }
     if (cur.done) return { ok: true, note: `병합 완료 → ${cur.status}` };
-    writeStatus({ current: { ...STATE.current, waitingSince: STATE.current && STATE.current.waitingSince ? STATE.current.waitingSince : nowIso() } });
+
+    // 자동 병합 판정 — 옵션은 매 회 다시 읽어 실행 중 on/off 가 바로 반영되게 한다.
+    const opts = readOpts();
+    let openPRs = [];
+    if (opts.autoMerge) { try { openPRs = await cardOpenPRs(task.key); } catch { openPRs = []; } }
+    const d = lib.shouldAutoMerge(opts, waitStartedAt, openPRs, Date.now());
+    writeStatus({
+      waitStartedAt, autoMerge: opts.autoMerge, autoMergeAfterMin: opts.autoMergeAfterMin,
+      autoMergeAt: d.dueMs ? new Date(d.dueMs).toISOString().replace(/\.\d{3}Z$/, "Z") : null,
+      autoMergeState: d.reason,
+      current: { ...STATE.current, waitingSince: waitStartedAt },
+    });
+    if (d.merge && !autoMergeTried) {
+      autoMergeTried = true;   // 한 번만 시도 — 실패하면 사람이 봐야 한다(무한 재시도로 PR 을 계속 두드리지 않는다)
+      log(`${task.key} 승인 상태로 ${opts.autoMergeAfterMin}분 경과 → 자동 병합 시도 (PR ${openPRs.length}건)`);
+      await slack(`🤖 [${EPIC_KEY}] ${task.key} — 리뷰 승인 후 ${opts.autoMergeAfterMin}분간 병합되지 않아 자동 병합합니다 (PR ${openPRs.length}건).`);
+      const r = await mergeViaDashboard();
+      if (r.ok) {
+        log(`${task.key} 자동 병합 완료 (${r.merged}건${r.doneStatus ? ` · 카드 ${r.doneStatus}` : ""})`);
+        await slack(`✅ [${EPIC_KEY}] ${task.key} 자동 병합 완료 — PR ${r.merged}건${r.doneStatus ? ` · 카드 ${r.doneStatus}` : ""}`);
+        continue;   // 다음 폴링에서 카드 완료를 확인하고 다음 태스크로
+      }
+      log(`${task.key} 자동 병합 실패: ${r.message}`);
+      return { ok: false, reason: `자동 병합 실패 — ${r.message}. PR 상태(충돌·권한)를 확인한 뒤 직접 병합하거나 [이어서 진행] 하세요.` };
+    }
     await sleep(MERGE_POLL_MS);
   }
 }

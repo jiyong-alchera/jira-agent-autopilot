@@ -406,6 +406,30 @@ function prBelongsToCard(pr, key) {
   return has(pr.branch) || has(pr.title);
 }
 
+// ===== 에픽 자동 병합 옵션 =====
+// 리뷰 승인까지 끝난 PR 을 사람이 오래 병합하지 않으면 대기 시간 뒤에 자동 병합한다.
+// 기본 60분, 1분~24시간(1440분) 범위.
+const EPIC_AUTO_MERGE_MIN_DEFAULT = 60;
+const EPIC_AUTO_MERGE_MIN_LIMIT = 1440;
+function clampAutoMergeMin(v) {
+  const n = parseInt(v, 10);
+  if (!Number.isFinite(n) || n <= 0) return EPIC_AUTO_MERGE_MIN_DEFAULT;
+  return Math.min(n, EPIC_AUTO_MERGE_MIN_LIMIT);
+}
+// 자동 병합 판정 — 켜져 있고, 대기 시간을 넘겼고, 열린 PR 이 '모두 리뷰 승인' 됐을 때만.
+// 미승인 PR 이 하나라도 있으면 시간이 지나도 병합하지 않는다(승인 게이트를 우회하지 않기 위해).
+function shouldAutoMerge(opts, waitStartedAt, openPRs, now) {
+  if (!opts || !opts.autoMerge) return { merge: false, reason: "off" };
+  const prs = openPRs || [];
+  if (!prs.length) return { merge: false, reason: "no-open-pr" };
+  if (!prs.every((p) => p.approved)) return { merge: false, reason: "not-approved" };
+  const start = Date.parse(waitStartedAt || "");
+  if (!Number.isFinite(start)) return { merge: false, reason: "no-start" };
+  const dueMs = start + clampAutoMergeMin(opts.autoMergeAfterMin) * 60000;
+  const t = (now instanceof Date ? now.getTime() : Number(now)) || Date.now();
+  return t >= dueMs ? { merge: true, reason: "due", dueMs } : { merge: false, reason: "waiting", dueMs };
+}
+
 module.exports = {
   DEFAULT_CREDS, readJson, writeJson, slugify, triggerClause, detectJql,
   adfToText, adfSegments, toADF, mdInline, mdToADF, buildReplyADF, maskCreds, applyCreds, createStore, doneStatusList, effectiveDoneStatuses,
@@ -415,4 +439,5 @@ module.exports = {
   REVIEW_LOOP_MAX_DEFAULT, REVIEW_LOOP_MAX_LIMIT, clampReviewLoopMax,
   SUGGEST_MARK, parseSuggestedAnswers,
   EPIC_STEPS, epicChildrenJql, epicTaskStep, nextEpicTask, nextEpicStep, buildAdoptedAnswerBody, prBelongsToCard,
+  EPIC_AUTO_MERGE_MIN_DEFAULT, EPIC_AUTO_MERGE_MIN_LIMIT, clampAutoMergeMin, shouldAutoMerge,
 };

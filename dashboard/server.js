@@ -655,8 +655,21 @@ app.post("/api/cards/:key/review-loop/stop", (req, res) => {
 // ================= 에픽 연속 개발 (run-epic-loop.js) =================
 // 에픽 하위 태스크를 생성순으로 하나씩 plan→답변자동채택→build(+승인까지 리뷰 루프)→병합 대기로 처리한다.
 // 진행 상태·중지는 <cloneBase>/.state/<EPIC>.epic.{lock,json,stop} 로 주고받는다(리뷰 승인 루프와 같은 규약).
+// 실행 중에도 바꿀 수 있는 에픽 옵션(자동 병합) — 러너가 await-merge 폴링마다 다시 읽는다.
+const epicOptsPath = (cfg, key) => path.join(stateDirOf(cfg), `${key}.epic.opts.json`);
+function readEpicOpts(cfg, key) {
+  try {
+    const o = JSON.parse(fs.readFileSync(epicOptsPath(cfg, key), "utf8"));
+    return { autoMerge: !!o.autoMerge, autoMergeAfterMin: lib.clampAutoMergeMin(o.autoMergeAfterMin) };
+  } catch { return { autoMerge: false, autoMergeAfterMin: lib.EPIC_AUTO_MERGE_MIN_DEFAULT }; }
+}
+function writeEpicOpts(cfg, key, next) {
+  const o = { autoMerge: !!next.autoMerge, autoMergeAfterMin: lib.clampAutoMergeMin(next.autoMergeAfterMin) };
+  try { fs.mkdirSync(stateDirOf(cfg), { recursive: true }); fs.writeFileSync(epicOptsPath(cfg, key), JSON.stringify(o, null, 2)); } catch {}
+  return o;
+}
 function runEpicLoop(epicKey, projectId, opts) {
-  const { repos, reviewLoopMax, resumeStep, resumeKey } = opts || {};
+  const { repos, reviewLoopMax, resumeStep, resumeKey, autoMerge, autoMergeAfterMin } = opts || {};
   const script = path.join(SCRIPTS_DIR, "run-epic-loop.js");
   if (!fs.existsSync(script)) return { ok: false, message: `스크립트를 찾을 수 없습니다: ${script}` };
   const logPath = path.join(SCRIPTS_DIR, "loop-epic.log");
@@ -670,6 +683,8 @@ function runEpicLoop(epicKey, projectId, opts) {
   env.REVIEW_LOOP_MAX = String(reviewLoopMax || clampReviewLoopMax(null, getConfig(projectId)));
   if (resumeStep) env.EPIC_RESUME_STEP = resumeStep;
   if (resumeKey) env.EPIC_RESUME_KEY = resumeKey;
+  env.EPIC_AUTO_MERGE = autoMerge ? "1" : "";
+  env.EPIC_AUTO_MERGE_AFTER_MIN = String(lib.clampAutoMergeMin(autoMergeAfterMin));
   const proc = spawn("node", [script, epicKey], { cwd: SCRIPTS_DIR, env, detached: true, stdio: ["ignore", fd, fd] });
   try { fs.closeSync(fd); } catch {}
   proc.unref();
@@ -683,16 +698,16 @@ function epicRunStatus(cfg, epicKey) {
   if (fs.existsSync(lockDir)) {
     let pid = null; try { pid = parseInt(fs.readFileSync(`${lockDir}.pid`, "utf8").trim(), 10); } catch {}
     // 락의 PID 가 진실 — 상태 파일의 pid(종료 시 null 로 기록됨)가 덮어쓰지 않도록 spread 뒤에 둔다.
-    if (pid && isAlive(pid)) return { running: true, ...st, pid, stopping: fs.existsSync(path.join(stateDir, `${epicKey}.epic.stop`)), status: "running" };
+    if (pid && isAlive(pid)) return { running: true, ...st, pid, stopping: fs.existsSync(path.join(stateDir, `${epicKey}.epic.stop`)), status: "running", opts: readEpicOpts(cfg, epicKey) };
     // 스테일 락(프로세스가 죽음) 정리 — 상태 파일은 남겨 '중단됨'으로 보이게 한다.
     try { fs.rmSync(lockDir, { recursive: true, force: true }); } catch {}
     for (const f of [`${lockDir}.pid`, `${lockDir}.phase`, path.join(stateDir, `${epicKey}.epic.stop`)]) { try { fs.unlinkSync(f); } catch {} }
   }
-  if (!st.epic) return { running: false, status: "idle" };
+  if (!st.epic) return { running: false, status: "idle", opts: readEpicOpts(cfg, epicKey) };
   // 락 없이 'running' 으로 남은 상태 파일 = 러너가 크래시/강제 종료된 것 → 재개 대상(paused)으로 정규화.
   // (락 정리는 위에서 한 번만 일어나므로 이 판정은 스테일 락 분기 밖에 둔다)
   if (st.status === "running") st = { ...st, status: "paused", reason: st.reason || "러너 프로세스가 예기치 않게 종료됐습니다." };
-  return { running: false, ...st };
+  return { running: false, ...st, opts: readEpicOpts(cfg, epicKey) };
 }
 
 // 프로젝트의 에픽 목록(연속 개발 시작 폼용)
@@ -744,7 +759,8 @@ app.post("/api/epics/:key/run", (req, res) => {
     // 새 시작이므로 이전 실행의 상태 파일은 지운다(재개는 /run/resume).
     try { fs.unlinkSync(path.join(stateDirOf(cfg), `${key}.epic.json`)); } catch {}
     const reviewLoopMax = clampReviewLoopMax(b.reviewLoopMax, cfg);
-    res.json({ ...runEpicLoop(key, id, { repos, reviewLoopMax }), repos, reviewLoopMax });
+    const opts = writeEpicOpts(cfg, key, { autoMerge: b.autoMerge, autoMergeAfterMin: b.autoMergeAfterMin });
+    res.json({ ...runEpicLoop(key, id, { repos, reviewLoopMax, ...opts }), repos, reviewLoopMax, opts });
   } catch (e) { fail(res, e); }
 });
 // 멈춘(paused/stopped) 에픽을 이어서 진행 — body.skip=true 면 멈춘 단계를 건너뛰고 다음 단계부터.
@@ -763,9 +779,27 @@ app.post("/api/epics/:key/run/resume", (req, res) => {
     const reviewLoopMax = clampReviewLoopMax((req.body || {}).reviewLoopMax, cfg);
     // 재개 단계는 '멈췄던 그 카드' 에만 적용한다(그 사이 사람이 카드를 끝냈으면 다른 카드에 잘못 붙지 않도록)
     const resumeKey = (cur.current && cur.current.key) || "";
-    res.json({ ...runEpicLoop(key, id, { repos: cur.repos || [], reviewLoopMax, resumeStep: step || "", resumeKey }), resumedAt: step || "(현재 단계 재판정)" });
+    const opts = readEpicOpts(cfg, key);   // 재개는 저장된 자동 병합 설정을 그대로 이어간다
+    res.json({ ...runEpicLoop(key, id, { repos: cur.repos || [], reviewLoopMax, resumeStep: step || "", resumeKey, ...opts }), resumedAt: step || "(현재 단계 재판정)", opts });
   } catch (e) { fail(res, e); }
 });
+// 자동 병합 옵션 변경 — 실행 중에도 즉시 반영된다(러너가 await-merge 폴링마다 옵션 파일을 다시 읽음).
+// body { autoMerge:boolean, autoMergeAfterMin:number }
+app.post("/api/epics/:key/run/options", (req, res) => {
+  const key = req.params.key;
+  if (!/^[A-Z][A-Z0-9]+-[0-9]+$/.test(key)) return res.status(400).json({ ok: false, message: "이슈 키 형식 오류" });
+  try {
+    const { cfg } = resolveProject(req);
+    const b = req.body || {};
+    const cur = readEpicOpts(cfg, key);
+    const opts = writeEpicOpts(cfg, key, {
+      autoMerge: b.autoMerge === undefined ? cur.autoMerge : !!b.autoMerge,
+      autoMergeAfterMin: b.autoMergeAfterMin === undefined ? cur.autoMergeAfterMin : b.autoMergeAfterMin,
+    });
+    res.json({ ok: true, opts, message: opts.autoMerge ? `자동 병합 켜짐 (승인 후 ${opts.autoMergeAfterMin}분)` : "자동 병합 꺼짐" });
+  } catch (e) { fail(res, e); }
+});
+
 // 에픽 연속 개발 중지 — 중지 플래그를 먼저 쓰고 프로세스 트리를 종료(진행 중 하위 작업도 함께 종료)
 app.post("/api/epics/:key/run/stop", (req, res) => {
   const key = req.params.key;

@@ -94,3 +94,47 @@ test("prBelongsToCard: 브랜치·제목의 키로 이 카드 PR 을 가린다",
   assert.equal(lib.prBelongsToCard(null, "EKYB-820"), false);
   assert.equal(lib.prBelongsToCard({ branch: "feat/EKYB-820-x" }, ""), false);
 });
+
+// ===== 자동 병합(리뷰 승인 후 N분) =====
+test("clampAutoMergeMin: 기본 60분, 1~1440 범위", () => {
+  assert.equal(lib.clampAutoMergeMin(undefined), 60);
+  assert.equal(lib.clampAutoMergeMin(0), 60);
+  assert.equal(lib.clampAutoMergeMin(-5), 60);
+  assert.equal(lib.clampAutoMergeMin("30"), 30);
+  assert.equal(lib.clampAutoMergeMin(99999), 1440);
+});
+
+test("shouldAutoMerge: 꺼져 있으면 시간이 지나도 병합하지 않는다", () => {
+  const start = "2026-09-02T00:00:00Z";
+  const at = (m) => Date.parse(start) + m * 60000;
+  const r = lib.shouldAutoMerge({ autoMerge: false, autoMergeAfterMin: 60 }, start, [{ approved: true }], at(999));
+  assert.equal(r.merge, false);
+  assert.equal(r.reason, "off");
+});
+
+test("shouldAutoMerge: 미승인 PR 이 하나라도 있으면 병합하지 않는다 (승인 게이트 우회 금지)", () => {
+  const start = "2026-09-02T00:00:00Z";
+  const at = (m) => Date.parse(start) + m * 60000;
+  const prs = [{ approved: true }, { approved: false }];
+  const r = lib.shouldAutoMerge({ autoMerge: true, autoMergeAfterMin: 60 }, start, prs, at(600));
+  assert.equal(r.merge, false);
+  assert.equal(r.reason, "not-approved");
+});
+
+test("shouldAutoMerge: 대기 시간을 넘기고 전부 승인이면 병합", () => {
+  const start = "2026-09-02T00:00:00Z";
+  const at = (m) => Date.parse(start) + m * 60000;
+  const prs = [{ approved: true }, { approved: true }];
+  const opts = { autoMerge: true, autoMergeAfterMin: 60 };
+  assert.equal(lib.shouldAutoMerge(opts, start, prs, at(59)).merge, false);   // 아직
+  assert.equal(lib.shouldAutoMerge(opts, start, prs, at(59)).reason, "waiting");
+  const due = lib.shouldAutoMerge(opts, start, prs, at(60));
+  assert.equal(due.merge, true);
+  assert.equal(due.dueMs, at(60));
+});
+
+test("shouldAutoMerge: 열린 PR 이 없거나 시작 시각이 없으면 병합하지 않는다", () => {
+  const opts = { autoMerge: true, autoMergeAfterMin: 60 };
+  assert.equal(lib.shouldAutoMerge(opts, "2026-09-02T00:00:00Z", [], Date.now()).reason, "no-open-pr");
+  assert.equal(lib.shouldAutoMerge(opts, "", [{ approved: true }], Date.now()).reason, "no-start");
+});

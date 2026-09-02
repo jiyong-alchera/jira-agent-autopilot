@@ -1167,6 +1167,13 @@ function ProjectCard({ proj, onDeleted, flash, jumpTo }) {
 }
 
 // =================== 전체 앱 ===================
+// 미래 시각까지 남은 시간 표기(자동 병합 예정 시각용)
+function untilText(iso) {
+  const ms = new Date(iso).getTime() - Date.now();
+  if (!Number.isFinite(ms) || ms <= 0) return "곧";
+  const m = Math.round(ms / 60000);
+  return m < 60 ? `${m}분` : `${Math.floor(m / 60)}시간 ${m % 60}분`;
+}
 // "12분째" / "3초 전" 같은 경과 표기 — 긴 단계에서 진행이 살아 있는지 눈으로 확인하기 위한 것.
 function sinceText(iso) {
   if (!iso) return "";
@@ -1388,6 +1395,8 @@ function EpicPanel({ projects, flash }) {
   const [run, setRun] = useState({ running: false, status: "idle" });
   const [busy, setBusy] = useState("");
   const repoTouched = React.useRef(false);   // 사용자가 체크를 직접 바꿨는지(폴링이 덮어쓰지 않도록)
+  const [autoMerge, setAutoMerge] = useState(false);          // 승인 후 자동 병합
+  const [autoMergeMin, setAutoMergeMin] = useState("60");     // 대기(분)
   const proj = projects.find((p) => p.id === pid) || null;
   const repoNames = ((proj && proj.repos) || []).map((r) => r.name).filter(Boolean);
 
@@ -1411,6 +1420,7 @@ function EpicPanel({ projects, flash }) {
     setRun(st);
     // 진행 중이거나 중단된 실행은 '그 실행이 실제로 쓰는 repo' 가 진실 — 기본값(전체 선택)으로 덮어쓰지 않는다.
     // (이걸 안 하면 3개만 골라 돌려도 패널엔 5개 전부 체크된 것처럼 보인다)
+    if (st.opts) { setAutoMerge(!!st.opts.autoMerge); setAutoMergeMin(String(st.opts.autoMergeAfterMin || 60)); }
     const hasRun = st.running || st.status === "paused" || st.status === "stopped";
     if (Array.isArray(st.repos) && st.repos.length && hasRun && (st.running || !repoTouched.current)) {
       setRepos(st.repos);
@@ -1427,7 +1437,15 @@ function EpicPanel({ projects, flash }) {
     try { const r = await fn(); flash(r.ok ? (r.message || `${name} 완료`) : (r.message || `${name} 실패`)); await loadRun(); await loadChildren(epicKey); }
     finally { setBusy(""); }
   };
-  const start = () => act("시작", () => api.post(`/api/epics/${epicKey}/run?project=${encodeURIComponent(pid)}`, { repos }));
+  const start = () => act("시작", () => api.post(`/api/epics/${epicKey}/run?project=${encodeURIComponent(pid)}`, { repos, autoMerge, autoMergeAfterMin: parseInt(autoMergeMin, 10) || 60 }));
+  // 실행 중에도 즉시 반영 — 러너가 병합 대기 폴링마다 옵션 파일을 다시 읽는다.
+  const saveAutoMerge = async (next) => {
+    const body = { autoMerge: next.autoMerge, autoMergeAfterMin: parseInt(next.min, 10) || 60 };
+    setAutoMerge(body.autoMerge); setAutoMergeMin(String(body.autoMergeAfterMin));
+    const r = await api.post(`/api/epics/${epicKey}/run/options?project=${encodeURIComponent(pid)}`, body);
+    flash(r.ok ? (r.message || "자동 병합 설정 저장") : (r.message || "설정 저장 실패"));
+    loadRun();
+  };
   const resume = (skip) => act(skip ? "건너뛰기" : "이어서 진행", () => api.post(`/api/epics/${epicKey}/run/resume?project=${encodeURIComponent(pid)}`, { skip }));
   const stop = () => act("중지", () => api.post(`/api/epics/${epicKey}/run/stop?project=${encodeURIComponent(pid)}`));
 
@@ -1514,6 +1532,34 @@ function EpicPanel({ projects, flash }) {
               {paused && <div className="text-xs text-amber-300/80 mt-1">멈춘 단계: <b>{EPIC_STEP_LABEL[run.step] || run.step || "-"}</b>{cur ? ` · ${cur.key}` : ""} — 조치 후 [이어서 진행]을 누르면 이 단계부터 다시 실행합니다.</div>}
             </div>
           )}
+
+          {/* 자동 병합 — 리뷰 승인까지 끝난 PR 을 오래 두면 대신 병합 */}
+          <div className="mb-3 rounded-lg border border-slate-700 bg-slate-800/40 px-3 py-2">
+            <div className="flex items-center gap-3 flex-wrap">
+              <label className="inline-flex items-center gap-1.5 text-sm text-slate-300">
+                <input type="checkbox" checked={autoMerge}
+                  onChange={(e) => saveAutoMerge({ autoMerge: e.target.checked, min: autoMergeMin })} />
+                리뷰 승인 후 자동 병합
+                <InfoTip title="리뷰 승인 후 자동 병합" text={"리뷰 승인이 끝난 PR 을 지정한 시간 동안 아무도 병합하지 않으면 대시보드가 대신 병합합니다.\n\n· 열린 PR 이 '모두' 리뷰 승인된 경우에만 병합합니다. 미승인 PR 이 하나라도 있으면 시간이 지나도 병합하지 않습니다.\n· 대기 시간은 '병합 대기' 단계에 들어간 시점부터 셉니다.\n· 실행 중에 켜고 끄면 바로 반영됩니다.\n· 병합에 실패하면(충돌·권한 등) 에픽을 중단하고 알립니다.\n· 대시보드가 켜져 있어야 동작합니다(병합 + 카드 완료 처리를 대시보드가 함께 수행)."} />
+              </label>
+              <label className={`inline-flex items-center gap-1.5 text-sm ${autoMerge ? "text-slate-300" : "text-slate-600"}`}>
+                대기
+                <input type="number" min="1" max="1440" value={autoMergeMin} disabled={!autoMerge}
+                  onChange={(e) => setAutoMergeMin(e.target.value)}
+                  onBlur={() => saveAutoMerge({ autoMerge, min: autoMergeMin })}
+                  className="w-20 bg-slate-800 border border-slate-600 rounded px-2 py-1 text-sm disabled:opacity-40 focus:outline-none focus:border-indigo-400" />
+                분
+              </label>
+              {autoMerge && run.running && run.step === "await-merge" && run.autoMergeAt && (
+                <span className="text-xs text-teal-300">
+                  {run.autoMergeState === "not-approved"
+                    ? "미승인 PR 이 있어 자동 병합 대기 중"
+                    : `자동 병합 예정: ${new Date(run.autoMergeAt).toLocaleTimeString()} (약 ${untilText(run.autoMergeAt)} 후)`}
+                </span>
+              )}
+            </div>
+            {!autoMerge && <p className="text-[11px] text-slate-500 mt-1">꺼져 있으면 PR 을 직접 병합해야 다음 태스크로 넘어갑니다.</p>}
+          </div>
 
           {/* 현재 태스크의 PR — 병합해야 다음 태스크로 넘어가므로 여기서 바로 조작 */}
           {(run.running || paused) && cur && cur.key && (
