@@ -351,6 +351,50 @@ function parseSuggestedAnswers(comments) {
   };
 }
 
+// ===== 에픽 연속 개발(run-epic-loop.js) 순수 로직 =====
+// 한 에픽의 하위 태스크를 생성순으로 하나씩: prepare→plan→adopt→build(+리뷰 승인 루프)→await-merge.
+// 러너는 상태를 <CLONE_BASE>/.state/<EPIC>.epic.json 에 쓰고 대시보드가 폴링한다.
+const EPIC_STEPS = ["prepare", "plan", "adopt", "build", "approve", "await-merge"];
+// 하위 태스크 조회 JQL — 미완료(완료 상태·Done 카테고리 제외) 전부, 생성순.
+// link: "parent"(기본) 또는 "epic-link" — 구형 company-managed 프로젝트는 'Epic Link' 만 먹는다.
+function epicChildrenJql(epicKey, cfg, link) {
+  const done = effectiveDoneStatuses(cfg || {});
+  const excl = done.length ? ` AND status NOT IN (${done.map((s) => `"${s}"`).join(", ")})` : "";
+  const clause = link === "epic-link" ? `"Epic Link" = "${epicKey}"` : `parent = "${epicKey}"`;
+  return `${clause} AND statusCategory != Done${excl} ORDER BY created ASC`;
+}
+// 태스크의 남은 단계 판정 — 라벨/상태로 '어디부터 하면 되는지'를 정한다(중단 후 재개·중복 실행 방지).
+function epicTaskStep(task, cfg) {
+  const c = cfg || {};
+  const labels = (task && task.labels) || [];
+  if (task && task.done) return null;                                   // 이미 완료된 카드는 건너뜀
+  if (labels.includes(c.prOpenLabel || "claude-pr")) return "await-merge"; // PR 올림 → 병합 대기
+  if (!labels.includes(c.triggerLabel || "claude-work")) return "prepare";
+  if (!labels.includes(c.plannedLabel || "claude-planned")) return "plan";
+  if (!labels.includes(c.answeredLabel || "claude-answered")) return "adopt";
+  return "build";
+}
+// 다음에 처리할 태스크(생성순으로 처리할 게 남은 첫 카드). 없으면 null → 에픽 완료.
+function nextEpicTask(tasks, cfg) {
+  for (const t of tasks || []) { const step = epicTaskStep(t, cfg); if (step) return { ...t, step }; }
+  return null;
+}
+// 이번 단계 다음 단계(마지막이면 null)
+function nextEpicStep(step) {
+  const i = EPIC_STEPS.indexOf(step);
+  return (i < 0 || i >= EPIC_STEPS.length - 1) ? null : EPIC_STEPS[i + 1];
+}
+// 제안 답변 → Jira 답변 코멘트 본문. 자동 채택임을 명시해 사람이 나중에 구분할 수 있게 한다.
+function buildAdoptedAnswerBody(suggested, epicKey) {
+  if (!suggested || !suggested.items || !suggested.items.length) return "";
+  const head = `[에픽 연속 개발${epicKey ? ` · ${epicKey}` : ""}] plan 이 제시한 제안 답변을 그대로 채택합니다.`;
+  const lines = suggested.items.map((it, i) => {
+    const n = it.n || i + 1;
+    return it.question ? `${n}. ${it.question}\n→ ${it.suggestion}` : `${n}. ${it.suggestion}`;
+  });
+  return `${head}\n\n${lines.join("\n\n")}`;
+}
+
 module.exports = {
   DEFAULT_CREDS, readJson, writeJson, slugify, triggerClause, detectJql,
   adfToText, adfSegments, toADF, mdInline, mdToADF, buildReplyADF, maskCreds, applyCreds, createStore, doneStatusList, effectiveDoneStatuses,
@@ -359,4 +403,5 @@ module.exports = {
   ENGINES, DEFAULT_ENGINE, DEFAULT_MODEL, resolveEngine,
   REVIEW_LOOP_MAX_DEFAULT, REVIEW_LOOP_MAX_LIMIT, clampReviewLoopMax,
   SUGGEST_MARK, parseSuggestedAnswers,
+  EPIC_STEPS, epicChildrenJql, epicTaskStep, nextEpicTask, nextEpicStep, buildAdoptedAnswerBody,
 };

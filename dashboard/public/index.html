@@ -1167,10 +1167,169 @@ function ProjectCard({ proj, onDeleted, flash, jumpTo }) {
 }
 
 // =================== 전체 앱 ===================
+// 에픽 연속 개발 패널 — 에픽 하위 태스크를 생성순으로 하나씩 개발→PR→리뷰 승인→병합 대기로 이어간다.
+// 진행 상태는 <EPIC>.epic.json 을 5초 폴링. 중단(paused)되면 사유와 [이어서 진행]/[건너뛰기] 를 띄운다.
+const EPIC_STEP_LABEL = {
+  prepare: "라벨 준비", plan: "plan(질문)", adopt: "제안 답변 채택",
+  build: "개발·PR·리뷰 승인", approve: "리뷰 승인 확인", "await-merge": "PR 병합 대기",
+};
+function EpicPanel({ projects, flash }) {
+  const [pid, setPid] = useState((projects[0] || {}).id || "");
+  const [epics, setEpics] = useState([]);
+  const [epicKey, setEpicKey] = useState("");
+  const [children, setChildren] = useState(null);
+  const [repos, setRepos] = useState([]);          // 선택된 repo name
+  const [run, setRun] = useState({ running: false, status: "idle" });
+  const [busy, setBusy] = useState("");
+  const proj = projects.find((p) => p.id === pid) || null;
+  const repoNames = ((proj && proj.repos) || []).map((r) => r.name).filter(Boolean);
+
+  const loadEpics = async (id) => {
+    if (!id) { setEpics([]); return; }
+    const r = await api.get(`/api/epics?project=${encodeURIComponent(id)}`);
+    setEpics(r.ok ? (r.epics || []) : []);
+    if (!r.ok) flash(r.message || "에픽 조회 실패");
+  };
+  const loadChildren = async (key) => {
+    if (!key) { setChildren(null); return; }
+    setChildren({ loading: true, items: [] });
+    const r = await api.get(`/api/epics/${key}/children?project=${encodeURIComponent(pid)}`);
+    setChildren({ loading: false, items: r.ok ? (r.children || []) : [], error: r.ok ? "" : (r.message || "조회 실패") });
+  };
+  const loadRun = useCallback(async () => {
+    if (!pid || !epicKey) return;
+    const r = await api.get(`/api/epics/${epicKey}/run?project=${encodeURIComponent(pid)}`);
+    if (r.ok) setRun(r.run || { running: false, status: "idle" });
+  }, [pid, epicKey]);
+
+  useEffect(() => { setEpicKey(""); setChildren(null); setRun({ running: false, status: "idle" }); loadEpics(pid); }, [pid]);
+  useEffect(() => { setRepos(repoNames); }, [pid, (proj && (proj.repos || []).length) || 0]);   // 기본은 전체 선택
+  useEffect(() => { loadChildren(epicKey); loadRun(); }, [epicKey]);
+  useEffect(() => { const t = setInterval(loadRun, 5000); return () => clearInterval(t); }, [loadRun]);
+
+  const act = async (name, fn) => {
+    setBusy(name);
+    try { const r = await fn(); flash(r.ok ? (r.message || `${name} 완료`) : (r.message || `${name} 실패`)); await loadRun(); await loadChildren(epicKey); }
+    finally { setBusy(""); }
+  };
+  const start = () => act("시작", () => api.post(`/api/epics/${epicKey}/run?project=${encodeURIComponent(pid)}`, { repos }));
+  const resume = (skip) => act(skip ? "건너뛰기" : "이어서 진행", () => api.post(`/api/epics/${epicKey}/run/resume?project=${encodeURIComponent(pid)}`, { skip }));
+  const stop = () => act("중지", () => api.post(`/api/epics/${epicKey}/run/stop?project=${encodeURIComponent(pid)}`));
+
+  const paused = !run.running && (run.status === "paused" || run.status === "stopped");
+  const finished = !run.running && run.status === "done";
+  const cur = run.current;
+  const total = run.total || (children && children.items.length) || 0;
+  const idx = run.index || 0;
+
+  return (
+    <Section title="에픽 연속 개발" collapsible defaultOpen={false}
+      right={<span className="text-xs text-slate-500">하위 태스크를 생성순으로 하나씩 · 개발 → PR → 리뷰 승인 → 병합하면 다음</span>}>
+      <div className="grid grid-cols-2 gap-4 mb-3">
+        <label className="block">
+          <span className="text-sm text-slate-400">프로젝트</span>
+          <select value={pid} onChange={(e) => setPid(e.target.value)}
+            className="mt-1 w-full bg-slate-800 border border-slate-600 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-indigo-400">
+            {projects.map((p) => <option key={p.id} value={p.id}>{p.name || p.id}</option>)}
+          </select>
+        </label>
+        <label className="block">
+          <span className="text-sm text-slate-400 inline-flex items-center gap-1">
+            에픽
+            <InfoTip title="에픽" text={"연속 개발할 상위 에픽입니다.\n에픽 본문(설계안)이 하위 태스크의 plan·build 프롬프트에 함께 주입되어, 모든 태스크가 같은 설계 방향으로 구현됩니다."} />
+          </span>
+          <select value={epicKey} onChange={(e) => setEpicKey(e.target.value)} disabled={run.running}
+            className="mt-1 w-full bg-slate-800 border border-slate-600 rounded-lg px-3 py-2 text-sm disabled:opacity-50 focus:outline-none focus:border-indigo-400">
+            <option value="">— 에픽 선택 —</option>
+            {epics.map((ep) => <option key={ep.key} value={ep.key}>{ep.key} · {ep.summary}</option>)}
+          </select>
+        </label>
+      </div>
+
+      {epicKey && (
+        <React.Fragment>
+          <div className="mb-3">
+            <div className="text-xs text-slate-400 mb-1 inline-flex items-center gap-1">
+              대상 repo
+              <InfoTip title="대상 repo" text={"에픽 작업이 진행될 레포지토리입니다.\n각 하위 카드에 repo_<name> 라벨로 부여되며, 그 repo 들에서만 개발·PR 이 이뤄집니다."} />
+            </div>
+            <div className="flex flex-wrap gap-3">
+              {repoNames.length === 0 && <span className="text-xs text-slate-500">프로젝트에 등록된 repo 가 없습니다.</span>}
+              {repoNames.map((n) => (
+                <label key={n} className="inline-flex items-center gap-1.5 text-sm text-slate-300">
+                  <input type="checkbox" checked={repos.includes(n)} disabled={run.running}
+                    onChange={(e) => setRepos((p) => e.target.checked ? [...p, n] : p.filter((x) => x !== n))} />
+                  {n}
+                </label>
+              ))}
+            </div>
+          </div>
+
+          {/* 진행 상태 */}
+          {(run.running || paused || finished) && (
+            <div className={`rounded-lg border p-3 mb-3 ${run.running ? "bg-indigo-500/10 border-indigo-500/40" : paused ? "bg-amber-500/10 border-amber-500/40" : "bg-emerald-500/10 border-emerald-500/40"}`}>
+              <div className="flex items-center justify-between gap-3 flex-wrap">
+                <div className="text-sm">
+                  {run.running && <span className="text-indigo-200">▶ 진행 중 · {idx + 1}/{total || "?"} — <b>{cur ? cur.key : "…"}</b> {cur && cur.summary ? `· ${cur.summary}` : ""} <span className="text-indigo-300">({EPIC_STEP_LABEL[run.step] || run.step})</span></span>}
+                  {paused && <span className="text-amber-200">⏸ {run.status === "stopped" ? "중지됨" : "중단됨"} — {run.reason || "사유 없음"}</span>}
+                  {finished && <span className="text-emerald-200">🎉 완료 — {run.reason || ""}</span>}
+                </div>
+                <div className="flex gap-2">
+                  {run.running && <Btn color="red" disabled={busy === "중지"} onClick={stop}>{busy === "중지" ? "중지 중…" : (run.stopping ? "중지 요청됨" : "중지")}</Btn>}
+                  {paused && <Btn color="green" disabled={!!busy} onClick={() => resume(false)}>{busy === "이어서 진행" ? "재개 중…" : "이어서 진행"}</Btn>}
+                  {paused && run.step && <Btn color="slate" disabled={!!busy} onClick={() => resume(true)}>{busy === "건너뛰기" ? "건너뛰는 중…" : "이 단계 건너뛰기"}</Btn>}
+                </div>
+              </div>
+              {run.running && cur && cur.waitingSince && run.step === "await-merge" && (
+                <div className="text-xs text-indigo-300/80 mt-1">이 카드의 PR 을 모두 병합하면 자동으로 다음 태스크로 넘어갑니다.</div>
+              )}
+              {paused && <div className="text-xs text-amber-300/80 mt-1">멈춘 단계: <b>{EPIC_STEP_LABEL[run.step] || run.step || "-"}</b>{cur ? ` · ${cur.key}` : ""} — 조치 후 [이어서 진행]을 누르면 이 단계부터 다시 실행합니다.</div>}
+            </div>
+          )}
+
+          {/* 하위 태스크 목록 */}
+          <div className="border border-slate-700 rounded-lg overflow-hidden mb-3">
+            <table className="w-full text-sm table-fixed">
+              <thead className="bg-slate-800/70 text-slate-400 text-xs">
+                <tr><th className="text-left px-3 py-2 w-28">키</th><th className="text-left px-3 py-2">제목</th><th className="text-left px-3 py-2 w-36">상태</th><th className="text-left px-3 py-2 w-32">다음 단계</th></tr>
+              </thead>
+              <tbody>
+                {children && children.loading && <tr><td colSpan="4" className="px-3 py-3 text-slate-500">불러오는 중…</td></tr>}
+                {children && !children.loading && children.error && <tr><td colSpan="4" className="px-3 py-3 text-rose-300">{children.error}</td></tr>}
+                {children && !children.loading && !children.error && children.items.length === 0 && <tr><td colSpan="4" className="px-3 py-3 text-slate-500">미완료 하위 태스크가 없습니다.</td></tr>}
+                {children && !children.loading && children.items.map((t) => {
+                  const isCur = cur && cur.key === t.key;
+                  return (
+                    <tr key={t.key} className={`border-t border-slate-700/70 ${isCur ? "bg-indigo-500/10" : ""}`}>
+                      <td className="px-3 py-2 font-mono text-xs text-indigo-300">{t.key}</td>
+                      <td className="px-3 py-2 truncate" title={t.summary}>{t.summary}</td>
+                      <td className="px-3 py-2 text-xs text-slate-400 truncate" title={t.status}>{t.status}</td>
+                      <td className="px-3 py-2 text-xs text-slate-400">{isCur ? <span className="text-indigo-300">▶ {EPIC_STEP_LABEL[run.step] || run.step}</span> : (EPIC_STEP_LABEL[t.step] || t.step || "-")}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <Btn color="green" disabled={run.running || !repos.length || !!busy} onClick={start}>{busy === "시작" ? "시작 중…" : "연속 개발 시작"}</Btn>
+            <Btn color="slate" onClick={() => { loadChildren(epicKey); loadRun(); }}>새로고침</Btn>
+          </div>
+          <p className="text-xs text-slate-500 mt-3">
+            트리거 라벨은 <b>그 태스크 차례가 됐을 때만</b> 붙습니다(스케줄 루프가 순서를 앞질러 가져가지 않도록).
+            이미 <code>claude-work</code> 가 붙어 있던 하위 카드는 plan/build 루프도 볼 수 있으니, 에픽 실행 중에는 두 루프를 멈춰두는 것을 권장합니다.
+          </p>
+        </React.Fragment>
+      )}
+    </Section>
+  );
+}
+
 function App() {
   const [projects, setProjects] = useState(null);
   const [status, setStatus] = useState({ plan: { running: false }, build: { running: false }, review: { running: false } });
-  const [logs, setLogs] = useState({ plan: "", build: "" });
+  const [logs, setLogs] = useState({ plan: "", build: "", review: "", epic: "" });
   const [history, setHistory] = useState([]);
   const [histPage, setHistPage] = useState(0);
   const [histQuery, setHistQuery] = useState("");       // 처리 이력 검색(티켓 이름/번호/프로젝트)
@@ -1233,7 +1392,7 @@ function App() {
   useEffect(() => {
     const t = setInterval(async () => {
       setStatus(await api.get("/api/loops/status"));
-      for (const type of ["plan", "build", "review"]) { const r = await api.get(`/api/logs/${type}?lines=120`); setLogs((p) => ({ ...p, [type]: r.log || "" })); }
+      for (const type of ["plan", "build", "review", "epic"]) { const r = await api.get(`/api/logs/${type}?lines=120`); setLogs((p) => ({ ...p, [type]: r.log || "" })); }
       refreshHistoryIfChanged();
     }, 4000);
     const ta = setInterval(loadActive, 30000);   // 활성 작업은 30초마다(프로젝트별 Jira 조회 비용 고려)
@@ -1279,6 +1438,9 @@ function App() {
         </div>
         <p className="text-xs text-slate-500 mt-3">한 사이클마다 등록된 모든 프로젝트를 순회합니다(프로젝트별 동시 상한 적용). <b>review</b> 루프는 자동화가 올린 build PR 을 점검해, 문제없으면 승인 마커 코멘트를 남기고 이후 스킵합니다.</p>
       </Section>
+
+      {/* 에픽 연속 개발 (전역) */}
+      {projects.length > 0 && <EpicPanel projects={projects} flash={flash} />}
 
       {/* 프로젝트들 */}
       <div className="flex items-center justify-between mb-3">
@@ -1423,8 +1585,8 @@ function App() {
 
       {/* 실시간 로그 (전역) */}
       <Section title="실시간 로그 (전 프로젝트)" collapsible defaultOpen>
-        <div className="grid grid-cols-3 gap-4">
-          {["plan", "build", "review"].map((type) => (
+        <div className="grid grid-cols-4 gap-4">
+          {["plan", "build", "review", "epic"].map((type) => (
             <div key={type}>
               <div className="flex items-center justify-between mb-1">
                 <span className="text-sm text-slate-400">loop-{type}.log</span>

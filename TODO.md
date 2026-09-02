@@ -96,4 +96,22 @@
 
 ---
 
+## 확장 기능
+
+- [x] **13. 에픽 연속 개발 (하위 태스크 순차 자동화)**
+  - 내용: 에픽 하나를 지정하면 그 하위 태스크를 순서대로 개발 → PR → 리뷰 → (사람이 병합) → 다음 태스크로,
+    에픽의 하위를 다 채울 때까지 이어서 진행. 에픽 본문(설계안)을 하위 태스크 작업의 베이스로 사용.
+    실행 시 선택한 레포지토리를 기준으로 전 태스크를 진행.
+  - AC: 대시보드에서 에픽+repo 를 선택해 시작/중지할 수 있고, 진행 상황(현재 태스크·단계)이 보인다.
+    PR 이 모두 병합되면 다음 태스크로 자동 진행하며, 중단 시 알림 + 멈춘 지점부터 재개할 수 있다.
+  - 영향: `run-epic-loop.js`(신규), `lib-project-env.js`(신규), `run-jira-agent.sh`(에픽 컨텍스트),
+    `dashboard/lib.js`, `dashboard/server.js`, `dashboard/public/index.html`, `dashboard/test/epic-loop.test.js`
+  → (완료 2026-09-02) `run-epic-loop.js` 추가 — 하위 태스크를 생성순으로 `prepare→plan→adopt→build(+승인까지 리뷰 루프)→approve→await-merge`
+    단계 머신으로 처리. plan 의 `💡 제안:` 답변을 자동 채택해 사람 개입은 PR 병합 하나로 축소. 선택 repo 는 `repo_<name>` 라벨로 부여하고,
+    트리거 라벨은 그 태스크 차례에만 붙여 스케줄 루프와의 순서 충돌을 방지. 실패 시 `paused` + Slack/대시보드 알림, [이어서 진행]/[건너뛰기] 로 재개
+    (상태 파일 기반이라 재시작 후에도 복구). `/api/epics*` 5개 엔드포인트 + 대시보드 '에픽 연속 개발' 패널 + `loop-epic.log` 추가.
+    `run-cycle.js` 의 env 구성 로직은 `lib-project-env.js` 로 분리해 공유.
+
+---
+
 *완료된 항목은 위 "완료 정의"에 따라 체크 표시 + 문서 동기화 후 마감합니다.*

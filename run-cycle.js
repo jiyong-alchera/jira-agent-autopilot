@@ -8,13 +8,11 @@
 // - 카드별 run-jira-agent.sh 를 프로젝트 MAX_PARALLEL 만큼 동시 실행
 // 출력은 stdout(상위 루프가 loop-<phase>.log 로 리다이렉트)
 // --------------------------------------------------------------------------
-const fs = require("fs");
 const path = require("path");
 const { spawn } = require("child_process");
 
-const SELF = __dirname;
-const DASH = path.join(SELF, "dashboard");
-const lib = require(path.join(DASH, "lib"));
+// 프로젝트 설정 → 실행 env 구성은 run-epic-loop.js 와 공유(lib-project-env.js)
+const { SELF, lib, reposToLines, resolveCardEnv, projectEnv, loadProjects, loadCreds } = require("./lib-project-env");
 // 카드 첨부(이미지·문서) 다운로드는 공유 모듈 — 대시보드 단건 실행 경로도 같은 코드를 CLI 로 쓴다.
 const { downloadCardAttachments } = require(path.join(SELF, "lib-attachments"));
 const phase = process.argv[2];
@@ -22,25 +20,6 @@ if (!["plan", "build", "review"].includes(phase)) { console.error("usage: run-cy
 
 const ts = () => new Date().toISOString().slice(0, 19).replace("T", " ");
 const log = (m) => console.log(`[${ts()}] ${m}`);
-const readJson = (p, f) => { try { return JSON.parse(fs.readFileSync(p, "utf8")); } catch { return f; } };
-// repo 별 env 파일(repo 전용만; 없으면 미복사 — run-jira 가 -f 로 확인)
-function repoEnvSrc(cfg, repoName) {
-  return path.join(cfg.workDir || SELF, `work-${cfg.id}-${repoName}.env`);
-}
-const reposToLines = (cfg, repos, envSrcOverride) => (repos || []).map((r) =>
-  [r.name, r.url, r.baseBranch || "main", envSrcOverride || repoEnvSrc(cfg, r.name), r.envDest || cfg.envDest || ""].join("\x1f")
-).join("\n");
-
-// 카드 전용 env: 로컬 card-envs/<KEY>.env 만 읽는다(Jira 폴백 없음). 없으면 null → repo 전용 env 사용.
-function cardEnvLocal(cfg, key) {
-  const dir = cfg.cardEnvDir || path.join(cfg.workDir || SELF, "card-envs");
-  return path.join(dir, `${key}.env`);
-}
-function resolveCardEnv(cfg, key) {
-  const p = cardEnvLocal(cfg, key);
-  return fs.existsSync(p) ? p : null;
-}
-
 // 카드 라벨 조회(프로젝트 자격증명) → 대상 repo 결정용
 async function fetchLabels(cfg, cred, key) {
   if (!cred || !cred.atlassianEmail || !cred.atlassianToken || !cfg.jiraSite) return [];
@@ -49,58 +28,6 @@ async function fetchLabels(cfg, cred, key) {
   if (!r.ok) return [];
   const d = await r.json();
   return (d.fields && d.fields.labels) || [];
-}
-
-const DEFAULTS = {
-  workDir: SELF, baseBranch: "main", triggerMode: "label", triggerLabel: "claude-work", triggerText: "claude-work",
-  doneStatus: "DEV COMPLETED", plannedLabel: "claude-planned", answeredLabel: "claude-answered", failedLabel: "claude-failed", prOpenLabel: "claude-pr",
-  maxRetries: 3, maxParallel: 5, intervalSeconds: 3600, reviewIntervalSeconds: 3600, envMode: "content", envPath: "", envDest: "", cardEnvDir: "", cloneBase: path.join(SELF, "repos"),
-  testCmd: "", buildCmd: "", repoUrl: "", jiraSite: "", projectKey: "", assigneeEmail: "", assigneeName: "",
-  engine: "", model: "",   // 비우면 전역 기본값(claude) 상속
-};
-
-function projectEnv(p, cred) {
-  const cfg = { ...DEFAULTS, ...p };
-  const repos = lib.normalizeRepos(cfg);
-  const env = { ...process.env };
-  env.PROJECT_ID = cfg.id || "";
-  env.WORK_DIR = cfg.workDir;
-  const eng = lib.resolveEngine(cfg);   // 프로젝트 override → 없으면 전역 기본값
-  env.ENGINE = eng.engine;
-  env.MODEL = eng.model;
-  env.REPO_URL = (repos[0] && repos[0].url) || cfg.repoUrl || "";
-  env.BASE_BRANCH = (repos[0] && repos[0].baseBranch) || cfg.baseBranch || "main";
-  env.CARD_REPOS = reposToLines(cfg, repos);   // 기본=전체 repo(카드별로 좁혀짐)
-  env.ASSIGNEE_EMAIL = cfg.assigneeEmail;
-  env.ASSIGNEE_NAME = cfg.assigneeName;
-  env.TRIGGER_MODE = cfg.triggerMode || "label";
-  env.TRIGGER_LABEL = cfg.triggerLabel || "claude-work";
-  env.TRIGGER_TEXT = cfg.triggerText;
-  env.DONE_STATUS = lib.effectiveDoneStatuses(cfg).join(",");   // doneStatus ∪ 매핑 완료
-  env.PLANNED_LABEL = cfg.plannedLabel;
-  env.ANSWERED_LABEL = cfg.answeredLabel || "claude-answered";
-  env.FAILED_LABEL = cfg.failedLabel || "claude-failed";
-  env.PR_OPEN_LABEL = cfg.prOpenLabel || "claude-pr";
-  env.MAX_RETRIES = String(cfg.maxRetries || 3);
-  env.TEST_CMD = cfg.testCmd || "";
-  env.BUILD_CMD = cfg.buildCmd || "";
-  env.HISTORY_FILE = path.join(SELF, "history.jsonl");
-  env.PROJECT_KEY = cfg.projectKey || "";
-  env.ENV_SRC = cfg.envPath || path.join(cfg.workDir || SELF, `work-${cfg.id}.env`);
-  env.ENV_DEST_REL = cfg.envDest || "";
-  env.CLONE_BASE = cfg.cloneBase || path.join(cfg.workDir || SELF, "repos");
-  if (cred && cred.anthropicApiKey) env.ANTHROPIC_API_KEY = cred.anthropicApiKey;
-  if (cred && cred.openaiApiKey) env.OPENAI_API_KEY = cred.openaiApiKey;   // codex 엔진
-  if (cred && cred.geminiApiKey) env.GEMINI_API_KEY = cred.geminiApiKey;   // gemini 엔진
-  if (cred && cred.githubToken) { env.GH_TOKEN = cred.githubToken; env.GITHUB_TOKEN = cred.githubToken; }
-  if (cred && cred.slackWebhookUrl) env.SLACK_WEBHOOK_URL = cred.slackWebhookUrl;
-  // 완료 내역을 설명 ADF 에 직접 append(이미지 보존)하기 위한 Jira REST 자격증명
-  env.JIRA_SITE = cfg.jiraSite || "";
-  // Atlassian MCP 의 cloudId — 프롬프트에 미리 박아 getAccessibleAtlassianResources 왕복을 없앤다.
-  env.JIRA_CLOUD_ID = cfg.jiraCloudId || cfg.jiraSite || "";
-  if (cred && cred.atlassianEmail) env.ATLASSIAN_EMAIL = cred.atlassianEmail;
-  if (cred && cred.atlassianToken) env.ATLASSIAN_TOKEN = cred.atlassianToken;
-  return { cfg, env };
 }
 
 // 탐지: REST(대시보드) 우선, 실패 시 detect-cards.sh 폴백
@@ -161,8 +88,8 @@ async function runWithCap(keys, env, cap, cfg, cred) {
 }
 
 (async () => {
-  const projects = (readJson(path.join(DASH, "projects.json"), { projects: [] }).projects) || [];
-  const creds = readJson(path.join(DASH, "project-credentials.json"), {});
+  const projects = loadProjects();
+  const creds = loadCreds();
   if (!projects.length) { log(`프로젝트가 없습니다 — 건너뜀`); return; }
   for (const p of projects) {
     const cred = creds[p.id];

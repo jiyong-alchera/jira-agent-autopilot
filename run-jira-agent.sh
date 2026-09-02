@@ -102,6 +102,19 @@ if [[ -n "${JIRA_CLOUD_ID:-}" ]]; then
 
 [Atlassian MCP] cloudId 는 '${JIRA_CLOUD_ID}' 입니다. 이 값을 그대로 쓰고 'getAccessibleAtlassianResources' 로 다시 찾지 마세요."
 fi
+# 에픽 연속 개발(run-epic-loop.js)에서 호출된 경우: 에픽 설계안을 컨텍스트로 함께 준다.
+# 하위 태스크는 에픽의 설계 방향 안에서 구현돼야 하므로 plan/build 프롬프트 공통으로 붙인다.
+EPIC_CTX=""
+if [[ -n "${EPIC_KEY:-}" ]]; then
+  EPIC_CTX="
+
+[상위 에픽] ${EPIC_KEY}${EPIC_SUMMARY:+ — ${EPIC_SUMMARY}}
+이 이슈는 위 에픽의 하위 작업입니다. 에픽의 설계 방향에 맞춰 일관되게 작업하고, 에픽 범위를 벗어나는 변경은 하지 마세요."
+  if [[ -n "${EPIC_DESIGN_FILE:-}" && -f "${EPIC_DESIGN_FILE}" ]]; then
+    EPIC_CTX="${EPIC_CTX}
+에픽의 설계안(본문)은 '${EPIC_DESIGN_FILE}' 에 있습니다. 작업 전에 'Read' 로 반드시 먼저 읽고, 그 설계를 기준으로 판단하세요."
+  fi
+fi
 if [[ -n "${JIRA_SITE:-}" ]]; then
   JIRA_REF_LINE="- Jira: https://${JIRA_SITE}/browse/${ISSUE_KEY} (이슈 키 ${ISSUE_KEY})"
 else
@@ -421,7 +434,7 @@ PR 을 하나도 생성하지 못했다면 절대 완료로 간주하지 말고,
 fi
 
 # 첨부(이미지·문서) 인식 지시를 모든 단계(plan/build/rework) 프롬프트에 공통 추가
-PROMPT="${PROMPT}${IMAGE_INSTR}${DOC_INSTR}${JIRA_CTX}"
+PROMPT="${PROMPT}${IMAGE_INSTR}${DOC_INSTR}${EPIC_CTX}${JIRA_CTX}"
 
 # ===== 실행 + 실패 재시도/백오프 처리 =====
 # claude 가 0이 아닌 코드로 종료하면 실패로 보고 카드별 실패 카운터를 증가시킨다.

@@ -652,6 +652,142 @@ app.post("/api/cards/:key/review-loop/stop", (req, res) => {
   } catch (e) { fail(res, e); }
 });
 
+// ================= 에픽 연속 개발 (run-epic-loop.js) =================
+// 에픽 하위 태스크를 생성순으로 하나씩 plan→답변자동채택→build(+승인까지 리뷰 루프)→병합 대기로 처리한다.
+// 진행 상태·중지는 <cloneBase>/.state/<EPIC>.epic.{lock,json,stop} 로 주고받는다(리뷰 승인 루프와 같은 규약).
+function runEpicLoop(epicKey, projectId, opts) {
+  const { repos, reviewLoopMax, resumeStep, resumeKey } = opts || {};
+  const script = path.join(SCRIPTS_DIR, "run-epic-loop.js");
+  if (!fs.existsSync(script)) return { ok: false, message: `스크립트를 찾을 수 없습니다: ${script}` };
+  const logPath = path.join(SCRIPTS_DIR, "loop-epic.log");
+  let fd;
+  try {
+    fd = fs.openSync(logPath, "a");
+    fs.writeSync(fd, `[${new Date().toISOString()}] (에픽 연속 개발)${resumeStep ? ` RESUME(${resumeStep})` : " START"}: ${epicKey} [${projectId}] repos=${(repos || []).join(",") || "(전체)"}\n`);
+  } catch (e) { return { ok: false, message: String(e.message || e) }; }
+  const env = scriptEnv(projectId);
+  env.EPIC_REPOS = (repos || []).join(",");
+  env.REVIEW_LOOP_MAX = String(reviewLoopMax || clampReviewLoopMax(null, getConfig(projectId)));
+  if (resumeStep) env.EPIC_RESUME_STEP = resumeStep;
+  if (resumeKey) env.EPIC_RESUME_KEY = resumeKey;
+  const proc = spawn("node", [script, epicKey], { cwd: SCRIPTS_DIR, env, detached: true, stdio: ["ignore", fd, fd] });
+  try { fs.closeSync(fd); } catch {}
+  proc.unref();
+  return { ok: true, pid: proc.pid };
+}
+// 에픽 러너 상태. 락 PID 가 살아 있으면 running, 없으면 상태 파일의 마지막 결과(paused/done/stopped)를 돌려준다.
+function epicRunStatus(cfg, epicKey) {
+  const stateDir = stateDirOf(cfg);
+  const lockDir = path.join(stateDir, `${epicKey}.epic.lock`);
+  let st = {}; try { st = JSON.parse(fs.readFileSync(path.join(stateDir, `${epicKey}.epic.json`), "utf8")); } catch {}
+  if (fs.existsSync(lockDir)) {
+    let pid = null; try { pid = parseInt(fs.readFileSync(`${lockDir}.pid`, "utf8").trim(), 10); } catch {}
+    // 락의 PID 가 진실 — 상태 파일의 pid(종료 시 null 로 기록됨)가 덮어쓰지 않도록 spread 뒤에 둔다.
+    if (pid && isAlive(pid)) return { running: true, ...st, pid, stopping: fs.existsSync(path.join(stateDir, `${epicKey}.epic.stop`)), status: "running" };
+    // 스테일 락(프로세스가 죽음) 정리 — 상태 파일은 남겨 '중단됨'으로 보이게 한다.
+    try { fs.rmSync(lockDir, { recursive: true, force: true }); } catch {}
+    for (const f of [`${lockDir}.pid`, `${lockDir}.phase`, path.join(stateDir, `${epicKey}.epic.stop`)]) { try { fs.unlinkSync(f); } catch {} }
+  }
+  if (!st.epic) return { running: false, status: "idle" };
+  // 락 없이 'running' 으로 남은 상태 파일 = 러너가 크래시/강제 종료된 것 → 재개 대상(paused)으로 정규화.
+  // (락 정리는 위에서 한 번만 일어나므로 이 판정은 스테일 락 분기 밖에 둔다)
+  if (st.status === "running") st = { ...st, status: "paused", reason: st.reason || "러너 프로세스가 예기치 않게 종료됐습니다." };
+  return { running: false, ...st };
+}
+
+// 프로젝트의 에픽 목록(연속 개발 시작 폼용)
+app.get("/api/epics", async (req, res) => {
+  try {
+    const { cfg, cred } = resolveProject(req);
+    if (!cfg.projectKey) throw new Error("프로젝트 키가 설정되지 않았습니다.");
+    const data = await jiraSearch(`project = "${cfg.projectKey}" AND issuetype = Epic ORDER BY created DESC`, cfg, cred);
+    const epics = (data.issues || []).map((i) => ({ key: i.key, summary: i.fields.summary, status: i.fields.status?.name || "" }));
+    res.json({ ok: true, epics });
+  } catch (e) { fail(res, e); }
+});
+// 에픽의 미완료 하위 태스크(생성순) + 각 카드의 시작 단계
+app.get("/api/epics/:key/children", async (req, res) => {
+  const key = req.params.key;
+  if (!/^[A-Z][A-Z0-9]+-[0-9]+$/.test(key)) return res.status(400).json({ ok: false, message: "이슈 키 형식 오류" });
+  try {
+    const { cfg, cred } = resolveProject(req);
+    let data;
+    // parent 절이 안 먹는 구형(company-managed) 프로젝트는 'Epic Link' 로 재시도
+    try { data = await jiraSearch(lib.epicChildrenJql(key, cfg, "parent"), cfg, cred); }
+    catch { data = await jiraSearch(lib.epicChildrenJql(key, cfg, "epic-link"), cfg, cred); }
+    const children = (data.issues || []).map((i) => {
+      const t = { key: i.key, summary: i.fields.summary, status: i.fields.status?.name || "", labels: i.fields.labels || [], done: false };
+      return { ...t, step: lib.epicTaskStep(t, cfg) };
+    });
+    res.json({ ok: true, children });
+  } catch (e) { fail(res, e); }
+});
+// 에픽 러너 상태(대시보드 폴링)
+app.get("/api/epics/:key/run", (req, res) => {
+  const key = req.params.key;
+  if (!/^[A-Z][A-Z0-9]+-[0-9]+$/.test(key)) return res.status(400).json({ ok: false, message: "이슈 키 형식 오류" });
+  try { const { cfg } = resolveProject(req); res.json({ ok: true, run: epicRunStatus(cfg, key) }); }
+  catch (e) { fail(res, e); }
+});
+// 에픽 연속 개발 시작 — body { repos:[name], reviewLoopMax? }. 에픽당 1개만 실행된다.
+app.post("/api/epics/:key/run", (req, res) => {
+  const key = req.params.key;
+  const b = req.body || {};
+  if (!/^[A-Z][A-Z0-9]+-[0-9]+$/.test(key)) return res.status(400).json({ ok: false, message: "이슈 키 형식 오류" });
+  try {
+    const { id, cfg } = resolveProject(req);
+    const cur = epicRunStatus(cfg, key);
+    if (cur.running) return res.json({ ok: false, message: `이미 에픽 연속 개발이 실행 중입니다 (${cur.current ? cur.current.key : ""} · ${cur.step || ""})` });
+    const names = normalizeRepos(cfg).map((r) => r.name);
+    const repos = (Array.isArray(b.repos) ? b.repos : []).map(String).filter((n) => names.includes(n));
+    if (!repos.length) return res.json({ ok: false, message: "대상 repo 를 1개 이상 선택하세요." });
+    // 새 시작이므로 이전 실행의 상태 파일은 지운다(재개는 /run/resume).
+    try { fs.unlinkSync(path.join(stateDirOf(cfg), `${key}.epic.json`)); } catch {}
+    const reviewLoopMax = clampReviewLoopMax(b.reviewLoopMax, cfg);
+    res.json({ ...runEpicLoop(key, id, { repos, reviewLoopMax }), repos, reviewLoopMax });
+  } catch (e) { fail(res, e); }
+});
+// 멈춘(paused/stopped) 에픽을 이어서 진행 — body.skip=true 면 멈춘 단계를 건너뛰고 다음 단계부터.
+app.post("/api/epics/:key/run/resume", (req, res) => {
+  const key = req.params.key;
+  if (!/^[A-Z][A-Z0-9]+-[0-9]+$/.test(key)) return res.status(400).json({ ok: false, message: "이슈 키 형식 오류" });
+  try {
+    const { id, cfg } = resolveProject(req);
+    const cur = epicRunStatus(cfg, key);
+    if (cur.running) return res.json({ ok: false, message: "이미 실행 중입니다." });
+    if (!cur.epic) return res.json({ ok: false, message: "이어서 진행할 이전 실행 기록이 없습니다. 새로 시작하세요." });
+    if (!["paused", "stopped"].includes(cur.status)) return res.json({ ok: false, message: `이어서 진행할 수 있는 상태가 아닙니다(${cur.status}). 새로 시작하세요.` });
+    const skip = !!(req.body && req.body.skip);
+    const step = skip ? lib.nextEpicStep(cur.step) : cur.step;
+    if (skip && !step) return res.json({ ok: false, message: "마지막 단계라 건너뛸 수 없습니다." });
+    const reviewLoopMax = clampReviewLoopMax((req.body || {}).reviewLoopMax, cfg);
+    // 재개 단계는 '멈췄던 그 카드' 에만 적용한다(그 사이 사람이 카드를 끝냈으면 다른 카드에 잘못 붙지 않도록)
+    const resumeKey = (cur.current && cur.current.key) || "";
+    res.json({ ...runEpicLoop(key, id, { repos: cur.repos || [], reviewLoopMax, resumeStep: step || "", resumeKey }), resumedAt: step || "(현재 단계 재판정)" });
+  } catch (e) { fail(res, e); }
+});
+// 에픽 연속 개발 중지 — 중지 플래그를 먼저 쓰고 프로세스 트리를 종료(진행 중 하위 작업도 함께 종료)
+app.post("/api/epics/:key/run/stop", (req, res) => {
+  const key = req.params.key;
+  if (!/^[A-Z][A-Z0-9]+-[0-9]+$/.test(key)) return res.status(400).json({ ok: false, message: "이슈 키 형식 오류" });
+  try {
+    const { cfg } = resolveProject(req);
+    const st = epicRunStatus(cfg, key);
+    if (!st.running) return res.json({ ok: false, message: "실행 중인 에픽 연속 개발이 없습니다." });
+    const stateDir = stateDirOf(cfg);
+    try { fs.writeFileSync(path.join(stateDir, `${key}.epic.stop`), new Date().toISOString()); } catch {}
+    const tree = [...descendantPids(st.pid), st.pid];   // 하위(엔진·스크립트) 먼저, 러너 마지막
+    for (const p of tree) { try { process.kill(p, "SIGTERM"); } catch {} }
+    setTimeout(() => {   // SIGKILL 은 정리 훅 미실행 → 락을 직접 치운다(상태 파일은 남김)
+      for (const p of [st.pid, ...descendantPids(st.pid)].filter(isAlive)) { try { process.kill(p, "SIGKILL"); } catch {} }
+      const lockDir = path.join(stateDir, `${key}.epic.lock`);
+      try { fs.rmSync(lockDir, { recursive: true, force: true }); } catch {}
+      for (const f of [`${lockDir}.pid`, `${lockDir}.phase`, path.join(stateDir, `${key}.epic.stop`)]) { try { fs.unlinkSync(f); } catch {} }
+    }, 6000);
+    res.json({ ok: true, killed: tree.length, message: `에픽 연속 개발 중지 요청됨 (pid ${st.pid})` });
+  } catch (e) { fail(res, e); }
+});
+
 // 기존 카드의 대상 repo 라벨(repo_<name>) 설정 — 프로젝트 repo 목록과 교집합만 반영
 app.post("/api/cards/:key/repos", async (req, res) => {
   const key = req.params.key;
@@ -851,14 +987,14 @@ app.get("/api/detect/:mode", async (req, res) => {
 
 // 로그
 app.get("/api/logs/:type", (req, res) => {
-  if (!["plan", "build", "review"].includes(req.params.type)) return res.status(400).json({ ok: false, message: "type 오류" });
+  if (!["plan", "build", "review", "epic"].includes(req.params.type)) return res.status(400).json({ ok: false, message: "type 오류" });
   const lines = Math.min(parseInt(req.query.lines || "200", 10), 2000);
   const logPath = path.join(SCRIPTS_DIR, `loop-${req.params.type}.log`);
   if (!fs.existsSync(logPath)) return res.json({ log: "(로그 파일 없음 — 아직 실행 전)" });
   res.json({ log: fs.readFileSync(logPath, "utf8").split("\n").slice(-lines).join("\n") });
 });
 app.post("/api/logs/:type/clear", (req, res) => {
-  if (!["plan", "build", "review"].includes(req.params.type)) return res.status(400).json({ ok: false, message: "type 오류" });
+  if (!["plan", "build", "review", "epic"].includes(req.params.type)) return res.status(400).json({ ok: false, message: "type 오류" });
   try { fs.writeFileSync(path.join(SCRIPTS_DIR, `loop-${req.params.type}.log`), ""); res.json({ ok: true }); }
   catch (e) { fail(res, e); }
 });
