@@ -1185,9 +1185,12 @@ function sinceText(iso) {
 }
 // 에픽 진행 로그 뷰 — 러너 진행 로그(loop-epic.log)와 현재 태스크의 엔진 상세 로그를 3초마다 갱신.
 // 긴 build 단계에서 "지금 무엇을 하고 있는지" 를 대시보드에서 바로 확인하기 위한 창.
-function EpicLogs({ pid, cardKey, step }) {
+function EpicLogs({ pid, cardKey, step, reviewLoop }) {
+  // build 단계라도 그 안에서 '승인까지 리뷰 루프' 가 돌면 실제 활동은 review 로그에 쌓인다.
+  // ● 를 build 에 붙여두면 멈춘 로그를 보게 되므로 활동 중인 쪽을 가리킨다.
   const stepPhase = (step === "plan" || step === "prepare" || step === "adopt") ? "plan"
-    : (step === "approve" || step === "await-merge") ? "review" : "build";
+    : (step === "approve" || step === "await-merge") ? "review"
+    : (reviewLoop && reviewLoop.running) ? "review" : "build";
   const [tab, setTab] = useState("epic");
   const [text, setText] = useState("");
   const [auto, setAuto] = useState(true);   // 새 줄이 오면 맨 아래로 따라감
@@ -1242,7 +1245,7 @@ function EpicLogs({ pid, cardKey, step }) {
       <div className="text-[11px] text-slate-500 mt-1">
         {tab === "epic"
           ? "러너 진행 로그 (loop-epic.log · 3초 갱신)"
-          : `agent-logs/${cardKey || "<KEY>"}-${wanted}.log — 엔진의 도구 호출·메시지·결과 (3초 갱신). ● 는 현재 단계의 로그입니다.`}
+          : `agent-logs/${cardKey || "<KEY>"}-${wanted}.log — 엔진의 도구 호출·메시지·결과 (3초 갱신). ● 는 지금 활동 중인 로그입니다(build 중 리뷰 루프가 돌면 review 를 가리킵니다).`}
       </div>
     </div>
   );
@@ -1395,6 +1398,7 @@ function EpicPanel({ projects, flash }) {
   const [run, setRun] = useState({ running: false, status: "idle" });
   const [busy, setBusy] = useState("");
   const repoTouched = React.useRef(false);   // 사용자가 체크를 직접 바꿨는지(폴링이 덮어쓰지 않도록)
+  const [reviewLoop, setReviewLoop] = useState(null);         // build 안에서 도는 '승인까지 리뷰 루프' 진행 상황
   const [autoMerge, setAutoMerge] = useState(false);          // 승인 후 자동 병합
   const [autoMergeMin, setAutoMergeMin] = useState("60");     // 대기(분)
   const proj = projects.find((p) => p.id === pid) || null;
@@ -1421,6 +1425,13 @@ function EpicPanel({ projects, flash }) {
     // 진행 중이거나 중단된 실행은 '그 실행이 실제로 쓰는 repo' 가 진실 — 기본값(전체 선택)으로 덮어쓰지 않는다.
     // (이걸 안 하면 3개만 골라 돌려도 패널엔 5개 전부 체크된 것처럼 보인다)
     if (st.opts) { setAutoMerge(!!st.opts.autoMerge); setAutoMergeMin(String(st.opts.autoMergeAfterMin || 60)); }
+    // 승인까지 리뷰 루프는 build 단계 '안에서' 도는 별도 프로세스라 에픽 상태 파일에 안 나온다.
+    // 이걸 안 보여주면 build 가 30분 넘게 멈춘 것처럼 보인다(실제로는 리뷰 회차가 진행 중).
+    const key = (st.current || {}).key;
+    if (key && st.running) {
+      const lr = await api.get(`/api/cards/${key}/review-loop?project=${encodeURIComponent(pid)}`);
+      setReviewLoop(lr.ok ? lr.loop : null);
+    } else setReviewLoop(null);
     const hasRun = st.running || st.status === "paused" || st.status === "stopped";
     if (Array.isArray(st.repos) && st.repos.length && hasRun && (st.running || !repoTouched.current)) {
       setRepos(st.repos);
@@ -1515,6 +1526,12 @@ function EpicPanel({ projects, flash }) {
                       ▶ 진행 중 · {idx + 1}/{total || "?"} — <b>{cur ? cur.key : "…"}</b> {cur && cur.summary ? `· ${cur.summary}` : ""}
                       {" "}<span className="text-indigo-300">({EPIC_STEP_LABEL[run.step] || run.step}{(run.stepStartedAt || run.updatedAt) ? ` · ${sinceText(run.stepStartedAt || run.updatedAt)}째` : ""})</span>
                       {run.stepStartedAt && run.updatedAt && <span className="text-indigo-400/70 text-xs"> · 갱신 {sinceText(run.updatedAt)} 전</span>}
+                      {reviewLoop && reviewLoop.running && (
+                        <span className="ml-2 text-xs px-2 py-0.5 rounded-full border bg-violet-500/15 text-violet-300 border-violet-500/40"
+                          title={`${reviewLoop.owner}#${reviewLoop.number} — 승인 마커가 남을 때까지 '반영 → 재리뷰' 반복`}>
+                          🔁 승인 루프 {reviewLoop.iter || 0}/{reviewLoop.max || 5}회차 · {reviewLoop.step === "rework" ? "리뷰 반영 중" : reviewLoop.step === "review" ? "리뷰 중" : reviewLoop.step || "진행 중"}
+                        </span>
+                      )}
                     </span>
                   )}
                   {paused && <span className="text-amber-200">⏸ {run.status === "stopped" ? "중지됨" : "중단됨"} — {run.reason || "사유 없음"}</span>}
@@ -1568,7 +1585,7 @@ function EpicPanel({ projects, flash }) {
           )}
 
           {/* 진행/엔진 로그 — 실행 중이거나 직전 실행 기록이 있을 때 */}
-          {(run.running || paused) && <EpicLogs pid={pid} cardKey={cur && cur.key} step={run.step} />}
+          {(run.running || paused) && <EpicLogs pid={pid} cardKey={cur && cur.key} step={run.step} reviewLoop={reviewLoop} />}
 
           {/* 하위 태스크 목록 */}
           <div className="border border-slate-700 rounded-lg overflow-hidden mb-3">
