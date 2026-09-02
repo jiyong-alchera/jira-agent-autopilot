@@ -1255,6 +1255,7 @@ function EpicPanel({ projects, flash }) {
   const [repos, setRepos] = useState([]);          // 선택된 repo name
   const [run, setRun] = useState({ running: false, status: "idle" });
   const [busy, setBusy] = useState("");
+  const repoTouched = React.useRef(false);   // 사용자가 체크를 직접 바꿨는지(폴링이 덮어쓰지 않도록)
   const proj = projects.find((p) => p.id === pid) || null;
   const repoNames = ((proj && proj.repos) || []).map((r) => r.name).filter(Boolean);
 
@@ -1273,12 +1274,20 @@ function EpicPanel({ projects, flash }) {
   const loadRun = useCallback(async () => {
     if (!pid || !epicKey) return;
     const r = await api.get(`/api/epics/${epicKey}/run?project=${encodeURIComponent(pid)}`);
-    if (r.ok) setRun(r.run || { running: false, status: "idle" });
+    if (!r.ok) return;
+    const st = r.run || { running: false, status: "idle" };
+    setRun(st);
+    // 진행 중이거나 중단된 실행은 '그 실행이 실제로 쓰는 repo' 가 진실 — 기본값(전체 선택)으로 덮어쓰지 않는다.
+    // (이걸 안 하면 3개만 골라 돌려도 패널엔 5개 전부 체크된 것처럼 보인다)
+    const hasRun = st.running || st.status === "paused" || st.status === "stopped";
+    if (Array.isArray(st.repos) && st.repos.length && hasRun && (st.running || !repoTouched.current)) {
+      setRepos(st.repos);
+    }
   }, [pid, epicKey]);
 
-  useEffect(() => { setEpicKey(""); setChildren(null); setRun({ running: false, status: "idle" }); loadEpics(pid); }, [pid]);
-  useEffect(() => { setRepos(repoNames); }, [pid, (proj && (proj.repos || []).length) || 0]);   // 기본은 전체 선택
-  useEffect(() => { loadChildren(epicKey); loadRun(); }, [epicKey]);
+  useEffect(() => { setEpicKey(""); setChildren(null); setRun({ running: false, status: "idle" }); repoTouched.current = false; loadEpics(pid); }, [pid]);
+  useEffect(() => { setRepos(repoNames); }, [pid, (proj && (proj.repos || []).length) || 0]);   // 새 실행의 기본은 전체 선택(loadRun 이 진행 중 실행의 실제 repo 로 덮어씀)
+  useEffect(() => { repoTouched.current = false; loadChildren(epicKey); loadRun(); }, [epicKey]);
   useEffect(() => { const t = setInterval(loadRun, 5000); return () => clearInterval(t); }, [loadRun]);
 
   const act = async (name, fn) => {
@@ -1291,6 +1300,7 @@ function EpicPanel({ projects, flash }) {
   const stop = () => act("중지", () => api.post(`/api/epics/${epicKey}/run/stop?project=${encodeURIComponent(pid)}`));
 
   const paused = !run.running && (run.status === "paused" || run.status === "stopped");
+  const repoLocked = run.running;   // 실행 중에만 고정. 중단 상태에서는 다른 repo 로 새로 시작할 수 있어야 한다.
   const finished = !run.running && run.status === "done";
   const cur = run.current;
   const total = run.total || (children && children.items.length) || 0;
@@ -1325,18 +1335,24 @@ function EpicPanel({ projects, flash }) {
           <div className="mb-3">
             <div className="text-xs text-slate-400 mb-1 inline-flex items-center gap-1">
               대상 repo
-              <InfoTip title="대상 repo" text={"에픽 작업이 진행될 레포지토리입니다.\n각 하위 카드에 repo_<name> 라벨로 부여되며, 그 repo 들에서만 개발·PR 이 이뤄집니다."} />
+              <InfoTip title="대상 repo" text={"에픽 작업이 진행될 레포지토리입니다.\n각 하위 카드에 repo_<name> 라벨로 부여되며, 그 repo 들에서만 개발·PR 이 이뤄집니다.\n\n실행이 시작되면 그 실행에 고정되므로 변경할 수 없고, 체크 표시는 '지금 돌고 있는 실행이 실제로 쓰는 repo' 를 보여줍니다.\n바꾸려면 중지하고 새로 시작하세요."} />
+              {run.running && <span className="text-[11px] text-slate-500">— 실행에 고정됨 (지금 이 실행이 쓰는 repo)</span>}
             </div>
             <div className="flex flex-wrap gap-3">
               {repoNames.length === 0 && <span className="text-xs text-slate-500">프로젝트에 등록된 repo 가 없습니다.</span>}
-              {repoNames.map((n) => (
-                <label key={n} className="inline-flex items-center gap-1.5 text-sm text-slate-300">
-                  <input type="checkbox" checked={repos.includes(n)} disabled={run.running}
-                    onChange={(e) => setRepos((p) => e.target.checked ? [...p, n] : p.filter((x) => x !== n))} />
-                  {n}
-                </label>
-              ))}
+              {repoNames.map((n) => {
+                const on = repos.includes(n);
+                return (
+                  <label key={n} className={`inline-flex items-center gap-1.5 text-sm ${repoLocked ? (on ? "text-indigo-300" : "text-slate-600") : "text-slate-300"}`}>
+                    <input type="checkbox" checked={on} disabled={repoLocked}
+                      onChange={(e) => { repoTouched.current = true; setRepos((p) => e.target.checked ? [...p, n] : p.filter((x) => x !== n)); }} />
+                    {n}
+                  </label>
+                );
+              })}
             </div>
+            {run.running && <p className="text-[11px] text-slate-500 mt-1">실행 중에는 대상 repo 를 바꿀 수 없습니다. 다른 repo 로 돌리려면 중지하고 새로 시작하세요.</p>}
+            {paused && <p className="text-[11px] text-slate-500 mt-1"><b>[이어서 진행]</b> 은 이 실행이 시작할 때 고른 repo 를 그대로 씁니다. 여기서 바꾼 값은 <b>[연속 개발 시작]</b>(새 실행)에만 적용됩니다.</p>}
           </div>
 
           {/* 진행 상태 */}
