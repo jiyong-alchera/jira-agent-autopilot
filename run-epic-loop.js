@@ -139,6 +139,11 @@ function writeStatus(patch) {
   STATE = { ...STATE, ...(patch || {}), updatedAt: nowIso() };
   try { fs.writeFileSync(STATUS_FILE, JSON.stringify(STATE, null, 2)); } catch {}
 }
+// build 처럼 수십 분 걸리는 단계에서도 상태 파일이 갱신되도록 주기적으로 updatedAt 을 찍는다.
+// (이게 없으면 대시보드가 '마지막 갱신 11분 전' 로 보여 멈춘 것처럼 읽힌다)
+const HEARTBEAT_MS = 15000;
+const heartbeat = setInterval(() => writeStatus({}), HEARTBEAT_MS);
+heartbeat.unref?.();
 const stopRequested = () => fs.existsSync(STOP_FILE);
 
 // ----- 락 -----
@@ -156,6 +161,7 @@ function cleanup(keepStatus) {
 }
 // paused/done/stopped 는 상태 파일을 남긴다 — 대시보드가 사유를 보여주고 재개 버튼을 띄운다.
 function finish(status, reason, code) {
+  clearInterval(heartbeat);
   writeStatus({ status, reason: reason || "", pid: null });
   cleanup(true);
   process.exit(code || 0);
@@ -338,7 +344,7 @@ const STEP_FN = { prepare: stepPrepare, plan: stepPlan, adopt: stepAdopt, build:
     let task = next;
     while (step) {
       if (stopRequested()) { await slack(`⏹ [${EPIC_KEY}] 에픽 연속 개발 중지됨 (${task.key} · ${step})`); history(task.key, "stopped"); finish("stopped", "사용자 중지"); }
-      writeStatus({ step, current: { key: task.key, summary: task.summary, step } });
+      writeStatus({ step, stepStartedAt: nowIso(), current: { key: task.key, summary: task.summary, step } });
       log(`${task.key} · ${step} …`);
       let r;
       try { r = await STEP_FN[step](task); }

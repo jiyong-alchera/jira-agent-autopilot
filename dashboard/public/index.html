@@ -1167,6 +1167,80 @@ function ProjectCard({ proj, onDeleted, flash, jumpTo }) {
 }
 
 // =================== 전체 앱 ===================
+// "12분째" / "3초 전" 같은 경과 표기 — 긴 단계에서 진행이 살아 있는지 눈으로 확인하기 위한 것.
+function sinceText(iso) {
+  if (!iso) return "";
+  const sec = Math.max(0, Math.floor((Date.now() - new Date(iso).getTime()) / 1000));
+  if (sec < 60) return `${sec}초`;
+  if (sec < 3600) return `${Math.floor(sec / 60)}분`;
+  const h = Math.floor(sec / 3600);
+  return `${h}시간 ${Math.floor((sec % 3600) / 60)}분`;
+}
+// 에픽 진행 로그 뷰 — 러너 진행 로그(loop-epic.log)와 현재 태스크의 엔진 상세 로그를 3초마다 갱신.
+// 긴 build 단계에서 "지금 무엇을 하고 있는지" 를 대시보드에서 바로 확인하기 위한 창.
+function EpicLogs({ pid, cardKey, step }) {
+  const stepPhase = (step === "plan" || step === "prepare" || step === "adopt") ? "plan"
+    : (step === "approve" || step === "await-merge") ? "review" : "build";
+  const [tab, setTab] = useState("epic");
+  const [text, setText] = useState("");
+  const [auto, setAuto] = useState(true);   // 새 줄이 오면 맨 아래로 따라감
+  const boxRef = React.useRef(null);
+  const wanted = tab === "epic" ? "epic" : tab;
+
+  useEffect(() => { setTab("epic"); }, [cardKey]);
+  useEffect(() => {
+    let alive = true;
+    const load = async () => {
+      const url = wanted === "epic"
+        ? `/api/logs/epic?lines=300`
+        : (cardKey ? `/api/claude-log/${cardKey}/${wanted}?lines=400&project=${encodeURIComponent(pid)}` : "");
+      if (!url) { if (alive) setText("(현재 처리 중인 태스크가 없습니다)"); return; }
+      const r = await api.get(url);
+      if (alive) setText(r.log || (r.ok === false ? (r.message || "조회 실패") : "(비어 있음)"));
+    };
+    load();
+    const t = setInterval(load, 3000);
+    return () => { alive = false; clearInterval(t); };
+  }, [wanted, cardKey, pid]);
+
+  useEffect(() => {   // 자동 따라가기(사용자가 위로 스크롤하면 멈춤)
+    const el = boxRef.current;
+    if (el && auto) el.scrollTop = el.scrollHeight;
+  }, [text, auto]);
+
+  const TABS = [
+    ["epic", "진행 로그"],
+    ["plan", "엔진 · plan"],
+    ["build", "엔진 · build"],
+    ["review", "엔진 · review"],
+  ];
+  return (
+    <div className="mb-3">
+      <div className="flex items-center justify-between mb-1 flex-wrap gap-2">
+        <div className="flex gap-1">
+          {TABS.map(([v, label]) => (
+            <button key={v} onClick={() => setTab(v)}
+              className={`text-xs px-2 py-1 rounded border transition ${tab === v ? "bg-indigo-600 border-indigo-500 text-white" : "bg-slate-800 border-slate-600 text-slate-300 hover:border-indigo-500/60"}`}>
+              {label}{v === stepPhase && v !== "epic" ? " ●" : ""}
+            </button>
+          ))}
+        </div>
+        <label className="text-xs text-slate-400 inline-flex items-center gap-1.5">
+          <input type="checkbox" checked={auto} onChange={(e) => setAuto(e.target.checked)} />
+          맨 아래 따라가기
+        </label>
+      </div>
+      <pre ref={boxRef} onWheel={() => setAuto(false)}
+        className="bg-black/60 border border-slate-700 rounded-lg p-3 text-xs h-72 overflow-auto whitespace-pre-wrap">{text || "(비어 있음)"}</pre>
+      <div className="text-[11px] text-slate-500 mt-1">
+        {tab === "epic"
+          ? "러너 진행 로그 (loop-epic.log · 3초 갱신)"
+          : `agent-logs/${cardKey || "<KEY>"}-${wanted}.log — 엔진의 도구 호출·메시지·결과 (3초 갱신). ● 는 현재 단계의 로그입니다.`}
+      </div>
+    </div>
+  );
+}
+
 // 에픽 연속 개발 패널 — 에픽 하위 태스크를 생성순으로 하나씩 개발→PR→리뷰 승인→병합 대기로 이어간다.
 // 진행 상태는 <EPIC>.epic.json 을 5초 폴링. 중단(paused)되면 사유와 [이어서 진행]/[건너뛰기] 를 띄운다.
 const EPIC_STEP_LABEL = {
@@ -1270,7 +1344,13 @@ function EpicPanel({ projects, flash }) {
             <div className={`rounded-lg border p-3 mb-3 ${run.running ? "bg-indigo-500/10 border-indigo-500/40" : paused ? "bg-amber-500/10 border-amber-500/40" : "bg-emerald-500/10 border-emerald-500/40"}`}>
               <div className="flex items-center justify-between gap-3 flex-wrap">
                 <div className="text-sm">
-                  {run.running && <span className="text-indigo-200">▶ 진행 중 · {idx + 1}/{total || "?"} — <b>{cur ? cur.key : "…"}</b> {cur && cur.summary ? `· ${cur.summary}` : ""} <span className="text-indigo-300">({EPIC_STEP_LABEL[run.step] || run.step})</span></span>}
+                  {run.running && (
+                    <span className="text-indigo-200">
+                      ▶ 진행 중 · {idx + 1}/{total || "?"} — <b>{cur ? cur.key : "…"}</b> {cur && cur.summary ? `· ${cur.summary}` : ""}
+                      {" "}<span className="text-indigo-300">({EPIC_STEP_LABEL[run.step] || run.step}{(run.stepStartedAt || run.updatedAt) ? ` · ${sinceText(run.stepStartedAt || run.updatedAt)}째` : ""})</span>
+                      {run.stepStartedAt && run.updatedAt && <span className="text-indigo-400/70 text-xs"> · 갱신 {sinceText(run.updatedAt)} 전</span>}
+                    </span>
+                  )}
                   {paused && <span className="text-amber-200">⏸ {run.status === "stopped" ? "중지됨" : "중단됨"} — {run.reason || "사유 없음"}</span>}
                   {finished && <span className="text-emerald-200">🎉 완료 — {run.reason || ""}</span>}
                 </div>
@@ -1286,6 +1366,9 @@ function EpicPanel({ projects, flash }) {
               {paused && <div className="text-xs text-amber-300/80 mt-1">멈춘 단계: <b>{EPIC_STEP_LABEL[run.step] || run.step || "-"}</b>{cur ? ` · ${cur.key}` : ""} — 조치 후 [이어서 진행]을 누르면 이 단계부터 다시 실행합니다.</div>}
             </div>
           )}
+
+          {/* 진행/엔진 로그 — 실행 중이거나 직전 실행 기록이 있을 때 */}
+          {(run.running || paused) && <EpicLogs pid={pid} cardKey={cur && cur.key} step={run.step} />}
 
           {/* 하위 태스크 목록 */}
           <div className="border border-slate-700 rounded-lg overflow-hidden mb-3">
