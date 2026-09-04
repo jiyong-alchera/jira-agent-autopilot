@@ -173,9 +173,9 @@ function cleanup(keepStatus) {
   if (!keepStatus) { try { fs.unlinkSync(STATUS_FILE); } catch {} }
 }
 // paused/done/stopped 는 상태 파일을 남긴다 — 대시보드가 사유를 보여주고 재개 버튼을 띄운다.
-function finish(status, reason, code) {
+function finish(status, reason, code, extra) {
   clearInterval(heartbeat);
-  writeStatus({ status, reason: reason || "", pid: null });
+  writeStatus({ status, reason: reason || "", pid: null, ...(extra || {}) });
   cleanup(true);
   process.exit(code || 0);
 }
@@ -206,6 +206,8 @@ async function taskEnv(key) {
   } catch { /* 첨부 없이 진행 */ }
   return e;
 }
+// 실패 사유 분류용으로 엔진 출력의 끝부분만 남긴다(사용량 한도 메시지·해제 시각이 여기 찍힌다).
+const tailOf = (out, n = 2000) => String(out || "").slice(-n);
 function runScript(script, args, env) {
   return new Promise((resolve) => {
     const c = spawn("bash", [path.join(SELF, script), ...args], { env, stdio: ["ignore", "pipe", "pipe"] });
@@ -269,8 +271,8 @@ async function stepPrepare(task) {
   return { ok: true, note: `라벨 부여: ${missing.join(", ")}` };
 }
 async function stepPlan(task) {
-  const { code } = await runScript("run-jira-agent.sh", [task.key, "plan"], await taskEnv(task.key));
-  if (code !== 0) return { ok: false, reason: `plan 실행 실패 (exit ${code})` };
+  const { code, out } = await runScript("run-jira-agent.sh", [task.key, "plan"], await taskEnv(task.key));
+  if (code !== 0) return { ok: false, reason: `plan 실행 실패 (exit ${code})`, lastError: tailOf(out) };
   const after = await fetchTask(task.key);
   if (!after.labels.includes(cfg.plannedLabel || "claude-planned")) {
     return { ok: false, reason: "plan 이 끝났지만 claude-planned 라벨이 없습니다(질문 코멘트 확인 필요)" };
@@ -294,7 +296,7 @@ async function stepBuild(task) {
   e.REVIEW_LOOP_AFTER = "1";                                        // PR 생성 후 '승인까지 리뷰 루프'로 이어짐
   e.REVIEW_LOOP_MAX = String(lib.clampReviewLoopMax(process.env.REVIEW_LOOP_MAX, cfg));
   const { code, out } = await runScript("run-jira-agent.sh", [task.key, "build"], e);
-  if (code !== 0) return { ok: false, reason: `build 실행 실패 (exit ${code})` };
+  if (code !== 0) return { ok: false, reason: `build 실행 실패 (exit ${code})`, lastError: tailOf(out) };
   if (/SKIP: awaiting answers/.test(out)) return { ok: false, reason: "build 가 답변 대기로 스킵됐습니다(카드 질문 확인 필요)" };
   const after = await fetchTask(task.key);
   if (!after.labels.includes(cfg.prOpenLabel || "claude-pr") && !after.done) {
@@ -415,7 +417,7 @@ const STEP_FN = { prepare: stepPrepare, plan: stepPlan, adopt: stepAdopt, build:
         log(`중단: ${reason}`);
         await slack(`⏸ [${EPIC_KEY}] ${task.key} · ${step} 에서 중단 — ${reason}\n대시보드에서 조치 후 [이어서 진행] 하세요.`);
         history(task.key, "paused");
-        finish("paused", `${task.key} · ${step}: ${reason}`, 1);
+        finish("paused", `${task.key} · ${step}: ${reason}`, 1, { lastError: r.lastError || "", pausedAt: nowIso() });
       }
       if (r.note) log(`${task.key} · ${step} ✓ ${r.note}`);
       step = lib.nextEpicStep(step);

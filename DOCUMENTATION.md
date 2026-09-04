@@ -312,6 +312,21 @@ Jira 카드를 자동으로 탐지해 **Claude가 개발 → PR 생성 → 카�
 - **트리거 라벨은 그 태스크 차례에만 붙인다**: 아직 차례가 아닌 하위 카드는 `claude-work` 가 없으므로
   plan/build 스케줄 루프의 탐지 JQL 에 잡히지 않는다 → 루프가 순서를 앞질러 가져가는 일이 없다.
   (이미 `claude-work` 가 붙어 있던 카드는 루프도 볼 수 있으니, 에픽 실행 중에는 두 루프를 멈춰두는 것을 권장 — UI 에도 안내)
+- **중단 시 자동 재시도(선택, 기본 꺼짐)**: 중단 사유가 **시간이 지나면 풀리는 종류**면 대시보드가 대신 재개한다.
+  - **감시 주체는 백엔드**(60초 주기). 러너는 중단 시 종료되므로 자기 자신을 되살릴 수 없고, 백엔드가 감시하면
+    **러너가 크래시로 죽어 상태 파일만 남은 경우**도 같은 경로로 복구된다. 대시보드가 켜져 있어야 동작한다.
+  - **재시도 대상**(`lib.classifyPause`): 사용량 한도(토큰) 소진 · rate limit · 429 · overloaded(`usage-limit`),
+    그 외 실행 실패·타임아웃·네트워크 오류(`transient`).
+    **재시도하지 않음**: 제안 답변 없음 · 리뷰 미승인 · 자동 병합 실패(`needs-human`), 카드 답변 대기(`awaiting-answer`)
+    — 시간이 지나도 결과가 같아 사람이 봐야 한다.
+  - **언제 재시도하나**: 사용량 한도면 엔진이 알려주는 **해제 시각을 파싱해 그 직후**(+2분)에 재시도한다
+    (`lib.parseUsageLimitReset` — `You've hit your session limit · resets 1:40pm (Asia/Seoul)` 형식).
+    **실측상 해제까지 9시간 34분이 걸린 사례가 있어 고정 백오프로는 닿지 않는다.**
+    시각을 못 읽으면 **10분 → 30분 → 1시간 → 2시간 → 4시간** 백오프(마지막 값 유지).
+  - **횟수**: 기본 5회(1~20). 카운터는 **진행 지점(`현재 카드:단계`)이 바뀌면 리셋**되므로, 한 지점에서 반복 실패할 때만 상한이 걸린다.
+    러너가 다시 뜬 것만으로는 리셋하지 않는다 — 그러면 상한이 영원히 걸리지 않는다.
+  - 기록은 `.state/<EPIC>.epic.retry.json`(`{signature, attempt, nextRetryAt, kind, label}`), 재시도마다 Slack `🔄` 알림.
+    대시보드는 중단 상태에서 `🔄 자동 재시도 1/5회 — 사용량 한도(토큰) 소진 · 13:42 예정` 또는 재시도하지 않는 사유를 표시한다.
 - **중단·재개**: 어떤 단계든 실패하면 상태를 `paused` 로 남기고 **Slack + 대시보드 알림** 후 종료한다.
   대시보드의 **[이어서 진행]** 은 그 태스크의 **그 단계부터**, **[이 단계 건너뛰기]** 는 **다음 단계부터** 재개한다.
   재개 단계는 **멈췄던 그 카드에만** 적용된다(그 사이 사람이 카드를 끝냈으면 다음 카드는 처음부터 판정).
@@ -319,7 +334,8 @@ Jira 카드를 자동으로 탐지해 **Claude가 개발 → PR 생성 → 카�
   `status:"running"` 으로 남은 상태 파일은 러너가 비정상 종료된 것으로 보고 `paused` 로 정규화해 재개 대상이 된다.
 - **동시 실행 방지**: 에픽당 하나 — `.state/<EPIC>.epic.lock`(+`.pid`/`.phase`).
 - **중지**: `.state/<EPIC>.epic.stop` 플래그(대시보드 '중지' 버튼) 또는 프로세스 트리 SIGTERM. 진행 중 하위 작업까지 함께 종료된다.
-- **상태 파일**: `.state/<EPIC>.epic.json` — `{status, reason, step, stepStartedAt, index, total, current:{key,summary,step}, tasks[], repos[], autoMerge, autoMergeAfterMin, autoMergeAt, autoMergeState}`.
+- **상태 파일**: `.state/<EPIC>.epic.json` — `{status, reason, lastError, pausedAt, step, stepStartedAt, index, total, current:{key,summary,step}, tasks[], repos[], autoMerge, autoMergeAfterMin, autoMergeAt, autoMergeState}`.
+  `lastError` 는 실패한 엔진 출력의 끝 2000자 — 자동 재시도가 사유를 분류하고 한도 해제 시각을 읽는 근거다.
   옵션 파일은 별도(`.state/<EPIC>.epic.opts.json`) — 러너가 쓰는 상태 파일과 분리해 대시보드가 실행 중에도 안전하게 고칠 수 있게 했다.
   대시보드가 5초마다 폴링해 진행률·현재 단계·**단계 경과 시간**·중단 사유를 표시한다.
 - **하트비트(15초)**: `build` 처럼 수십 분 걸리는 단계에서도 상태 파일의 `updatedAt` 을 주기적으로 갱신한다.
@@ -373,10 +389,10 @@ Jira 카드를 자동으로 탐지해 **Claude가 개발 → PR 생성 → 카�
 | POST | `/api/cards/:key/review-loop/stop` | **루프 즉시 중지** — `.reviewloop.stop` 플래그를 먼저 쓴 뒤(다음 회차 차단 + 하위 종료를 '실패'로 오인 방지) 루프 프로세스 트리를 SIGTERM→6초 후 SIGKILL·락 정리. 이력에 `review-loop/stopped` 기록 |
 | GET | `/api/epics` | 프로젝트의 에픽 목록(`{key,summary,status}`) — '에픽 연속 개발' 시작 폼용 |
 | GET | `/api/epics/:key/children` | 에픽의 **미완료 하위 태스크(생성순)** + 각 카드의 시작 단계(`step`). `parent` 절 실패 시 `"Epic Link"` 로 폴백 |
-| GET | `/api/epics/:key/run` | **에픽 연속 개발 상태**(대시보드 5초 폴링) — `{running,pid,status,reason,step,index,total,current,tasks,repos}`. 락 PID 생존 확인 + 스테일 락 정리, 락 없이 `running` 인 상태 파일은 `paused` 로 정규화(크래시 복구) |
-| POST | `/api/epics/:key/run` | **에픽 연속 개발 시작** — body `{repos:[name], reviewLoopMax?, autoMerge?, autoMergeAfterMin?}`. `run-epic-loop.js` 를 detached 로 띄워 하위 태스크를 생성순으로 처리([4.3d](#43d-run-epic-loopjs-에픽-연속-개발--하위-태스크-순차-자동화)). 에픽당 1개만 실행. repo 미선택이면 거부 |
+| GET | `/api/epics/:key/run` | **에픽 연속 개발 상태**(대시보드 5초 폴링) — `{running,pid,status,reason,step,index,total,current,tasks,repos}`. 락 PID 생존 확인 + 스테일 락 정리, 락 없이 `running` 인 상태 파일은 `paused` 로 정규화(크래시 복구). 중단 상태면 `retry`(`{attempt,max,willRetry,at,kind,label,why,source}`)로 **자동 재시도 예정/미실행 사유**를 함께 준다 |
+| POST | `/api/epics/:key/run` | **에픽 연속 개발 시작** — body `{repos:[name], reviewLoopMax?, autoMerge?, autoMergeAfterMin?, autoRetry?, autoRetryMax?}`. `run-epic-loop.js` 를 detached 로 띄워 하위 태스크를 생성순으로 처리([4.3d](#43d-run-epic-loopjs-에픽-연속-개발--하위-태스크-순차-자동화)). 에픽당 1개만 실행. repo 미선택이면 거부 |
 | POST | `/api/epics/:key/run/resume` | **멈춘 지점부터 이어서 진행** — body `{skip?}`. `skip:true` 면 멈춘 단계를 건너뛰고 다음 단계부터. `paused`/`stopped` 상태에서만 수용하며, 재개 단계는 멈췄던 그 카드에만 적용 |
-| POST | `/api/epics/:key/run/options` | **자동 병합 옵션 변경**(실행 중에도 즉시 반영) — body `{autoMerge?, autoMergeAfterMin?}`. 생략한 필드는 기존 값 유지, 분은 1~1440 으로 clamp. `.state/<EPIC>.epic.opts.json` 에 저장하고 러너가 병합 대기 폴링마다 다시 읽는다 |
+| POST | `/api/epics/:key/run/options` | **자동 병합·자동 재시도 옵션 변경**(실행 중에도 즉시 반영) — body `{autoMerge?, autoMergeAfterMin?, autoRetry?, autoRetryMax?}`. 생략한 필드는 기존 값 유지, 분은 1~1440 으로 clamp. `.state/<EPIC>.epic.opts.json` 에 저장하고 러너가 병합 대기 폴링마다 다시 읽는다 |
 | POST | `/api/epics/:key/run/stop` | **에픽 연속 개발 중지** — `.epic.stop` 플래그를 먼저 쓴 뒤 프로세스 트리를 SIGTERM→6초 후 SIGKILL·락 정리(상태 파일은 남겨 재개 가능) |
 | POST | `/api/cards/:key/repos` | 기존 카드의 대상 repo 라벨(`repo_<name>`) 설정(프로젝트 repo 목록과 교집합만 반영) |
 | GET | `/api/cards/:key/prs` | **카드의 모든 PR(1:N) 조회** — 대상 repo 들에서 카드 키로 검색. PR별 `{repo,owner,number,url,title,state,branch,isDraft,author,isBot}` 반환. `isBot`=봇 계정(GH_TOKEN 사용자)이 만든 자동화 PR 여부, `botLogin` 도 함께 반환 **`?approved=1`** 이면 열린 PR 마다 리뷰 승인 마커(`CLAUDE-REVIEW-APPROVED`) 유무를 `approved` 로 붙인다(PR 당 API 1회라 opt-in). **`?strict=1`** 이면 **브랜치·제목에 그 카드 키가 있는 PR 만** 남긴다 — `gh pr list --search` 가 PR 본문까지 전문 검색해 본문이 이 키를 언급한 **형제 카드의 PR 까지 끌어오기** 때문(에픽 패널의 병합 목록이 사용) |
@@ -409,7 +425,7 @@ Jira 카드를 자동으로 탐지해 **Claude가 개발 → PR 생성 → 카�
 
 ### 4.5 대시보드 프론트 (dashboard/public/index.html, React)
 
-빌드 도구 없이 CDN(React + Tailwind)으로 동작하는 단일 페이지(본문 폭 `max-w-7xl`). 카드 상태·처리 이력 표는 `table-fixed` 로 열 폭을 고정하고 티켓 이름·브랜치·프로젝트는 **한 줄 표시 + 넘치면 `…`(truncate, 전체 텍스트는 hover title)** 로 정돈한다. **멀티 프로젝트** 구조: 전역 섹션(루프 제어·**에픽 연속 개발**·**활성화된 작업**·처리 이력·실시간 로그)과 **프로젝트 카드 목록**으로 구성된다(에픽 연속 개발 패널은 루프 제어와 프로젝트 목록 사이, 활성화된 작업 패널은 프로젝트 목록과 처리 이력 사이). **에픽 연속 개발** 패널은 프로젝트·에픽·대상 repo 를 고르면 하위 태스크 목록과 각 카드의 다음 단계를 보여주고, 실행 중에는 `3/7 · EKYB-812 · PR 병합 대기 · 12분째` 형태의 진행 상황과 중지 버튼을, 중단되면 사유와 **[이어서 진행]·[이 단계 건너뛰기]** 버튼을 띄운다(5초 폴링). **리뷰 승인 후 자동 병합** 체크박스와 대기(분) 입력이 있어 실행 중에도 켜고 끌 수 있고, 병합 대기 중에는 `자동 병합 예정: 14:30 (약 42분 후)` 을 표시한다. 그 아래 **PR 목록**(`EpicPrs`: 현재 태스크 PR 의 승인·병합 가능 여부 배지 + 개별/선택/전체 병합)과 **로그 창**(`EpicLogs`)에서 러너 진행 로그(`loop-epic.log`)와 **현재 태스크의 엔진 상세 로그**(`agent-logs/<KEY>-<phase>.log`)를 탭으로 전환해 3초마다 확인할 수 있다(현재 단계 탭에 `●`, '맨 아래 따라가기' 자동 스크롤). **대상 repo 체크박스는 실행 기록이 있으면 그 실행이 실제로 쓰는 repo(`run.repos`)를 표시**한다 — 기본값(전체 선택)을 그리면 3개만 골라 돌려도 5개가 체크된 것처럼 보이기 때문. 실행 중에는 잠기고(변경 불가), 중단 상태에서는 바꿀 수 있으나 그 값은 **[연속 개발 시작]**(새 실행)에만 적용된다(**[이어서 진행]** 은 시작 시 고른 repo 를 그대로 사용). 각 프로젝트 카드는 접이식이며, 그 안의 **설정·자격증명·카드 등록·카드 상태** 각 영역도 개별 접기/펼치기(`SubSection`, **기본 접힘**) — 헤더 클릭으로 토글, 액션 버튼(저장·조회 등)은 펼쳤을 때만 노출. 설정·자격증명·카드 등록의 **각 입력 항목 라벨 옆 'i' 버튼**을 누르면 그 항목에 무엇을 입력해야 하는지 설명 모달이 뜬다(`InfoTip` 컴포넌트, 포털로 렌더).
+빌드 도구 없이 CDN(React + Tailwind)으로 동작하는 단일 페이지(본문 폭 `max-w-7xl`). 카드 상태·처리 이력 표는 `table-fixed` 로 열 폭을 고정하고 티켓 이름·브랜치·프로젝트는 **한 줄 표시 + 넘치면 `…`(truncate, 전체 텍스트는 hover title)** 로 정돈한다. **멀티 프로젝트** 구조: 전역 섹션(루프 제어·**에픽 연속 개발**·**활성화된 작업**·처리 이력·실시간 로그)과 **프로젝트 카드 목록**으로 구성된다(에픽 연속 개발 패널은 루프 제어와 프로젝트 목록 사이, 활성화된 작업 패널은 프로젝트 목록과 처리 이력 사이). **에픽 연속 개발** 패널은 프로젝트·에픽·대상 repo 를 고르면 하위 태스크 목록과 각 카드의 다음 단계를 보여주고, 실행 중에는 `3/7 · EKYB-812 · PR 병합 대기 · 12분째` 형태의 진행 상황과 중지 버튼을, 중단되면 사유와 **[이어서 진행]·[이 단계 건너뛰기]** 버튼을 띄운다(5초 폴링). **리뷰 승인 후 자동 병합**(+대기 분)과 **중단 시 자동 재시도**(+최대 횟수) 체크박스가 있어 실행 중에도 켜고 끌 수 있고, 병합 대기 중에는 `자동 병합 예정: 14:30 (약 42분 후)`, 중단 상태에서는 `🔄 자동 재시도 1/5회 — 사용량 한도(토큰) 소진 · 13:42 예정` 또는 재시도하지 않는 사유를 표시한다. 그 아래 **PR 목록**(`EpicPrs`: 현재 태스크 PR 의 승인·병합 가능 여부 배지 + 개별/선택/전체 병합)과 **로그 창**(`EpicLogs`)에서 러너 진행 로그(`loop-epic.log`)와 **현재 태스크의 엔진 상세 로그**(`agent-logs/<KEY>-<phase>.log`)를 탭으로 전환해 3초마다 확인할 수 있다(현재 단계 탭에 `●`, '맨 아래 따라가기' 자동 스크롤). **대상 repo 체크박스는 실행 기록이 있으면 그 실행이 실제로 쓰는 repo(`run.repos`)를 표시**한다 — 기본값(전체 선택)을 그리면 3개만 골라 돌려도 5개가 체크된 것처럼 보이기 때문. 실행 중에는 잠기고(변경 불가), 중단 상태에서는 바꿀 수 있으나 그 값은 **[연속 개발 시작]**(새 실행)에만 적용된다(**[이어서 진행]** 은 시작 시 고른 repo 를 그대로 사용). 각 프로젝트 카드는 접이식이며, 그 안의 **설정·자격증명·카드 등록·카드 상태** 각 영역도 개별 접기/펼치기(`SubSection`, **기본 접힘**) — 헤더 클릭으로 토글, 액션 버튼(저장·조회 등)은 펼쳤을 때만 노출. 설정·자격증명·카드 등록의 **각 입력 항목 라벨 옆 'i' 버튼**을 누르면 그 항목에 무엇을 입력해야 하는지 설명 모달이 뜬다(`InfoTip` 컴포넌트, 포털로 렌더).
 
 모든 백엔드 호출은 `api.get/post/del` → `request()` 를 거친다. `request()` 는 **어떤 경우에도 reject 하지 않고** 네트워크 실패·비 JSON 응답을 서버 에러와 같은 `{ ok:false, message }` 로 정규화한다. 호출부는 `setLoading(true)` 이후 구간을 `try/finally` 로 감싸 로딩 플래그를 반드시 되돌린다 — 이 두 규칙이 깨지면 버튼이 "…중" 상태로 영구 고착된다(회귀 테스트: `dashboard/test/frontend-api.test.js`).
 
@@ -503,6 +519,8 @@ Jira 카드를 자동으로 탐지해 **Claude가 개발 → PR 생성 → 카�
 | 에픽 설계안 파일 | `EPIC_DESIGN_FILE` | `<CLONE_BASE>/.state/<EPIC>.epic-design.md` | 에픽 본문(설계안). 프롬프트가 "작업 전 `Read` 로 먼저 읽어라"고 지시한다(러너가 저장·주입) |
 | 자동 병합 | `EPIC_AUTO_MERGE` (옵션 파일 `autoMerge`) | (꺼짐) | `1` 이면 `await-merge` 에서 조건 충족 시 자동 병합. 대시보드 '에픽 연속 개발' 패널의 체크박스가 설정하며 실행 중에도 변경 가능 |
 | 자동 병합 대기(분) | `EPIC_AUTO_MERGE_AFTER_MIN` (옵션 파일 `autoMergeAfterMin`) | `60` | 병합 대기 진입 후 이 시간이 지나고 열린 PR 이 전부 리뷰 승인이면 자동 병합(1~1440) |
+| 자동 재시도 | (옵션 파일 `autoRetry`) | (꺼짐) | 중단 사유가 사용량 한도·일시적 오류면 백엔드가 자동으로 재개(60초 주기 감시). 대시보드 패널 체크박스로 설정 |
+| 자동 재시도 상한 | (옵션 파일 `autoRetryMax`) | `5` | 같은 지점에서 반복 실패할 때의 최대 재시도 횟수(1~20). 진행 지점이 바뀌면 리셋 |
 | 병합 대기 폴링(초) | `EPIC_MERGE_POLL` | `60` | 에픽 연속 개발의 `await-merge` 단계에서 병합 여부를 확인하는 주기 |
 | 에픽 재개 지점 | `EPIC_RESUME_STEP`·`EPIC_RESUME_KEY` | (없음) | 대시보드 [이어서 진행]/[건너뛰기] 가 주입하는 재개 단계와 그 대상 카드 키 |
 | 동시 처리 상한 | `MAX_PARALLEL` | `5` | 한 주기에 동시에 처리하는 카드 수 |

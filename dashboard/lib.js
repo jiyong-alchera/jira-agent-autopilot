@@ -430,6 +430,87 @@ function shouldAutoMerge(opts, waitStartedAt, openPRs, now) {
   return t >= dueMs ? { merge: true, reason: "due", dueMs } : { merge: false, reason: "waiting", dueMs };
 }
 
+// ===== 에픽 자동 재시도 =====
+// 중단(paused) 사유가 '시간이 지나면 풀리는' 종류면 대시보드가 일정 시간 뒤 자동으로 재개한다.
+// 가장 흔한 원인은 사용량 한도(토큰 소진)이고, 엔진이 해제 시각을 함께 알려준다:
+//   "You've hit your session limit · resets 1:40pm (Asia/Seoul)"
+// 실측상 해제까지 9시간 넘게 걸리는 경우도 있어, 고정 백오프로는 닿지 않는다 → 시각을 파싱해 그때 재시도한다.
+const EPIC_RETRY_MAX_DEFAULT = 5;
+const EPIC_RETRY_MAX_LIMIT = 20;
+// 해제 시각을 못 얻었을 때 쓰는 점증 백오프(분). 마지막 값을 넘어서면 마지막 값을 계속 쓴다.
+const EPIC_RETRY_BACKOFF_MIN = [10, 30, 60, 120, 240];
+const EPIC_RETRY_BUFFER_MIN = 2;    // 해제 시각 직후는 아직 안 풀릴 수 있어 여유를 둔다
+
+function clampRetryMax(v) {
+  const n = parseInt(v, 10);
+  if (!Number.isFinite(n) || n <= 0) return EPIC_RETRY_MAX_DEFAULT;
+  return Math.min(n, EPIC_RETRY_MAX_LIMIT);
+}
+
+// 지정 타임존에서 '지금'이 몇 분(0~1439)인지. TZ 변환 없이 '지금부터 몇 분 뒤'만 계산하기 위한 것.
+function minutesOfDayInTZ(date, tz) {
+  try {
+    const p = new Intl.DateTimeFormat("en-US", { timeZone: tz, hour12: false, hour: "2-digit", minute: "2-digit" })
+      .formatToParts(date).reduce((a, x) => (a[x.type] = x.value, a), {});
+    const h = parseInt(p.hour, 10) % 24, m = parseInt(p.minute, 10);
+    return Number.isFinite(h) && Number.isFinite(m) ? h * 60 + m : null;
+  } catch { return null; }
+}
+
+// "resets 1:40pm (Asia/Seoul)" / "resets 3pm" / "resets 10am" → 재시도할 시각(Date). 못 읽으면 null.
+// 해당 타임존 기준으로 '다음 번 그 시각'까지 남은 분을 구해 now 에 더한다(절대 TZ 변환을 피해 DST 영향을 줄임).
+function parseUsageLimitReset(text, now) {
+  const s = String(text || "");
+  const m = s.match(/resets?\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*(?:\(([^)]+)\))?/i);
+  if (!m) return null;
+  let h = parseInt(m[1], 10);
+  const min = m[2] ? parseInt(m[2], 10) : 0;
+  const ap = (m[3] || "").toLowerCase();
+  if (h > 23 || min > 59) return null;
+  if (ap === "pm" && h < 12) h += 12;
+  if (ap === "am" && h === 12) h = 0;
+  const tz = (m[4] || "").trim();
+  const base = now instanceof Date ? now : new Date(now || Date.now());
+  const nowMin = tz ? minutesOfDayInTZ(base, tz) : (base.getHours() * 60 + base.getMinutes());
+  if (nowMin == null) return null;
+  let delta = (h * 60 + min) - nowMin;
+  if (delta <= 0) delta += 1440;                      // 이미 지난 시각이면 '내일 그 시각'
+  return new Date(base.getTime() + (delta + EPIC_RETRY_BUFFER_MIN) * 60000);
+}
+
+// 중단 사유 분류. retryable=false 면 시간이 지나도 그대로라 사람이 봐야 한다.
+function classifyPause(reason, lastError) {
+  const t = `${reason || ""}\n${lastError || ""}`;
+  if (/session limit|usage limit|rate limit|quota|too many requests|\b429\b|overloaded/i.test(t)) {
+    return { retryable: true, kind: "usage-limit", label: "사용량 한도(토큰) 소진" };
+  }
+  // 사람 판단이 필요한 것들 — 재시도해도 결과가 같다
+  if (/제안 답변이 없|리뷰 승인이 남았|자동 병합 실패/.test(t)) {
+    return { retryable: false, kind: "needs-human", label: "사람 확인 필요" };
+  }
+  if (/답변 대기|awaiting answers/i.test(t)) {
+    return { retryable: false, kind: "awaiting-answer", label: "카드 질문 답변 대기" };
+  }
+  if (/실행 실패|exit \d+|오류|timeout|ETIMEDOUT|ECONNRESET|ENOTFOUND|socket hang up/i.test(t)) {
+    return { retryable: true, kind: "transient", label: "일시적 실행 실패" };
+  }
+  return { retryable: false, kind: "unknown", label: "분류되지 않은 중단" };
+}
+
+// 다음 재시도 계획. attempt 는 '지금까지 시도한 횟수'(0부터).
+function planRetry(run, attempt, cfg, now) {
+  const opts = cfg || {};
+  if (!opts.autoRetry) return { retry: false, why: "off" };
+  const max = clampRetryMax(opts.autoRetryMax);
+  const c = classifyPause(run && run.reason, run && run.lastError);
+  if (!c.retryable) return { retry: false, why: c.kind, kind: c.kind, label: c.label };
+  if (attempt >= max) return { retry: false, why: "max-attempts", kind: c.kind, label: c.label, max };
+  const base = now instanceof Date ? now : new Date(now || Date.now());
+  const reset = c.kind === "usage-limit" ? parseUsageLimitReset(run && run.lastError, base) : null;
+  const at = reset || new Date(base.getTime() + EPIC_RETRY_BACKOFF_MIN[Math.min(attempt, EPIC_RETRY_BACKOFF_MIN.length - 1)] * 60000);
+  return { retry: true, at, kind: c.kind, label: c.label, max, source: reset ? "reset-time" : "backoff" };
+}
+
 module.exports = {
   DEFAULT_CREDS, readJson, writeJson, slugify, triggerClause, detectJql,
   adfToText, adfSegments, toADF, mdInline, mdToADF, buildReplyADF, maskCreds, applyCreds, createStore, doneStatusList, effectiveDoneStatuses,
@@ -440,4 +521,6 @@ module.exports = {
   SUGGEST_MARK, parseSuggestedAnswers,
   EPIC_STEPS, epicChildrenJql, epicTaskStep, nextEpicTask, nextEpicStep, buildAdoptedAnswerBody, prBelongsToCard,
   EPIC_AUTO_MERGE_MIN_DEFAULT, EPIC_AUTO_MERGE_MIN_LIMIT, clampAutoMergeMin, shouldAutoMerge,
+  EPIC_RETRY_MAX_DEFAULT, EPIC_RETRY_MAX_LIMIT, EPIC_RETRY_BACKOFF_MIN, clampRetryMax,
+  parseUsageLimitReset, classifyPause, planRetry,
 };

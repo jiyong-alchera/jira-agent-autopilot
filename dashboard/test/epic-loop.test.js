@@ -138,3 +138,79 @@ test("shouldAutoMerge: 열린 PR 이 없거나 시작 시각이 없으면 병합
   assert.equal(lib.shouldAutoMerge(opts, "2026-09-02T00:00:00Z", [], Date.now()).reason, "no-open-pr");
   assert.equal(lib.shouldAutoMerge(opts, "", [{ approved: true }], Date.now()).reason, "no-start");
 });
+
+// ===== 중단 시 자동 재시도 =====
+// 실측 사례: 04:06 에 "resets 1:40pm" → 9시간 34분 뒤. 고정 백오프(최대 4시간)로는 닿지 않아
+// 해제 시각 파싱이 필수다.
+test("parseUsageLimitReset: 실제 메시지에서 해제 시각을 읽는다", () => {
+  const now = new Date("2026-09-02T04:06:11+09:00");
+  const at = lib.parseUsageLimitReset("You've hit your session limit · resets 1:40pm (Asia/Seoul)", now);
+  assert.equal(Math.round((at - now) / 60000), 576);   // 9시간 34분 + 버퍼 2분
+});
+
+test("parseUsageLimitReset: 분 없는 형식·자정 넘김도 처리", () => {
+  const now = new Date("2026-09-02T04:06:11+09:00");
+  assert.equal(Math.round((lib.parseUsageLimitReset("resets 3pm (Asia/Seoul)", now) - now) / 60000), 656);
+  assert.equal(Math.round((lib.parseUsageLimitReset("resets 10am (Asia/Seoul)", now) - now) / 60000), 356);
+  // 01:20am 은 이미 지난 시각 → 다음 날 그 시각
+  assert.equal(Math.round((lib.parseUsageLimitReset("resets 1:20am (Asia/Seoul)", now) - now) / 60000), 1276);
+});
+
+test("parseUsageLimitReset: 못 읽는 문자열은 null", () => {
+  assert.equal(lib.parseUsageLimitReset("그냥 실패했습니다", new Date()), null);
+  assert.equal(lib.parseUsageLimitReset("", new Date()), null);
+  assert.equal(lib.parseUsageLimitReset("resets 99:99pm", new Date()), null);
+});
+
+test("classifyPause: 사용량 한도는 재시도 대상", () => {
+  const c = lib.classifyPause("build 실행 실패 (exit 1)", "You've hit your session limit · resets 1:40pm (Asia/Seoul)");
+  assert.equal(c.retryable, true);
+  assert.equal(c.kind, "usage-limit");
+});
+
+test("classifyPause: 사람이 봐야 하는 중단은 재시도하지 않는다", () => {
+  for (const r of ["EKYB-1 · approve: 리뷰 승인이 남았습니다: o/r#1",
+                   "EKYB-1 · adopt: plan 질문에 '💡 제안:' 답변이 없어 자동 채택할 수 없습니다.",
+                   "자동 병합 실패 — base 충돌"]) {
+    assert.equal(lib.classifyPause(r, "").retryable, false, r);
+  }
+  assert.equal(lib.classifyPause("build 가 답변 대기로 스킵됐습니다", "").kind, "awaiting-answer");
+});
+
+test("classifyPause: 일반 실행 실패는 일시적으로 보고 재시도", () => {
+  const c = lib.classifyPause("plan 실행 실패 (exit 1)", "some engine crash");
+  assert.equal(c.retryable, true);
+  assert.equal(c.kind, "transient");
+});
+
+test("planRetry: 사용량 한도면 해제 시각에, 아니면 점증 백오프", () => {
+  const now = new Date("2026-09-02T04:06:11+09:00");
+  const cfg = { autoRetry: true, autoRetryMax: 5 };
+  const limit = { reason: "build 실행 실패 (exit 1)", lastError: "You've hit your session limit · resets 1:40pm (Asia/Seoul)" };
+  const p1 = lib.planRetry(limit, 0, cfg, now);
+  assert.equal(p1.retry, true);
+  assert.equal(p1.source, "reset-time");
+  assert.equal(Math.round((p1.at - now) / 60000), 576);
+
+  const plain = { reason: "build 실행 실패 (exit 1)", lastError: "network hiccup" };
+  assert.equal(Math.round((lib.planRetry(plain, 0, cfg, now).at - now) / 60000), 10);
+  assert.equal(Math.round((lib.planRetry(plain, 2, cfg, now).at - now) / 60000), 60);
+  const wide = { autoRetry: true, autoRetryMax: 20 };
+  assert.equal(Math.round((lib.planRetry(plain, 4, wide, now).at - now) / 60000), 240);
+  assert.equal(Math.round((lib.planRetry(plain, 9, wide, now).at - now) / 60000), 240);  // 배열 끝을 넘으면 마지막 값 유지
+  assert.equal(lib.planRetry(plain, 0, cfg, now).source, "backoff");
+});
+
+test("planRetry: 꺼져 있거나 상한 초과면 재시도하지 않는다", () => {
+  const now = new Date();
+  const run = { reason: "build 실행 실패 (exit 1)", lastError: "session limit" };
+  assert.equal(lib.planRetry(run, 0, { autoRetry: false }, now).why, "off");
+  assert.equal(lib.planRetry(run, 5, { autoRetry: true, autoRetryMax: 5 }, now).why, "max-attempts");
+});
+
+test("clampRetryMax: 기본 5, 1~20", () => {
+  assert.equal(lib.clampRetryMax(undefined), 5);
+  assert.equal(lib.clampRetryMax(0), 5);
+  assert.equal(lib.clampRetryMax(3), 3);
+  assert.equal(lib.clampRetryMax(999), 20);
+});

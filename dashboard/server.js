@@ -660,11 +660,17 @@ const epicOptsPath = (cfg, key) => path.join(stateDirOf(cfg), `${key}.epic.opts.
 function readEpicOpts(cfg, key) {
   try {
     const o = JSON.parse(fs.readFileSync(epicOptsPath(cfg, key), "utf8"));
-    return { autoMerge: !!o.autoMerge, autoMergeAfterMin: lib.clampAutoMergeMin(o.autoMergeAfterMin) };
-  } catch { return { autoMerge: false, autoMergeAfterMin: lib.EPIC_AUTO_MERGE_MIN_DEFAULT }; }
+    return {
+      autoMerge: !!o.autoMerge, autoMergeAfterMin: lib.clampAutoMergeMin(o.autoMergeAfterMin),
+      autoRetry: !!o.autoRetry, autoRetryMax: lib.clampRetryMax(o.autoRetryMax),
+    };
+  } catch { return { autoMerge: false, autoMergeAfterMin: lib.EPIC_AUTO_MERGE_MIN_DEFAULT, autoRetry: false, autoRetryMax: lib.EPIC_RETRY_MAX_DEFAULT }; }
 }
 function writeEpicOpts(cfg, key, next) {
-  const o = { autoMerge: !!next.autoMerge, autoMergeAfterMin: lib.clampAutoMergeMin(next.autoMergeAfterMin) };
+  const o = {
+    autoMerge: !!next.autoMerge, autoMergeAfterMin: lib.clampAutoMergeMin(next.autoMergeAfterMin),
+    autoRetry: !!next.autoRetry, autoRetryMax: lib.clampRetryMax(next.autoRetryMax),
+  };
   try { fs.mkdirSync(stateDirOf(cfg), { recursive: true }); fs.writeFileSync(epicOptsPath(cfg, key), JSON.stringify(o, null, 2)); } catch {}
   return o;
 }
@@ -707,7 +713,91 @@ function epicRunStatus(cfg, epicKey) {
   // 락 없이 'running' 으로 남은 상태 파일 = 러너가 크래시/강제 종료된 것 → 재개 대상(paused)으로 정규화.
   // (락 정리는 위에서 한 번만 일어나므로 이 판정은 스테일 락 분기 밖에 둔다)
   if (st.status === "running") st = { ...st, status: "paused", reason: st.reason || "러너 프로세스가 예기치 않게 종료됐습니다." };
-  return { running: false, ...st, opts: readEpicOpts(cfg, epicKey) };
+  const base = { running: false, ...st, opts: readEpicOpts(cfg, epicKey) };
+  if (st.status !== "paused") return base;
+  // 중단 상태면 '자동 재시도가 걸릴지·언제·왜 안 걸리는지' 를 함께 준다(대시보드 표시용).
+  try {
+    const { attempt, plan } = epicRetryPlan(cfg, epicKey, st);
+    const rec = readEpicRetry(cfg, epicKey);
+    return { ...base, retry: { attempt, max: plan.max || base.opts.autoRetryMax, willRetry: !!plan.retry, at: (rec.nextRetryAt || (plan.at && plan.at.toISOString())) || null, kind: plan.kind, label: plan.label, why: plan.why, source: plan.source } };
+  } catch { return base; }
+}
+
+// ===== 에픽 자동 재시도 =====
+// 중단(paused)된 에픽을, 사유가 '시간이 지나면 풀리는' 종류일 때 대시보드가 대신 재개한다.
+// 러너는 중단 시 종료되므로 자기 자신을 되살릴 수 없다 → 상시 프로세스인 백엔드가 감시한다
+// (러너가 크래시로 죽어 상태 파일만 남은 경우도 같은 경로로 복구된다).
+const epicRetryPath = (cfg, key) => path.join(stateDirOf(cfg), `${key}.epic.retry.json`);
+function readEpicRetry(cfg, key) {
+  try { return JSON.parse(fs.readFileSync(epicRetryPath(cfg, key), "utf8")) || {}; } catch { return {}; }
+}
+function writeEpicRetry(cfg, key, next) {
+  try { fs.mkdirSync(stateDirOf(cfg), { recursive: true }); fs.writeFileSync(epicRetryPath(cfg, key), JSON.stringify(next, null, 2)); } catch {}
+  return next;
+}
+function clearEpicRetry(cfg, key) { try { fs.unlinkSync(epicRetryPath(cfg, key)); } catch {} }
+// 진행 지점이 바뀌면(다른 카드·다른 단계) 재시도 카운터를 리셋한다 — 한 지점에서 반복 실패할 때만 상한이 걸린다.
+const retrySignature = (st) => `${(st.current && st.current.key) || ""}:${st.step || ""}`;
+
+// 한 에픽의 재시도 판정·실행. 대시보드 감시 루프와 상태 조회에서 공용.
+function epicRetryPlan(cfg, key, st, now) {
+  const opts = readEpicOpts(cfg, key);
+  const rec = readEpicRetry(cfg, key);
+  const sig = retrySignature(st);
+  const attempt = rec.signature === sig ? (rec.attempt || 0) : 0;
+  const plan = lib.planRetry(st, attempt, opts, now || new Date());
+  return { opts, rec, sig, attempt, plan };
+}
+async function retryPausedEpics() {
+  const out = [];
+  for (const p of listProjects()) {
+    const cfg = getProject(p.id);
+    let files = [];
+    try { files = fs.readdirSync(stateDirOf(cfg)).filter((f) => f.endsWith(".epic.json")); } catch { continue; }
+    for (const f of files) {
+      const key = f.replace(/\.epic\.json$/, "");
+      let st;
+      try { st = epicRunStatus(cfg, key); } catch { continue; }
+      if (st.running) continue;                    // 돌고 있으면 둔다(카운터는 signature 로만 리셋)
+      if (st.status !== "paused") {
+        if (st.status === "done" || st.status === "stopped") clearEpicRetry(cfg, key);
+        continue;
+      }
+      const { rec, sig, attempt, plan } = epicRetryPlan(cfg, key, st);
+      if (!plan.retry) continue;
+      const now = Date.now();
+      // 첫 판정에서는 예정 시각만 기록해 둔다(대시보드가 '다음 시도 …' 를 보여줄 수 있게)
+      if (rec.signature !== sig || !rec.nextRetryAt) {
+        writeEpicRetry(cfg, key, { signature: sig, attempt, nextRetryAt: plan.at.toISOString(), kind: plan.kind, label: plan.label });
+        console.log(`[epic-retry] ${key}: ${plan.label} → ${plan.at.toISOString()} 재시도 예정 (${attempt + 1}/${plan.max}, ${plan.source})`);
+        continue;
+      }
+      if (now < Date.parse(rec.nextRetryAt)) continue;   // 아직 시각 전
+      // 재시도 실행 — 멈췄던 그 단계부터
+      const resumeStep = st.step || "";
+      const resumeKey = (st.current && st.current.key) || "";
+      const opts2 = readEpicOpts(cfg, key);
+      const r = runEpicLoop(key, cfg.id, {
+        repos: st.repos || [], reviewLoopMax: clampReviewLoopMax(null, cfg),
+        resumeStep, resumeKey, ...opts2,
+      });
+      const next = attempt + 1;
+      writeEpicRetry(cfg, key, { signature: sig, attempt: next, nextRetryAt: null, kind: plan.kind, label: plan.label, lastRetryAt: new Date().toISOString() });
+      console.log(`[epic-retry] ${key}: 자동 재시도 ${next}/${plan.max} 실행 (${resumeKey} · ${resumeStep}) ${r.ok ? `pid ${r.pid}` : `실패: ${r.message}`}`);
+      out.push({ project: cfg.id, key, attempt: next, ok: !!r.ok });
+      try {
+        const cred = getProjectCreds(cfg.id);
+        if (cred.slackWebhookUrl) {
+          await fetch(cred.slackWebhookUrl, {
+            method: "POST", headers: { "Content-type": "application/json" },
+            body: JSON.stringify({ text: `🔄 [${key}] 자동 재시도 ${next}/${plan.max} — ${plan.label} 이후 ${resumeKey} · ${resumeStep} 부터 재개` }),
+            signal: AbortSignal.timeout(10000),
+          });
+        }
+      } catch {}
+    }
+  }
+  return out;
 }
 
 // 프로젝트의 에픽 목록(연속 개발 시작 폼용)
@@ -759,7 +849,8 @@ app.post("/api/epics/:key/run", (req, res) => {
     // 새 시작이므로 이전 실행의 상태 파일은 지운다(재개는 /run/resume).
     try { fs.unlinkSync(path.join(stateDirOf(cfg), `${key}.epic.json`)); } catch {}
     const reviewLoopMax = clampReviewLoopMax(b.reviewLoopMax, cfg);
-    const opts = writeEpicOpts(cfg, key, { autoMerge: b.autoMerge, autoMergeAfterMin: b.autoMergeAfterMin });
+    const opts = writeEpicOpts(cfg, key, { autoMerge: b.autoMerge, autoMergeAfterMin: b.autoMergeAfterMin, autoRetry: b.autoRetry, autoRetryMax: b.autoRetryMax });
+    clearEpicRetry(cfg, key);   // 새 실행이므로 재시도 카운터 초기화
     res.json({ ...runEpicLoop(key, id, { repos, reviewLoopMax, ...opts }), repos, reviewLoopMax, opts });
   } catch (e) { fail(res, e); }
 });
@@ -795,8 +886,16 @@ app.post("/api/epics/:key/run/options", (req, res) => {
     const opts = writeEpicOpts(cfg, key, {
       autoMerge: b.autoMerge === undefined ? cur.autoMerge : !!b.autoMerge,
       autoMergeAfterMin: b.autoMergeAfterMin === undefined ? cur.autoMergeAfterMin : b.autoMergeAfterMin,
+      autoRetry: b.autoRetry === undefined ? cur.autoRetry : !!b.autoRetry,
+      autoRetryMax: b.autoRetryMax === undefined ? cur.autoRetryMax : b.autoRetryMax,
     });
-    res.json({ ok: true, opts, message: opts.autoMerge ? `자동 병합 켜짐 (승인 후 ${opts.autoMergeAfterMin}분)` : "자동 병합 꺼짐" });
+    // 재시도 설정을 바꾸면 예정 시각을 다시 계산하도록 기록을 비운다
+    if (b.autoRetry !== undefined || b.autoRetryMax !== undefined) clearEpicRetry(cfg, key);
+    const msg = [
+      opts.autoMerge ? `자동 병합 켜짐(승인 후 ${opts.autoMergeAfterMin}분)` : "자동 병합 꺼짐",
+      opts.autoRetry ? `자동 재시도 켜짐(최대 ${opts.autoRetryMax}회)` : "자동 재시도 꺼짐",
+    ].join(" · ");
+    res.json({ ok: true, opts, message: msg });
   } catch (e) { fail(res, e); }
 });
 
@@ -1497,5 +1596,11 @@ app.listen(PORT, () => {
   setInterval(syncAll, MERGE_SYNC_MS).unref?.();
   setTimeout(syncAll, 8000).unref?.(); // 부팅 직후 1회
   console.log(`  외부 병합 자동 동기화: ${MERGE_SYNC_MS / 1000}s 주기`);
+  // 중단된 에픽 자동 재시도(사용량 한도 등 시간이 지나면 풀리는 사유만). 러너는 중단 시 종료되므로 여기서 감시한다.
+  const EPIC_RETRY_SCAN_MS = 60000;
+  const scanRetries = async () => { try { await retryPausedEpics(); } catch (e) { console.warn("[epic-retry] 스캔 오류:", e.message); } };
+  setInterval(scanRetries, EPIC_RETRY_SCAN_MS).unref?.();
+  setTimeout(scanRetries, 12000).unref?.();
+  console.log(`  에픽 자동 재시도 감시: ${EPIC_RETRY_SCAN_MS / 1000}s 주기`);
   console.log("");
 });
