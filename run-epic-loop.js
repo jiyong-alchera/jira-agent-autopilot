@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // run-epic-loop.js <EPIC-KEY>
 // --------------------------------------------------------------------------
-// 한 에픽의 하위 태스크를 '생성순으로 하나씩' 끝까지 개발한다.
+// 한 상위 카드(에픽 계층 — 프로젝트에 따라 '에픽' · '워크스트림' 등으로 불린다)의 하위 태스크를
+// '생성순으로 하나씩' 끝까지 개발한다. 하위는 parent 로만 찾으므로 타입 이름과 무관하게 동작한다.
 //
 // 태스크 한 건의 단계(lib.EPIC_STEPS):
 //   prepare      claude-work + repo_<name> 라벨 부여(대상 repo 확정)
@@ -9,8 +10,11 @@
 //   adopt        plan 이 남긴 '💡 제안:' 답변을 자동 채택 → 답변 코멘트 + claude-answered
 //   build        REVIEW_LOOP_AFTER=1 run-jira-agent.sh <KEY> build
 //                → PR 생성 후 run-review-loop.sh 가 '승인까지' 이어서 실행(기존 자산)
+//   ci           PR 의 CI 를 확인해 깨졌으면 '원인 파악 → 수정/재실행 → 재검증' 을 초록까지 반복
+//                (CI 수정 커밋이 생기면 기존 승인을 무효화하고 리뷰 루프를 다시 태운다)
 //   approve      열린 봇 PR 전부에 승인 마커(CLAUDE-REVIEW-APPROVED)가 있는지 확인
 //   await-merge  사용자가 그 카드의 PR 을 모두 병합할 때까지 대기(카드가 완료되면 통과)
+//                자동 병합은 승인 + CI 초록일 때만 — 대기 중 base 가 움직여 깨진 회귀를 여기서 다시 막는다
 // 모든 태스크가 끝나면 에픽 완료.
 //
 // 어느 단계든 실패하면 상태를 'paused' 로 남기고 알림 후 종료한다. 대시보드의
@@ -24,8 +28,11 @@
 //   <EPIC>.epic-design.md           에픽 설명(설계안) — 하위 태스크 프롬프트에 주입
 //
 // env: PROJECT_ID(필수), EPIC_REPOS(쉼표 구분 repo name), REVIEW_LOOP_MAX,
+//      EPIC_CI_LOOP_MAX(CI 수정 반복 한도, 기본 5), EPIC_CI_POLL(CI 폴링 초, 기본 30),
+//      EPIC_CI_WAIT_MAX_MIN(CI 완료 대기 한도 분, 기본 40),
 //      EPIC_MERGE_POLL(병합 대기 폴링 초, 기본 60), EPIC_RESUME_STEP·EPIC_RESUME_KEY(재개 지점),
 //      EPIC_AUTO_MERGE(1=승인 후 자동 병합)·EPIC_AUTO_MERGE_AFTER_MIN(대기 분, 기본 60),
+//      EPIC_LABEL(상위 카드 표시 이름, 기본 "에픽" — 로그·Slack·Jira 코멘트 문구에만 쓰임),
 //      DASHBOARD_URL(병합 동기화 가속 + 자동 병합 경로) — 그 외는 하위 스크립트가 쓰는 값 그대로
 // --------------------------------------------------------------------------
 const fs = require("fs");
@@ -45,6 +52,8 @@ const MERGE_POLL_MS = Math.max(10, parseInt(process.env.EPIC_MERGE_POLL || "60",
 const APPROVED_MARKER = lib.REVIEW_APPROVED_MARKER;
 
 const ts = () => new Date().toISOString().slice(0, 19).replace("T", " ");
+// 상위 카드를 프로젝트가 부르는 이름(에픽 · 워크스트림 …). 대시보드가 이슈 타입 메타에서 뽑아 넘긴다.
+const EPIC_LABEL = process.env.EPIC_LABEL || lib.EPIC_LABEL_FALLBACK;
 const log = (m) => console.log(`[${ts()}] [epic ${EPIC_KEY}] ${m}`);
 const nowIso = () => new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -77,11 +86,19 @@ function readOpts() {
   } catch { return DEFAULT_OPTS; }
 }
 
-// 대상 repo — 시작 시 사용자가 고른 것. 비면 프로젝트 전체.
+// 대상 repo — 시작 시 사용자가 고른 것. **비어 있으면 전체로 넓히지 않고 실패한다**:
+// 예전엔 빈 값을 '프로젝트 전체'로 해석했는데, 상태 파일이 낡거나 깨져 repos 가 비면 재개가
+// 조용히 전 repo 로 번졌다(고른 적 없는 repo 에 PR 이 열린다). 넓히는 실수는 되돌리기 비싸므로 멈춘다.
 const allRepos = lib.normalizeRepos(cfg);
 const pickedNames = String(process.env.EPIC_REPOS || "").split(",").map((s) => s.trim()).filter(Boolean);
-const epicRepos = pickedNames.length ? allRepos.filter((r) => pickedNames.includes(r.name)) : allRepos;
-if (!epicRepos.length) { console.error("대상 repo 가 없습니다."); process.exit(2); }
+if (!pickedNames.length) {
+  console.error("대상 repo 가 지정되지 않았습니다(EPIC_REPOS). 전체로 넓히지 않고 종료합니다 — 대시보드에서 repo 를 골라 새로 시작하세요.");
+  process.exit(2);
+}
+const unknown = pickedNames.filter((n) => !allRepos.some((r) => r.name === n));
+const epicRepos = allRepos.filter((r) => pickedNames.includes(r.name));
+if (!epicRepos.length) { console.error(`대상 repo 가 프로젝트에 없습니다: ${pickedNames.join(", ")}`); process.exit(2); }
+if (unknown.length) console.log(`[warn] 프로젝트에 없는 repo 는 무시합니다: ${unknown.join(", ")}`);
 
 // ----- Jira REST -----
 const jiraAuth = Buffer.from(`${cred.atlassianEmail}:${cred.atlassianToken}`).toString("base64");
@@ -98,6 +115,10 @@ async function jira(method, urlPath, body) {
 }
 const jiraSearch = (jql) => jira("POST", "/rest/api/3/search/jql", { jql, maxResults: 100, fields: ["summary", "labels", "status", "created"] });
 const addLabels = (key, labels) => jira("PUT", `/rest/api/3/issue/${encodeURIComponent(key)}`, { update: { labels: labels.map((l) => ({ add: l })) } });
+// 한 번의 PUT 으로 추가·제거를 함께 적용(중간 상태가 남지 않게).
+const editLabels = (key, add, remove) => jira("PUT", `/rest/api/3/issue/${encodeURIComponent(key)}`, {
+  update: { labels: [...add.map((l) => ({ add: l })), ...remove.map((l) => ({ remove: l }))] },
+});
 
 // 하위 태스크 목록(미완료, 생성순). 태스크 경계마다 다시 조회해 중간에 추가된 카드도 반영한다.
 // parent 절이 안 먹는 구형 프로젝트는 'Epic Link' 로 한 번 더 시도한다.
@@ -143,7 +164,7 @@ function history(key, result, extra) {
 
 // ----- 상태 파일 -----
 let STATE = {
-  epic: EPIC_KEY, project: project.id, repos: epicRepos.map((r) => r.name),
+  epic: EPIC_KEY, label: EPIC_LABEL, project: project.id, repos: epicRepos.map((r) => r.name),
   startedAt: nowIso(), updatedAt: nowIso(), pid: process.pid,
   status: "running", reason: "", step: "", index: 0, total: 0,
   current: null, tasks: [],
@@ -161,7 +182,7 @@ const stopRequested = () => fs.existsSync(STOP_FILE);
 
 // ----- 락 -----
 try { fs.mkdirSync(LOCK_DIR); }
-catch { console.log(`SKIP: [${EPIC_KEY}] 에픽 연속 개발이 이미 실행 중입니다(lock)`); process.exit(0); }
+catch { console.log(`SKIP: [${EPIC_KEY}] ${EPIC_LABEL} 연속 개발이 이미 실행 중입니다(lock)`); process.exit(0); }
 try { fs.unlinkSync(STOP_FILE); } catch {}
 try { fs.writeFileSync(`${LOCK_DIR}.phase`, "epic"); fs.writeFileSync(`${LOCK_DIR}.pid`, String(process.pid)); } catch {}
 
@@ -185,7 +206,7 @@ for (const sig of ["SIGTERM", "SIGINT"]) {
   process.on(sig, async () => {
     if (terminating) return; terminating = true;
     log(`중지 신호 — ${STATE.current ? `${STATE.current.key} ${STATE.step}` : "대기"} 에서 종료`);
-    await slack(`⏹ [${EPIC_KEY}] 에픽 연속 개발 중지됨${STATE.current ? ` (${STATE.current.key} · ${STATE.step})` : ""}`);
+    await slack(`⏹ [${EPIC_KEY}] ${EPIC_LABEL} 연속 개발 중지됨${STATE.current ? ` (${STATE.current.key} · ${STATE.step})` : ""}`);
     history(STATE.current && STATE.current.key, "stopped");
     finish("stopped", "사용자 중지", 130);
   });
@@ -226,21 +247,36 @@ function ghJson(args) {
     });
   });
 }
+// 실패를 '결과 없음'으로 삼키지 않는 판. 승인·CI 판정처럼 '못 물어본 것'과 '없는 것'을 구분해야
+// 하는 자리에 쓴다 — 조용히 빈 배열을 주면 미승인 PR 이 승인된 것처럼, CI 실패가 없는 것처럼 보인다.
+function ghJsonStrict(args) {
+  return new Promise((resolve, reject) => {
+    execFile("gh", args, { env: BASE_ENV, maxBuffer: 20 * 1024 * 1024 }, (err, stdout, stderr) => {
+      if (err) return reject(new Error(`gh ${args.slice(0, 2).join(" ")} 실패: ${String(stderr || err.message).trim().slice(0, 200)}`));
+      try { resolve(JSON.parse(stdout || "null")); } catch (e) { reject(new Error(`gh 출력 파싱 실패: ${e.message}`)); }
+    });
+  });
+}
 const ownerRepo = (url) => String(url || "").replace(/\.git$/, "").replace(/^https?:\/\/github\.com\//, "").split("/").slice(0, 2).join("/");
 
-// 카드의 열린 봇 PR 들이 모두 승인 마커를 받았는지 확인. [{owner,number,url,approved}] 반환.
+// 카드의 열린 봇 PR 들 — 승인 마커와 CI 상태를 함께 판정한다.
+// [{owner,number,url,sha,approved,ci,ciFailed}] 반환. gh 조회가 실패하면 throw 한다(빈 배열로 삼키지 않음).
 async function cardOpenPRs(key) {
   const prs = [];
   for (const r of epicRepos) {
     const or = ownerRepo(r.url);
-    const list = await ghJson(["pr", "list", "--repo", or, "--search", key, "--state", "open", "--json", "number,url,title,headRefName,isDraft"]);
+    const list = await ghJsonStrict(["pr", "list", "--repo", or, "--search", key, "--state", "open",
+      "--json", "number,url,title,headRefName,headRefOid,isDraft,statusCheckRollup"]);
     for (const p of (list || [])) {
       if (p.isDraft) continue;
       // --search 는 PR 본문까지 훑어 형제 카드의 PR 까지 잡는다 → 브랜치/제목으로 이 카드 것만 남긴다.
       if (!lib.prBelongsToCard({ branch: p.headRefName, title: p.title }, key)) continue;
-      const comments = await ghJson(["api", `repos/${or}/issues/${p.number}/comments?per_page=100`, "--jq", "[.[].body]"]);
+      const comments = await ghJsonStrict(["api", `repos/${or}/issues/${p.number}/comments?per_page=100`, "--jq", "[.[].body]"]);
       const approved = (comments || []).some((b) => String(b).includes(APPROVED_MARKER));
-      prs.push({ owner: or, number: p.number, url: p.url, approved });
+      prs.push({
+        owner: or, number: p.number, url: p.url, sha: p.headRefOid || "", approved,
+        ci: lib.ciStateOf(p.statusCheckRollup), ciFailed: lib.failedChecks(p.statusCheckRollup),
+      });
     }
   }
   return prs;
@@ -263,12 +299,21 @@ async function mergeViaDashboard() {
 }
 
 // ----- 단계 구현 -----
+// 카드의 라벨을 이번 실행의 repo 선택에 맞춘다 — 부족한 건 붙이고, 이번 실행에 없는 repo_ 는 지운다.
+// 안 지우면 카드 단위 경로(run-cycle.js 예약 루프 · 대시보드 개별 실행)가 그 라벨을 보고 뺀 repo 까지
+// 개발한다(러너 자신은 CARD_REPOS 를 쓰므로 영향 없음).
+// **prepare 단계가 아니라 태스크 진입마다** 부른다 — 이미 claude-work 가 붙은 카드는 시작 단계가
+// plan/build 라 prepare 를 건너뛰는데, 스테일 라벨이 남는 건 바로 그 카드들이기 때문.
+async function syncTaskLabels(task) {
+  const { add, remove } = lib.epicPrepareLabelDiff(task.labels, epicRepos.map((r) => r.name), cfg);
+  if (!add.length && !remove.length) return { changed: false, note: "라벨 이미 설정됨" };
+  await editLabels(task.key, add, remove);
+  const note = [add.length ? `부여: ${add.join(", ")}` : "", remove.length ? `제거: ${remove.join(", ")}` : ""].filter(Boolean).join(" · ");
+  return { changed: true, note: `라벨 ${note}` };
+}
 async function stepPrepare(task) {
-  const want = [cfg.triggerLabel || "claude-work", ...epicRepos.map((r) => lib.REPO_LABEL_PREFIX + r.name)];
-  const missing = want.filter((l) => !task.labels.includes(l));
-  if (!missing.length) return { ok: true, note: "라벨 이미 설정됨" };
-  await addLabels(task.key, missing);
-  return { ok: true, note: `라벨 부여: ${missing.join(", ")}` };
+  const r = await syncTaskLabels(task);
+  return { ok: true, note: r.note };
 }
 async function stepPlan(task) {
   const { code, out } = await runScript("run-jira-agent.sh", [task.key, "plan"], await taskEnv(task.key));
@@ -286,7 +331,7 @@ async function stepAdopt(task) {
   if (!suggested) {
     return { ok: false, reason: "plan 질문에 '💡 제안:' 답변이 없어 자동 채택할 수 없습니다. 카드에 직접 답변한 뒤 이어서 진행하세요." };
   }
-  const body = lib.buildAdoptedAnswerBody(suggested, EPIC_KEY);
+  const body = lib.buildAdoptedAnswerBody(suggested, EPIC_KEY, EPIC_LABEL);
   await jira("POST", `/rest/api/3/issue/${encodeURIComponent(task.key)}/comment`, { body: lib.buildReplyADF(body, suggested.commentId) });
   await addLabels(task.key, [cfg.answeredLabel || "claude-answered"]);
   return { ok: true, note: `제안 답변 ${suggested.count}건 자동 채택` };
@@ -313,6 +358,121 @@ async function stepApprove(task) {
   }
   return { ok: true, note: `PR ${prs.length}건 리뷰 승인 완료` };
 }
+// ----- ci 단계: CI 가 깨졌으면 원인을 파악해 고치고 초록으로 만든다 -----
+// 회차마다 '한 가지 일'만 한다 — CI 실패면 수정, 수정 커밋이 쌓였으면 재리뷰. 그리고 다시 판정한다.
+// 재리뷰가 필요한 이유: CI 를 고치면 코드가 바뀌는데, 그 커밋은 아무도 리뷰하지 않은 채로 병합된다.
+const CI_POLL_MS = Math.max(10, parseInt(process.env.EPIC_CI_POLL || "30", 10) || 30) * 1000;
+const CI_WAIT_MAX_MS = Math.max(1, parseInt(process.env.EPIC_CI_WAIT_MAX_MIN || "40", 10) || 40) * 60000;
+const CI_SETTLE_MS = 20000;        // 푸시·재실행 직후 새 체크가 등록될 때까지의 여유
+const CI_NONE_GRACE_MS = 180000;   // '체크 없음'을 '아직 안 올라옴'으로 보는 구간(3분)
+const CI_PUSHED_MARK = "CI_FIX_PUSHED";   // run-jira-agent.sh 의 CI_PUSHED_MARK 와 같아야 함
+const SUPERSEDED_MARKER = "CLAUDE-REVIEW-SUPERSEDED-BY-CI-FIX";
+
+async function prCiState(or, number) {
+  const p = await ghJsonStrict(["pr", "view", String(number), "--repo", or, "--json", "state,headRefOid,statusCheckRollup"]);
+  return {
+    prState: (p && p.state) || "", sha: (p && p.headRefOid) || "",
+    state: lib.ciStateOf(p && p.statusCheckRollup), failed: lib.failedChecks(p && p.statusCheckRollup),
+  };
+}
+// CI 가 확정될 때까지(도는 체크가 없어질 때까지) 기다린다.
+async function waitCi(or, number) {
+  const until = Date.now() + CI_WAIT_MAX_MS;
+  const graceUntil = Date.now() + CI_NONE_GRACE_MS;
+  for (;;) {
+    if (stopRequested()) return { stop: true };
+    const c = await prCiState(or, number);
+    if (c.prState && c.prState !== "OPEN") return { ...c, closed: true };
+    // 체크가 아직 하나도 없으면 '없는 repo'인지 '방금 푸시해 아직 안 올라온 것'인지 알 수 없다 → 잠깐 기다려 본다.
+    if (c.state !== "pending" && !(c.state === "none" && Date.now() < graceUntil)) return c;
+    if (Date.now() >= until) return { ...c, timeout: true };
+    await sleep(CI_POLL_MS);
+  }
+}
+// CI 수정 커밋이 올라오면 기존 리뷰 승인은 무효다. 승인 마커를 남의 코멘트를 지우지 않고 무력화한다
+// (봇이 쓴 자기 코멘트만 편집 — 마커 문자열을 바꾸고 무효 사유를 덧붙인다).
+async function supersedeApproval(or, number) {
+  const comments = await ghJsonStrict(["api", `repos/${or}/issues/${number}/comments?per_page=100`, "--jq", "[.[] | {id, body}]"]);
+  const file = path.join(STATE_DIR, `${EPIC_KEY}.ci-supersede.md`);
+  let n = 0;
+  for (const c of (comments || [])) {
+    const body = String((c && c.body) || "");
+    if (!body.includes(APPROVED_MARKER)) continue;
+    fs.writeFileSync(file, `${body.split(APPROVED_MARKER).join(SUPERSEDED_MARKER)}\n\n> ⚠️ CI 수정 커밋이 올라와 이 승인은 무효화됐습니다(${nowIso()}). 재리뷰가 진행됩니다.\n`);
+    await ghJsonStrict(["api", "-X", "PATCH", `repos/${or}/issues/comments/${c.id}`, "-F", `body=@${file}`]);
+    n += 1;
+  }
+  try { fs.unlinkSync(file); } catch {}
+  return n;
+}
+
+async function ciFixLoop(task, pr, max) {
+  const tag = `${pr.owner}#${pr.number}`;
+  let pendingReview = false;   // CI 수정 커밋이 쌓여 재리뷰가 필요한 상태
+  let last = null;
+  for (let i = 1; i <= max; i++) {
+    if (stopRequested()) return { ok: false, stop: true };
+    const c = await waitCi(pr.owner, pr.number);
+    if (c.stop) return { ok: false, stop: true };
+    if (c.closed) return { ok: true, note: `${tag} PR 이 ${c.prState} → 건너뜀` };
+    if (c.timeout) return { ok: false, reason: `${tag} CI 가 ${CI_WAIT_MAX_MS / 60000}분 안에 끝나지 않았습니다(아직 진행 중). 확인 후 [이어서 진행] 하세요.` };
+    last = c;
+
+    if (c.state === "fail") {
+      const names = c.failed.map((f) => f.name).join(", ");
+      log(`${task.key} ${tag} CI 실패(${names}) → 수정 ${i}/${max} 회차`);
+      await slack(`🧪 [${EPIC_KEY}] ${task.key} — CI 실패 수정 ${i}/${max} 회차 · ${tag} · 실패: ${names}`);
+      const e = await taskEnv(task.key);
+      e.CI_FIX = "1";
+      e.REWORK_ONLY_OWNER = pr.owner;
+      e.REWORK_ONLY_NUM = String(pr.number);
+      e.CI_FAILED_CHECKS = c.failed.map((f) => `- ${f.name} (${f.conclusion}) ${f.url}`).join("\n");
+      // 연쇄 실행 플래그는 끊는다 — CI 수정이 리뷰 루프를 또 띄우면 중첩 실행이 락에 막힌다.
+      e.REVIEW_LOOP_AFTER = ""; e.REVIEW_AFTER = ""; e.REVIEW_FIRST = ""; e.IN_REVIEW_LOOP = "1";
+      const { code, out } = await runScript("run-jira-agent.sh", [task.key, "build"], e);
+      if (stopRequested()) return { ok: false, stop: true };
+      if (code !== 0) return { ok: false, reason: `${tag} CI 수정 실행 실패 (exit ${code})`, lastError: tailOf(out) };
+      if (out.includes(CI_PUSHED_MARK)) pendingReview = true;
+      await sleep(CI_SETTLE_MS);
+      continue;
+    }
+
+    // 여기부터는 CI 초록(또는 체크 없음).
+    if (!pendingReview) return { ok: true, note: `${tag} CI ${c.state === "none" ? "체크 없음" : "통과"}${i > 1 ? ` (${i - 1}회 수정)` : ""}` };
+
+    // CI 수정 커밋은 아무도 안 본 코드다 → 기존 승인을 무효화하고 리뷰 루프를 다시 태운다.
+    log(`${task.key} ${tag} CI 초록 · CI 수정 커밋 재리뷰 (${i}/${max} 회차)`);
+    await slack(`🔁 [${EPIC_KEY}] ${task.key} — CI 수정 커밋에 대해 재리뷰합니다 · ${tag}`);
+    try {
+      const n = await supersedeApproval(pr.owner, pr.number);
+      if (n) log(`${task.key} ${tag} 기존 리뷰 승인 ${n}건 무효화`);
+    } catch (e) { return { ok: false, reason: `${tag} 기존 승인 무효화 실패: ${e.message}` }; }
+    const re = await taskEnv(task.key);
+    re.REVIEW_FIRST = "1";   // 방금 고친 코드라 반영할 리뷰 의견이 아직 없다 → 리뷰부터
+    re.REVIEW_LOOP_MAX = String(lib.clampReviewLoopMax(process.env.REVIEW_LOOP_MAX, cfg));
+    const { code } = await runScript("run-review-loop.sh", [task.key, pr.owner, String(pr.number)], re);
+    if (stopRequested()) return { ok: false, stop: true };
+    if (code !== 0) return { ok: false, reason: `${tag} CI 수정분 재리뷰 실패 (exit ${code})` };
+    pendingReview = false;
+    await sleep(CI_SETTLE_MS);   // 재리뷰가 반영 커밋을 더했을 수 있으니 CI 를 다시 본다
+  }
+  const names = last && last.failed ? last.failed.map((f) => f.name).join(", ") : "";
+  return { ok: false, reason: `${tag} CI 수정 반복 ${max}회 후에도 정리되지 않았습니다${names ? ` (실패: ${names})` : ""}. 로그를 확인한 뒤 [이어서 진행] 하세요.` };
+}
+
+async function stepCi(task) {
+  const prs = await cardOpenPRs(task.key);
+  if (!prs.length) return { ok: true, note: "열린 PR 없음(이미 병합됨)" };
+  const max = lib.clampCiLoopMax(process.env.EPIC_CI_LOOP_MAX, cfg);
+  const notes = [];
+  for (const pr of prs) {
+    const r = await ciFixLoop(task, pr, max);
+    if (!r.ok) return r;
+    notes.push(r.note);
+  }
+  return { ok: true, note: notes.join(" · ") };
+}
+
 // 사용자가 PR 을 모두 병합할 때까지 대기. 대시보드가 있으면 병합 동기화를 앞당겨 호출한다.
 // 자동 병합이 켜져 있으면, 대기 시간이 지나고 열린 PR 이 '모두 리뷰 승인' 된 경우 대신 병합한다.
 async function stepAwaitMerge(task) {
@@ -333,9 +493,13 @@ async function stepAwaitMerge(task) {
 
     // 자동 병합 판정 — 옵션은 매 회 다시 읽어 실행 중 on/off 가 바로 반영되게 한다.
     const opts = readOpts();
-    let openPRs = [];
-    if (opts.autoMerge) { try { openPRs = await cardOpenPRs(task.key); } catch { openPRs = []; } }
-    const d = lib.shouldAutoMerge(opts, waitStartedAt, openPRs, Date.now());
+    let openPRs = [], prsErr = "";
+    if (opts.autoMerge) { try { openPRs = await cardOpenPRs(task.key); } catch (e) { prsErr = e.message; } }
+    // 조회 자체가 실패한 회차는 판정하지 않는다 — '못 물어봤다'를 '열린 PR 이 없다'로 읽으면
+    // 승인·CI 게이트를 통째로 건너뛰게 된다. 다음 폴링에서 다시 본다.
+    const d = prsErr ? { merge: false, reason: "pr-lookup-failed" }
+      : lib.shouldAutoMerge(opts, waitStartedAt, openPRs, Date.now());
+    if (prsErr) log(`PR 상태 조회 실패(다음 폴링에서 재시도): ${prsErr}`);
     writeStatus({
       waitStartedAt, autoMerge: opts.autoMerge, autoMergeAfterMin: opts.autoMergeAfterMin,
       autoMergeAt: d.dueMs ? new Date(d.dueMs).toISOString().replace(/\.\d{3}Z$/, "Z") : null,
@@ -358,7 +522,7 @@ async function stepAwaitMerge(task) {
     await sleep(MERGE_POLL_MS);
   }
 }
-const STEP_FN = { prepare: stepPrepare, plan: stepPlan, adopt: stepAdopt, build: stepBuild, approve: stepApprove, "await-merge": stepAwaitMerge };
+const STEP_FN = { prepare: stepPrepare, plan: stepPlan, adopt: stepAdopt, build: stepBuild, ci: stepCi, approve: stepApprove, "await-merge": stepAwaitMerge };
 
 // ----- 메인 -----
 (async () => {
@@ -369,11 +533,11 @@ const STEP_FN = { prepare: stepPrepare, plan: stepPlan, adopt: stepAdopt, build:
     epicSummary = (ep.fields && ep.fields.summary) || "";
     const design = lib.adfToText(ep.fields && ep.fields.description) || "";
     fs.writeFileSync(DESIGN_FILE, `# ${EPIC_KEY} ${epicSummary}\n\n${design}\n`);
-  } catch (e) { log(`에픽 설명 조회 실패(설계안 없이 진행): ${e.message}`); }
+  } catch (e) { log(`${EPIC_LABEL} 설명 조회 실패(설계안 없이 진행): ${e.message}`); }
   writeStatus({ epicSummary });
 
   log(`시작 · repo: ${epicRepos.map((r) => r.name).join(", ")}`);
-  await slack(`🧭 [${EPIC_KEY}] 에픽 연속 개발 시작 — ${epicSummary || ""} · repo ${epicRepos.map((r) => r.name).join(", ")}`);
+  await slack(`🧭 [${EPIC_KEY}] ${EPIC_LABEL} 연속 개발 시작 — ${epicSummary || ""} · repo ${epicRepos.map((r) => r.name).join(", ")}`);
   history(EPIC_KEY, "started");
 
   // 재개 시 시작할 단계(대시보드 [이어서 진행]/[건너뛰기] 가 지정).
@@ -383,7 +547,7 @@ const STEP_FN = { prepare: stepPrepare, plan: stepPlan, adopt: stepAdopt, build:
   let doneCount = 0;
 
   for (;;) {
-    if (stopRequested()) { await slack(`⏹ [${EPIC_KEY}] 에픽 연속 개발 중지됨`); history(EPIC_KEY, "stopped"); finish("stopped", "사용자 중지"); }
+    if (stopRequested()) { await slack(`⏹ [${EPIC_KEY}] ${EPIC_LABEL} 연속 개발 중지됨`); history(EPIC_KEY, "stopped"); finish("stopped", "사용자 중지"); }
 
     let children;
     try { children = await fetchChildren(); }
@@ -404,14 +568,20 @@ const STEP_FN = { prepare: stepPrepare, plan: stepPlan, adopt: stepAdopt, build:
     await slack(`▶️ [${EPIC_KEY}] ${next.key} 처리 시작 (${doneCount + 1}/${doneCount + children.length}) · ${next.summary}`);
 
     let task = next;
+    // 어느 단계에서 시작하든 라벨부터 이번 실행 기준으로 맞춘다(prepare 를 건너뛰는 카드 포함).
+    try {
+      const sync = await syncTaskLabels(task);
+      if (sync.changed) log(`${task.key} · ${sync.note}`);
+    } catch (e) { log(`${task.key} · 라벨 동기화 실패(계속 진행): ${e.message}`); }
+
     while (step) {
-      if (stopRequested()) { await slack(`⏹ [${EPIC_KEY}] 에픽 연속 개발 중지됨 (${task.key} · ${step})`); history(task.key, "stopped"); finish("stopped", "사용자 중지"); }
+      if (stopRequested()) { await slack(`⏹ [${EPIC_KEY}] ${EPIC_LABEL} 연속 개발 중지됨 (${task.key} · ${step})`); history(task.key, "stopped"); finish("stopped", "사용자 중지"); }
       writeStatus({ step, stepStartedAt: nowIso(), current: { key: task.key, summary: task.summary, step } });
       log(`${task.key} · ${step} …`);
       let r;
       try { r = await STEP_FN[step](task); }
       catch (e) { r = { ok: false, reason: `${step} 오류: ${String((e && e.message) || e)}` }; }
-      if (r && r.stop) { await slack(`⏹ [${EPIC_KEY}] 에픽 연속 개발 중지됨 (${task.key} · ${step})`); history(task.key, "stopped"); finish("stopped", "사용자 중지"); }
+      if (r && r.stop) { await slack(`⏹ [${EPIC_KEY}] ${EPIC_LABEL} 연속 개발 중지됨 (${task.key} · ${step})`); history(task.key, "stopped"); finish("stopped", "사용자 중지"); }
       if (!r || !r.ok) {
         const reason = (r && r.reason) || `${step} 실패`;
         log(`중단: ${reason}`);
@@ -430,13 +600,13 @@ const STEP_FN = { prepare: stepPrepare, plan: stepPlan, adopt: stepAdopt, build:
     history(task.key, "task-done");
   }
 
-  log(`에픽 완료 — 하위 태스크 ${doneCount}건 처리`);
-  await slack(`🎉 [${EPIC_KEY}] 에픽 연속 개발 완료 — 하위 태스크 ${doneCount}건 처리`);
+  log(`${EPIC_LABEL} 완료 — 하위 태스크 ${doneCount}건 처리`);
+  await slack(`🎉 [${EPIC_KEY}] ${EPIC_LABEL} 연속 개발 완료 — 하위 태스크 ${doneCount}건 처리`);
   history(EPIC_KEY, "done");
   finish("done", `하위 태스크 ${doneCount}건 완료`);
 })().catch(async (e) => {
   log(`오류: ${String((e && e.stack) || e)}`);
-  await slack(`❌ [${EPIC_KEY}] 에픽 연속 개발 오류 — ${String((e && e.message) || e)}`);
+  await slack(`❌ [${EPIC_KEY}] ${EPIC_LABEL} 연속 개발 오류 — ${String((e && e.message) || e)}`);
   history(EPIC_KEY, "failed");
   finish("paused", String((e && e.message) || e), 1);
 });

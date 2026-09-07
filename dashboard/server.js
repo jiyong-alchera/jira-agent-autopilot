@@ -320,6 +320,26 @@ async function jiraReq(method, urlPath, body, cfg, cred) {
   if (!res.ok) throw new Error(`Jira ${res.status}: ${txt.slice(0, 400)}`);
   return txt ? JSON.parse(txt) : {};
 }
+// 프로젝트 이슈 타입 메타 — 에픽 계층 타입(에픽·워크스트림 …)을 알아내려고 자주 부르므로 캐시한다.
+// "메타 새로고침"(/api/jira/meta)은 force 로 캐시를 갱신한다.
+const ISSUE_TYPE_TTL_MS = 5 * 60 * 1000;
+const issueTypeCache = new Map();   // projectId -> { at, types }
+async function projectIssueTypes(cfg, cred, force) {
+  const hit = issueTypeCache.get(cfg.id);
+  if (!force && hit && Date.now() - hit.at < ISSUE_TYPE_TTL_MS) return hit.types;
+  if (!cfg.projectKey) throw new Error("프로젝트 키가 설정되지 않았습니다.");
+  const proj = await jiraReq("GET", `/rest/api/3/project/${encodeURIComponent(cfg.projectKey)}`, null, cfg, cred);
+  const types = (proj.issueTypes || []).map((t) => ({ id: t.id, name: t.name, subtask: !!t.subtask, hierarchyLevel: t.hierarchyLevel }));
+  issueTypeCache.set(cfg.id, { at: Date.now(), types });
+  return types;
+}
+// 이 프로젝트의 에픽 계층 타입과 표시 이름. 메타 조회에 실패해도 기본값으로 진행한다.
+async function epicTypeInfo(cfg, cred, force) {
+  let types = [];
+  try { types = await projectIssueTypes(cfg, cred, force); } catch {}
+  return { types, label: lib.epicTypeLabel(types) };
+}
+
 // ----- PR 병합(rebase) — gh CLI 결정적 실행 + Jira 완료 전환 -----
 function ghEnv(cred) { const e = { ...process.env }; if (cred && cred.githubToken) { e.GH_TOKEN = cred.githubToken; e.GITHUB_TOKEN = cred.githubToken; } return e; }
 function ownerRepo(url) { const m = String(url || "").replace(/\.git$/, "").match(/[:/]([^/:]+\/[^/]+?)$/); return m ? m[1] : null; }
@@ -675,22 +695,27 @@ function writeEpicOpts(cfg, key, next) {
   return o;
 }
 function runEpicLoop(epicKey, projectId, opts) {
-  const { repos, reviewLoopMax, resumeStep, resumeKey, autoMerge, autoMergeAfterMin } = opts || {};
+  const { repos, reviewLoopMax, resumeStep, resumeKey, autoMerge, autoMergeAfterMin, epicLabel } = opts || {};
+  const label = epicLabel || lib.EPIC_LABEL_FALLBACK;
   const script = path.join(SCRIPTS_DIR, "run-epic-loop.js");
   if (!fs.existsSync(script)) return { ok: false, message: `스크립트를 찾을 수 없습니다: ${script}` };
+  // 빈 목록은 '전체'가 아니다 — 러너도 거부하지만 여기서 먼저 막아 사용자에게 이유를 준다.
+  if (!(repos || []).length) return { ok: false, message: "대상 repo 가 없습니다. repo 를 골라 새로 시작하세요." };
   const logPath = path.join(SCRIPTS_DIR, "loop-epic.log");
   let fd;
   try {
     fd = fs.openSync(logPath, "a");
-    fs.writeSync(fd, `[${new Date().toISOString()}] (에픽 연속 개발)${resumeStep ? ` RESUME(${resumeStep})` : " START"}: ${epicKey} [${projectId}] repos=${(repos || []).join(",") || "(전체)"}\n`);
+    fs.writeSync(fd, `[${new Date().toISOString()}] (${label} 연속 개발)${resumeStep ? ` RESUME(${resumeStep})` : " START"}: ${epicKey} [${projectId}] repos=${(repos || []).join(",") || "(전체)"}\n`);
   } catch (e) { return { ok: false, message: String(e.message || e) }; }
   const env = scriptEnv(projectId);
   env.EPIC_REPOS = (repos || []).join(",");
   env.REVIEW_LOOP_MAX = String(reviewLoopMax || clampReviewLoopMax(null, getConfig(projectId)));
+  env.EPIC_CI_LOOP_MAX = String(lib.clampCiLoopMax(null, getConfig(projectId)));
   if (resumeStep) env.EPIC_RESUME_STEP = resumeStep;
   if (resumeKey) env.EPIC_RESUME_KEY = resumeKey;
   env.EPIC_AUTO_MERGE = autoMerge ? "1" : "";
   env.EPIC_AUTO_MERGE_AFTER_MIN = String(lib.clampAutoMergeMin(autoMergeAfterMin));
+  env.EPIC_LABEL = label;
   const proc = spawn("node", [script, epicKey], { cwd: SCRIPTS_DIR, env, detached: true, stdio: ["ignore", fd, fd] });
   try { fs.closeSync(fd); } catch {}
   proc.unref();
@@ -778,6 +803,7 @@ async function retryPausedEpics() {
       const resumeKey = (st.current && st.current.key) || "";
       const opts2 = readEpicOpts(cfg, key);
       const r = runEpicLoop(key, cfg.id, {
+        epicLabel: st.label,
         repos: st.repos || [], reviewLoopMax: clampReviewLoopMax(null, cfg),
         resumeStep, resumeKey, ...opts2,
       });
@@ -800,14 +826,15 @@ async function retryPausedEpics() {
   return out;
 }
 
-// 프로젝트의 에픽 목록(연속 개발 시작 폼용)
+// 연속 개발 대상(에픽 계층) 카드 목록 — 프로젝트가 그 계층을 뭐라 부르든(에픽·워크스트림 …) 동일하게 뜬다.
 app.get("/api/epics", async (req, res) => {
   try {
     const { cfg, cred } = resolveProject(req);
     if (!cfg.projectKey) throw new Error("프로젝트 키가 설정되지 않았습니다.");
-    const data = await jiraSearch(`project = "${cfg.projectKey}" AND issuetype = Epic ORDER BY created DESC`, cfg, cred);
+    const { types, label } = await epicTypeInfo(cfg, cred);
+    const data = await jiraSearch(lib.epicSearchJql(cfg.projectKey, types), cfg, cred);
     const epics = (data.issues || []).map((i) => ({ key: i.key, summary: i.fields.summary, status: i.fields.status?.name || "" }));
-    res.json({ ok: true, epics });
+    res.json({ ok: true, epics, label });
   } catch (e) { fail(res, e); }
 });
 // 에픽의 미완료 하위 태스크(생성순) + 각 카드의 시작 단계
@@ -835,14 +862,15 @@ app.get("/api/epics/:key/run", (req, res) => {
   catch (e) { fail(res, e); }
 });
 // 에픽 연속 개발 시작 — body { repos:[name], reviewLoopMax? }. 에픽당 1개만 실행된다.
-app.post("/api/epics/:key/run", (req, res) => {
+app.post("/api/epics/:key/run", async (req, res) => {
   const key = req.params.key;
   const b = req.body || {};
   if (!/^[A-Z][A-Z0-9]+-[0-9]+$/.test(key)) return res.status(400).json({ ok: false, message: "이슈 키 형식 오류" });
   try {
-    const { id, cfg } = resolveProject(req);
+    const { id, cfg, cred } = resolveProject(req);
+    const { label: epicLabel } = await epicTypeInfo(cfg, cred);
     const cur = epicRunStatus(cfg, key);
-    if (cur.running) return res.json({ ok: false, message: `이미 에픽 연속 개발이 실행 중입니다 (${cur.current ? cur.current.key : ""} · ${cur.step || ""})` });
+    if (cur.running) return res.json({ ok: false, message: `이미 ${epicLabel} 연속 개발이 실행 중입니다 (${cur.current ? cur.current.key : ""} · ${cur.step || ""})` });
     const names = normalizeRepos(cfg).map((r) => r.name);
     const repos = (Array.isArray(b.repos) ? b.repos : []).map(String).filter((n) => names.includes(n));
     if (!repos.length) return res.json({ ok: false, message: "대상 repo 를 1개 이상 선택하세요." });
@@ -851,7 +879,7 @@ app.post("/api/epics/:key/run", (req, res) => {
     const reviewLoopMax = clampReviewLoopMax(b.reviewLoopMax, cfg);
     const opts = writeEpicOpts(cfg, key, { autoMerge: b.autoMerge, autoMergeAfterMin: b.autoMergeAfterMin, autoRetry: b.autoRetry, autoRetryMax: b.autoRetryMax });
     clearEpicRetry(cfg, key);   // 새 실행이므로 재시도 카운터 초기화
-    res.json({ ...runEpicLoop(key, id, { repos, reviewLoopMax, ...opts }), repos, reviewLoopMax, opts });
+    res.json({ ...runEpicLoop(key, id, { repos, reviewLoopMax, epicLabel, ...opts }), repos, reviewLoopMax, opts, label: epicLabel });
   } catch (e) { fail(res, e); }
 });
 // 멈춘(paused/stopped) 에픽을 이어서 진행 — body.skip=true 면 멈춘 단계를 건너뛰고 다음 단계부터.
@@ -864,6 +892,9 @@ app.post("/api/epics/:key/run/resume", (req, res) => {
     if (cur.running) return res.json({ ok: false, message: "이미 실행 중입니다." });
     if (!cur.epic) return res.json({ ok: false, message: "이어서 진행할 이전 실행 기록이 없습니다. 새로 시작하세요." });
     if (!["paused", "stopped"].includes(cur.status)) return res.json({ ok: false, message: `이어서 진행할 수 있는 상태가 아닙니다(${cur.status}). 새로 시작하세요.` });
+    if (!(cur.repos || []).length) {
+      return res.json({ ok: false, message: "이전 실행의 대상 repo 기록이 없어 이어서 진행할 수 없습니다(전체로 넓히지 않습니다). repo 를 골라 새로 시작하세요." });
+    }
     const skip = !!(req.body && req.body.skip);
     const step = skip ? lib.nextEpicStep(cur.step) : cur.step;
     if (skip && !step) return res.json({ ok: false, message: "마지막 단계라 건너뛸 수 없습니다." });
@@ -871,7 +902,7 @@ app.post("/api/epics/:key/run/resume", (req, res) => {
     // 재개 단계는 '멈췄던 그 카드' 에만 적용한다(그 사이 사람이 카드를 끝냈으면 다른 카드에 잘못 붙지 않도록)
     const resumeKey = (cur.current && cur.current.key) || "";
     const opts = readEpicOpts(cfg, key);   // 재개는 저장된 자동 병합 설정을 그대로 이어간다
-    res.json({ ...runEpicLoop(key, id, { repos: cur.repos || [], reviewLoopMax, resumeStep: step || "", resumeKey, ...opts }), resumedAt: step || "(현재 단계 재판정)", opts });
+    res.json({ ...runEpicLoop(key, id, { repos: cur.repos || [], reviewLoopMax, resumeStep: step || "", resumeKey, epicLabel: cur.label, ...opts }), resumedAt: step || "(현재 단계 재판정)", opts });
   } catch (e) { fail(res, e); }
 });
 // 자동 병합 옵션 변경 — 실행 중에도 즉시 반영된다(러너가 await-merge 폴링마다 옵션 파일을 다시 읽음).
@@ -950,9 +981,12 @@ async function listCardPRs(repos, key, cred) {
   const out = [];
   for (const repo of repos) {
     const or = ownerRepo(repo.url); if (!or) continue;
-    const list = await gh(["pr", "list", "--repo", or, "--search", key, "--state", "all", "--json", "number,url,title,state,headRefName,baseRefName,isDraft,author,createdAt,mergeable,mergeStateStatus"], cred);
-    let prs = []; try { prs = JSON.parse(list.stdout || "[]"); } catch {}
-    for (const pr of prs) out.push({ repo: repo.name, owner: or, number: pr.number, url: pr.url, title: pr.title, state: pr.state, branch: pr.headRefName || "", base: pr.baseRefName || "", isDraft: !!pr.isDraft, author: (pr.author && pr.author.login) || "", createdAt: pr.createdAt || "", mergeable: pr.mergeable || "UNKNOWN", mergeState: pr.mergeStateStatus || "UNKNOWN" });
+    const list = await gh(["pr", "list", "--repo", or, "--search", key, "--state", "all", "--json", "number,url,title,state,headRefName,baseRefName,isDraft,author,createdAt,mergeable,mergeStateStatus,statusCheckRollup"], cred);
+    // 조회 실패를 'PR 없음'으로 삼키면 안 된다. gh 검색은 분당 30회 제한에 걸리면 빈손으로 돌아오는데,
+    // 그걸 '이 카드엔 PR 이 없다'로 읽어 자동 병합이 아무것도 못 찾고 실패한 적이 있다(원인도 안 남았다).
+    if (!list.ok) throw new Error(`${repo.name}: PR 목록 조회 실패 — ${(list.stderr || "").trim().slice(0, 160)}`);
+    let prs = []; try { prs = JSON.parse(list.stdout || "[]"); } catch (e) { throw new Error(`${repo.name}: PR 목록 파싱 실패 — ${e.message}`); }
+    for (const pr of prs) out.push({ repo: repo.name, owner: or, number: pr.number, url: pr.url, title: pr.title, state: pr.state, branch: pr.headRefName || "", base: pr.baseRefName || "", isDraft: !!pr.isDraft, author: (pr.author && pr.author.login) || "", createdAt: pr.createdAt || "", mergeable: pr.mergeable || "UNKNOWN", mergeState: pr.mergeStateStatus || "UNKNOWN", ci: lib.ciStateOf(pr.statusCheckRollup), ciFailed: lib.failedChecks(pr.statusCheckRollup) });
   }
   return out;
 }
@@ -1071,11 +1105,31 @@ app.post("/api/cards/:key/merge", async (req, res) => {
       // 개별 지정이 아닐 때는 '이 카드의 PR' 로 한정한다 — 본문에 이 키를 언급한 형제 카드의 PR 이
       // --search 로 섞여 들어와 함께 병합되는 것을 막는다.
       targets = allPRs.filter((p) => (!botLogin || p.author === botLogin) && lib.prBelongsToCard(p, key));
+      // 대상이 없으면 '왜 없는지'를 실어 보낸다. 예전엔 ok:false 만 돌려보내 호출부(에픽 러너)가
+      // 사유 자리에 상태코드를 찍었다 — 로그에 'HTTP 200' 만 남아 원인을 못 찾았다.
+      if (!targets.length) {
+        const mine = allPRs.filter((p) => lib.prBelongsToCard(p, key));
+        return res.json({
+          ok: false, merged: 0, errors: [],
+          message: mine.length
+            ? `이 카드의 PR ${mine.length}건이 모두 자동화(${botLogin || "봇"}) PR 이 아닙니다. 사람 PR 은 개별 선택으로 병합하세요.`
+            : `이 카드(${key})의 PR 을 찾지 못했습니다. repo ${repos.length}개를 검색했습니다 — PR 이 아직 없거나 GitHub 검색이 일시적으로 실패했을 수 있습니다.`,
+        });
+      }
     }
     const mergedUrls = [], branches = [], errors = [];
     for (const pr of targets) {
       if (pr.state === "MERGED") { mergedUrls.push(pr.url); branches.push(pr.branch); continue; }
       if (pr.state !== "OPEN") continue;
+      // CI 게이트 — 빨간 채로 병합하지 않는다. develop 에 브랜치 보호가 없는 repo 에서는
+      // GitHub 가 막아주지 않으므로 여기가 유일한 방어선이다. force 는 사람이 확인하고 넘길 때만.
+      if (!body.force && (pr.ci === "fail" || pr.ci === "pending")) {
+        const names = (pr.ciFailed || []).map((f) => f.name).join(", ");
+        errors.push(pr.ci === "fail"
+          ? `${pr.repo} #${pr.number}: CI 실패로 병합하지 않았습니다${names ? ` (${names})` : ""}`
+          : `${pr.repo} #${pr.number}: CI 가 아직 진행 중이라 병합하지 않았습니다`);
+        continue;
+      }
       const r = await gh(["pr", "merge", String(pr.number), "--repo", pr.owner, "--rebase", "--delete-branch"], cred);
       if (r.ok) { mergedUrls.push(pr.url); branches.push(pr.branch); } else errors.push(`${pr.repo} #${pr.number}: ${(r.stderr || "").trim().slice(0, 160)}`);
     }
@@ -1253,14 +1307,13 @@ app.get("/api/jira/meta", async (req, res) => {
   try {
     const { cfg, cred } = resolveProject(req);
     if (!cfg.projectKey) throw new Error("프로젝트 키가 설정되지 않았습니다.");
-    const proj = await jiraReq("GET", `/rest/api/3/project/${encodeURIComponent(cfg.projectKey)}`, null, cfg, cred);
-    const issueTypes = (proj.issueTypes || []).map((t) => ({ id: t.id, name: t.name, subtask: !!t.subtask, hierarchyLevel: t.hierarchyLevel }));
+    const issueTypes = await projectIssueTypes(cfg, cred, true);   // 명시적 새로고침이므로 캐시를 갱신
     let epics = [];
     try {
-      const data = await jiraSearch(`project = "${cfg.projectKey}" AND issuetype = Epic ORDER BY created DESC`, cfg, cred);
+      const data = await jiraSearch(lib.epicSearchJql(cfg.projectKey, issueTypes), cfg, cred);
       epics = (data.issues || []).map((i) => ({ key: i.key, summary: i.fields.summary }));
     } catch {}
-    res.json({ ok: true, projectKey: cfg.projectKey, issueTypes, epics });
+    res.json({ ok: true, projectKey: cfg.projectKey, issueTypes, epics, epicLabel: lib.epicTypeLabel(issueTypes) });
   } catch (e) { fail(res, e); }
 });
 

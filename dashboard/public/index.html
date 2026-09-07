@@ -163,6 +163,18 @@ const stageBadge = {
   "done": ["완료", "bg-emerald-500/20 text-emerald-300 border-emerald-500/40"],
 };
 const loopStepLabel = { starting: "준비 중", rework: "반영 중", review: "리뷰 중" };   // 리뷰 승인 루프 진행 단계
+// PR 의 CI(체크) 상태 배지. 자동 병합이 이 상태를 게이트로 쓴다 — 빨갛거나 아직 도는 중이면 병합하지 않는다.
+const ciBadge = {
+  pass: ["✓ CI 통과", "bg-emerald-500/15 text-emerald-300 border-emerald-500/40", "모든 체크 통과"],
+  fail: ["✗ CI 실패", "bg-rose-500/20 text-rose-300 border-rose-500/50", "실패한 체크가 있어 병합하지 않습니다"],
+  pending: ["… CI 진행중", "bg-slate-600/30 text-slate-300 border-slate-600", "체크가 아직 돌고 있습니다"],
+};
+function CiBadge({ pr }) {
+  const b = ciBadge[pr && pr.ci];
+  if (!b) return null;   // "none"(체크가 없는 repo) 이거나 아직 조회 전
+  const names = ((pr.ciFailed || []).map((f) => f.name).join(", "));
+  return <span title={names ? `${b[2]}: ${names}` : b[2]} className={`text-[10px] px-1.5 py-0.5 rounded-full border ${b[1]}`}>{b[0]}</span>;
+}
 const resultBadge = {
   "success": ["성공", "bg-emerald-500/20 text-emerald-300 border-emerald-500/40"],
   "skip": ["스킵(답변대기)", "bg-slate-500/20 text-slate-300 border-slate-500/40"],
@@ -344,7 +356,7 @@ function ProjectCard({ proj, onDeleted, flash, jumpTo }) {
   const [config, setConfig] = useState(proj);
   const [creds, setCreds] = useState({});
   const [credInput, setCredInput] = useState({ anthropicApiKey: "", openaiApiKey: "", geminiApiKey: "", githubToken: "", atlassianEmail: "", atlassianToken: "", slackWebhookUrl: "" });
-  const [jiraMeta, setJiraMeta] = useState({ issueTypes: [], epics: [], loaded: false, err: "" });
+  const [jiraMeta, setJiraMeta] = useState({ issueTypes: [], epics: [], epicLabel: "에픽", loaded: false, err: "" });
   const [jiraStatuses, setJiraStatuses] = useState({ list: [], loaded: false, err: "" });   // 상태→단계 매핑 UI용
   const [newCard, setNewCard] = useState({ issueType: "", summary: "", description: "", epicKey: "", parentInput: "", addTriggerLabel: true, assignSelf: true, attachments: [], repos: [], env: "" });
   const [creating, setCreating] = useState(false);
@@ -388,8 +400,8 @@ function ProjectCard({ proj, onDeleted, flash, jumpTo }) {
   };
   const loadMeta = async () => {
     const r = await api.get(withP("/api/jira/meta"));
-    if (r.ok) { setJiraMeta({ issueTypes: r.issueTypes || [], epics: r.epics || [], loaded: true, err: "" }); setNewCard((p) => p.issueType ? p : { ...p, issueType: (r.issueTypes.find((t) => t.name === "Task") || r.issueTypes[0] || {}).name || "" }); }
-    else setJiraMeta({ issueTypes: [], epics: [], loaded: true, err: r.message || "메타 조회 실패" });
+    if (r.ok) { setJiraMeta({ issueTypes: r.issueTypes || [], epics: r.epics || [], epicLabel: r.epicLabel || "에픽", loaded: true, err: "" }); setNewCard((p) => p.issueType ? p : { ...p, issueType: (r.issueTypes.find((t) => t.name === "Task") || r.issueTypes[0] || {}).name || "" }); }
+    else setJiraMeta({ issueTypes: [], epics: [], epicLabel: "에픽", loaded: true, err: r.message || "메타 조회 실패" });
   };
   const loadStatuses = async () => {
     const r = await api.get(withP("/api/jira/statuses"));
@@ -562,8 +574,10 @@ function ProjectCard({ proj, onDeleted, flash, jumpTo }) {
     setPrs((p) => (p && p.key === key) ? { key, loading: false, list: r.ok ? (r.prs || []) : [], botLogin: r.botLogin || "", err: r.ok ? "" : (r.message || "조회 실패") } : p);
   };
   const mergeOnePr = async (key, pr) => {
-    if (!window.confirm(`${pr.repo} #${pr.number} (${pr.isBot ? "자동화" : "사람"} @${pr.author}) 을(를) rebase merge 할까요?`)) return;
-    const r = await api.post(`/api/cards/${key}/merge`, { owner: pr.owner, number: pr.number, project: PID });
+    const ciNote = pr.ci === "fail" ? `\n\n⚠️ CI 실패 상태입니다${(pr.ciFailed || []).length ? ` (${pr.ciFailed.map((f) => f.name).join(", ")})` : ""}.`
+      : pr.ci === "pending" ? "\n\n⚠️ CI 가 아직 진행 중입니다." : "";
+    if (!window.confirm(`${pr.repo} #${pr.number} (${pr.isBot ? "자동화" : "사람"} @${pr.author}) 을(를) rebase merge 할까요?${ciNote}`)) return;
+    const r = await api.post(`/api/cards/${key}/merge`, { owner: pr.owner, number: pr.number, project: PID, force: pr.ci === "fail" || pr.ci === "pending" });
     if (r.ok) flash(`#${pr.number} 병합${r.doneStatus ? ` · 카드 완료(${r.doneStatus})` : ""}${r.removed?.length ? ` · clone 정리` : ""}`);
     else flash(r.message || (r.errors?.length ? r.errors[0] : "병합 실패"));
     loadPrs(key); loadCards();
@@ -769,7 +783,7 @@ function ProjectCard({ proj, onDeleted, flash, jumpTo }) {
           <Field label="요약 (필수)" value={newCard.summary} onChange={(v) => setNewCard({ ...newCard, summary: v })} placeholder="카드 제목"
             info={"생성할 카드의 제목(summary)입니다. 필수 항목이에요.\n\n작업 내용을 한 줄로 명확히 적으세요. 상세 요구사항은 카드 생성 후 설명·코멘트로 보강할 수 있습니다."} />
           <label className="block mb-3">
-            <span className="text-sm text-slate-400 inline-flex items-center gap-1">상위 에픽 (드롭다운)<InfoTip title="상위 에픽" text={"이 카드를 소속시킬 상위 에픽을 선택합니다(선택 사항).\n\n'메타 새로고침'으로 프로젝트의 에픽 목록을 불러옵니다. 아래 '상위 키 직접 입력'에 값이 있으면 그쪽이 우선 적용됩니다."} /></span>
+            <span className="text-sm text-slate-400 inline-flex items-center gap-1">상위 {jiraMeta.epicLabel} (드롭다운)<InfoTip title={`상위 ${jiraMeta.epicLabel}`} text={`이 카드를 소속시킬 상위 ${jiraMeta.epicLabel}을(를) 선택합니다(선택 사항).\n\n'메타 새로고침'으로 프로젝트의 ${jiraMeta.epicLabel} 목록을 불러옵니다. 아래 '상위 키 직접 입력'에 값이 있으면 그쪽이 우선 적용됩니다.`} /></span>
             <select value={newCard.epicKey} onChange={(e) => setNewCard({ ...newCard, epicKey: e.target.value })}
               className="mt-1 w-full bg-slate-800 border border-slate-600 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-indigo-400">
               <option value="">(상위 없음)</option>
@@ -777,7 +791,7 @@ function ProjectCard({ proj, onDeleted, flash, jumpTo }) {
             </select>
           </label>
           <Field label="또는 상위 키 직접 입력 (우선 적용)" value={newCard.parentInput} onChange={(v) => setNewCard({ ...newCard, parentInput: v })} placeholder="예: EKYB-123"
-            info={"상위 이슈 키를 직접 입력합니다(드롭다운보다 우선 적용).\n\n계층 규칙: 상위는 자식보다 한 단계 위여야 합니다 — 에픽 > 작업/스토리/버그 > 하위작업(Subtask).\n• 버그·작업·스토리를 다른 카드의 하위로 두려면 이슈 타입을 'Subtask(하위 작업)'으로 선택하세요.\n• 작업/스토리를 두려면 상위는 에픽이어야 합니다."} />
+            info={"상위 이슈 키를 직접 입력합니다(드롭다운보다 우선 적용).\n\n계층 규칙: 상위는 자식보다 한 단계 위여야 합니다 — 에픽 계층(에픽·워크스트림 등) > 작업/스토리/버그 > 하위작업(Subtask).\n• 버그·작업·스토리를 다른 카드의 하위로 두려면 이슈 타입을 'Subtask(하위 작업)'으로 선택하세요.\n• 작업/스토리를 두려면 상위는 에픽 계층 카드여야 합니다."} />
         </div>
         <div className="mb-3">
           <div className="flex items-center justify-between mb-1">
@@ -1088,6 +1102,7 @@ function ProjectCard({ proj, onDeleted, flash, jumpTo }) {
                                                 {pr.state === "OPEN" && pr.mergeable !== "CONFLICTING" && pr.mergeState === "BEHIND" && <span className="text-[10px] px-1.5 py-0.5 rounded-full border bg-amber-500/20 text-amber-300 border-amber-500/50" title="base 브랜치가 앞서 있습니다(충돌 아님). 최신 base 반영이 필요할 수 있습니다.">⟳ base 갱신됨</span>}
                                                 {pr.state === "OPEN" && pr.mergeable === "MERGEABLE" && pr.mergeState === "CLEAN" && <span className="text-[10px] px-1.5 py-0.5 rounded-full border bg-emerald-500/15 text-emerald-300 border-emerald-500/40" title="충돌 없이 병합 가능">✓ 병합 가능</span>}
                                                 {pr.state === "OPEN" && pr.mergeable === "UNKNOWN" && <span className="text-[10px] px-1.5 py-0.5 rounded-full border bg-slate-600/30 text-slate-400 border-slate-600" title="GitHub 가 병합 가능 여부를 아직 계산 중입니다. 잠시 후 새로고침하세요.">병합상태 확인중</span>}
+                                                {pr.state === "OPEN" && <CiBadge pr={pr} />}
                                               </div>
                                               <div className="text-[11px] text-slate-300 mt-0.5 truncate">{pr.title}</div>
                                               <div className="text-[10px] text-slate-500 font-mono truncate">{pr.branch}{pr.base ? <span className="text-slate-600"> → {pr.base}</span> : null}</div>
@@ -1282,23 +1297,27 @@ function EpicPrs({ pid, cardKey, step, flash, onMerged }) {
   const blocked = open.filter((p) => p.mergeable === "CONFLICTING");
 
   const afterMerge = async (msg) => { flash(msg); await load(); if (onMerged) onMerged(); };
+  // 사람이 확인창에서 '그래도 진행'을 고르면 force 로 보낸다 — 자동 병합에는 없는 우회로다(서버가 막는 건 동일).
+  const ciWarn = (p) => (p.ci === "fail" ? `⚠️ CI 실패 상태입니다${(p.ciFailed || []).length ? ` (${p.ciFailed.map((f) => f.name).join(", ")})` : ""}.\n`
+    : p.ci === "pending" ? "⚠️ CI 가 아직 진행 중입니다.\n" : "");
+  const ciForce = (p) => p.ci === "fail" || p.ci === "pending";
   const mergeOne = async (p) => {
-    if (!window.confirm(`${p.repo} #${p.number} — "${p.title}"\n${p.approved ? "" : "⚠️ 아직 리뷰 승인 마커가 없습니다.\n"}${p.mergeable === "CONFLICTING" ? "⚠️ base 충돌 상태입니다.\n" : ""}\nrebase merge 하고 브랜치를 삭제합니다. 진행할까요?`)) return;
+    if (!window.confirm(`${p.repo} #${p.number} — "${p.title}"\n${p.approved ? "" : "⚠️ 아직 리뷰 승인 마커가 없습니다.\n"}${p.mergeable === "CONFLICTING" ? "⚠️ base 충돌 상태입니다.\n" : ""}${ciWarn(p)}\nrebase merge 하고 브랜치를 삭제합니다. 진행할까요?`)) return;
     setBusy(idOf(p));
     try {
-      const r = await api.post(`/api/cards/${cardKey}/merge`, { owner: p.owner, number: p.number, project: pid });
+      const r = await api.post(`/api/cards/${cardKey}/merge`, { owner: p.owner, number: p.number, project: pid, force: ciForce(p) });
       await afterMerge(r.ok ? `#${p.number} 병합${r.doneStatus ? ` · 카드 완료(${r.doneStatus})` : ""}` : (r.message || (r.errors || [])[0] || "병합 실패"));
     } finally { setBusy(""); }
   };
   const mergeMany = async (targets, label) => {
     if (!targets.length) return;
-    const list = targets.map((p) => `  · ${p.repo} #${p.number}${p.approved ? "" : " (미승인)"}${p.mergeable === "CONFLICTING" ? " (충돌)" : ""}`).join("\n");
+    const list = targets.map((p) => `  · ${p.repo} #${p.number}${p.approved ? "" : " (미승인)"}${p.mergeable === "CONFLICTING" ? " (충돌)" : ""}${p.ci === "fail" ? " (CI 실패)" : p.ci === "pending" ? " (CI 진행중)" : ""}`).join("\n");
     if (!window.confirm(`${label} — PR ${targets.length}건을 rebase merge 합니다.\n\n${list}\n\n진행할까요?`)) return;
     setBusy(label);
     try {
       const results = [];
       for (const p of targets) {   // 순차 — 실패한 것만 남겨 사유를 보여준다
-        const r = await api.post(`/api/cards/${cardKey}/merge`, { owner: p.owner, number: p.number, project: pid });
+        const r = await api.post(`/api/cards/${cardKey}/merge`, { owner: p.owner, number: p.number, project: pid, force: ciForce(p) });
         results.push({ p, ok: r.ok, msg: r.message || (r.errors || [])[0] || "", doneStatus: r.doneStatus });
       }
       const okN = results.filter((x) => x.ok).length;
@@ -1359,6 +1378,8 @@ function EpicPrs({ pid, cardKey, step, flash, onMerged }) {
               {p.mergeable !== "CONFLICTING" && p.mergeState === "BEHIND" && <Badge cls="bg-amber-500/20 text-amber-300 border-amber-500/50" title="base 가 앞서 있음(충돌 아님)">⟳ base 갱신됨</Badge>}
               {p.mergeable === "MERGEABLE" && p.mergeState === "CLEAN" && <Badge cls="bg-emerald-500/15 text-emerald-300 border-emerald-500/40" title="충돌 없이 병합 가능">✓ 병합 가능</Badge>}
               {p.mergeable === "UNKNOWN" && <Badge cls="bg-slate-600/30 text-slate-400 border-slate-600" title="GitHub 가 계산 중">확인중</Badge>}
+              <CiBadge pr={p} />
+
               <button disabled={!!busy} onClick={() => mergeOne(p)}
                 className="text-[11px] px-2 py-0.5 rounded border border-teal-500/40 text-teal-300 hover:bg-teal-500/10 disabled:opacity-35 transition shrink-0">
                 {busy === id ? "병합 중…" : "병합"}
@@ -1383,18 +1404,23 @@ function EpicPrs({ pid, cardKey, step, flash, onMerged }) {
   );
 }
 
-// 에픽 연속 개발 패널 — 에픽 하위 태스크를 생성순으로 하나씩 개발→PR→리뷰 승인→병합 대기로 이어간다.
+// 연속 개발 패널 — 상위 카드(에픽 계층: 에픽·워크스트림 …) 하위 태스크를 생성순으로 하나씩
+// 개발→PR→리뷰 승인→병합 대기로 이어간다. 화면 용어는 프로젝트 이슈 타입 이름을 그대로 쓴다.
 // 진행 상태는 <EPIC>.epic.json 을 5초 폴링. 중단(paused)되면 사유와 [이어서 진행]/[건너뛰기] 를 띄운다.
 const EPIC_STEP_LABEL = {
   prepare: "라벨 준비", plan: "plan(질문)", adopt: "제안 답변 채택",
-  build: "개발·PR·리뷰 승인", approve: "리뷰 승인 확인", "await-merge": "PR 병합 대기",
+  build: "개발·PR·리뷰 승인", ci: "CI 확인·수정", approve: "리뷰 승인 확인", "await-merge": "PR 병합 대기",
 };
 function EpicPanel({ projects, flash }) {
   const [pid, setPid] = useState((projects[0] || {}).id || "");
   const [epics, setEpics] = useState([]);
+  const [epicLabel, setEpicLabel] = useState("에픽");   // 이 프로젝트가 에픽 계층을 부르는 이름
   const [epicKey, setEpicKey] = useState("");
   const [children, setChildren] = useState(null);
   const [repos, setRepos] = useState([]);          // 선택된 repo name
+  // 중단 상태에서 repo 체크박스는 잠근다 — [이어서 진행]은 시작 시점 repo 를 쓰므로, 열어두면
+  // 바꾼 값이 반영되는 것처럼 보이지만 무시된다. 바꾸려면 이 모드로 들어와 '새 실행'으로만 적용한다.
+  const [newRunMode, setNewRunMode] = useState(false);
   const [run, setRun] = useState({ running: false, status: "idle" });
   const [busy, setBusy] = useState("");
   const repoTouched = React.useRef(false);   // 사용자가 체크를 직접 바꿨는지(폴링이 덮어쓰지 않도록)
@@ -1410,7 +1436,8 @@ function EpicPanel({ projects, flash }) {
     if (!id) { setEpics([]); return; }
     const r = await api.get(`/api/epics?project=${encodeURIComponent(id)}`);
     setEpics(r.ok ? (r.epics || []) : []);
-    if (!r.ok) flash(r.message || "에픽 조회 실패");
+    setEpicLabel((r.ok && r.label) || "에픽");
+    if (!r.ok) flash(r.message || "상위 카드 조회 실패");
   };
   const loadChildren = async (key) => {
     if (!key) { setChildren(null); return; }
@@ -1424,6 +1451,7 @@ function EpicPanel({ projects, flash }) {
     if (!r.ok) return;
     const st = r.run || { running: false, status: "idle" };
     setRun(st);
+    if (st.label) setEpicLabel(st.label);
     // 진행 중이거나 중단된 실행은 '그 실행이 실제로 쓰는 repo' 가 진실 — 기본값(전체 선택)으로 덮어쓰지 않는다.
     // (이걸 안 하면 3개만 골라 돌려도 패널엔 5개 전부 체크된 것처럼 보인다)
     if (st.opts) {
@@ -1443,9 +1471,9 @@ function EpicPanel({ projects, flash }) {
     }
   }, [pid, epicKey]);
 
-  useEffect(() => { setEpicKey(""); setChildren(null); setRun({ running: false, status: "idle" }); repoTouched.current = false; loadEpics(pid); }, [pid]);
+  useEffect(() => { setEpicKey(""); setChildren(null); setRun({ running: false, status: "idle" }); repoTouched.current = false; setNewRunMode(false); loadEpics(pid); }, [pid]);
   useEffect(() => { setRepos(repoNames); }, [pid, (proj && (proj.repos || []).length) || 0]);   // 새 실행의 기본은 전체 선택(loadRun 이 진행 중 실행의 실제 repo 로 덮어씀)
-  useEffect(() => { repoTouched.current = false; loadChildren(epicKey); loadRun(); }, [epicKey]);
+  useEffect(() => { repoTouched.current = false; setNewRunMode(false); loadChildren(epicKey); loadRun(); }, [epicKey]);
   useEffect(() => { const t = setInterval(loadRun, 5000); return () => clearInterval(t); }, [loadRun]);
 
   const act = async (name, fn) => {
@@ -1453,10 +1481,17 @@ function EpicPanel({ projects, flash }) {
     try { const r = await fn(); flash(r.ok ? (r.message || `${name} 완료`) : (r.message || `${name} 실패`)); await loadRun(); await loadChildren(epicKey); }
     finally { setBusy(""); }
   };
-  const start = () => act("시작", () => api.post(`/api/epics/${epicKey}/run?project=${encodeURIComponent(pid)}`, {
-    repos, autoMerge, autoMergeAfterMin: parseInt(autoMergeMin, 10) || 60,
-    autoRetry, autoRetryMax: parseInt(autoRetryMax, 10) || 5,
-  }));
+  const start = () => act("시작", async () => {
+    const r = await api.post(`/api/epics/${epicKey}/run?project=${encodeURIComponent(pid)}`, {
+      repos, autoMerge, autoMergeAfterMin: parseInt(autoMergeMin, 10) || 60,
+      autoRetry, autoRetryMax: parseInt(autoRetryMax, 10) || 5,
+    });
+    if (r.ok) { setNewRunMode(false); repoTouched.current = false; }
+    return r;
+  });
+  // 잠금 해제(새 실행용 repo 고르기) / 취소 — 취소하면 폴링이 실행 기록의 repo 로 되돌린다.
+  const enterNewRunMode = () => { setNewRunMode(true); repoTouched.current = false; };
+  const cancelNewRunMode = () => { setNewRunMode(false); repoTouched.current = false; if (Array.isArray(run.repos) && run.repos.length) setRepos(run.repos); };
   const saveOpts = async (patch, label) => {
     const r = await api.post(`/api/epics/${epicKey}/run/options?project=${encodeURIComponent(pid)}`, patch);
     flash(r.ok ? (r.message || `${label} 저장`) : (r.message || "설정 저장 실패"));
@@ -1474,14 +1509,17 @@ function EpicPanel({ projects, flash }) {
   const stop = () => act("중지", () => api.post(`/api/epics/${epicKey}/run/stop?project=${encodeURIComponent(pid)}`));
 
   const paused = !run.running && (run.status === "paused" || run.status === "stopped");
-  const repoLocked = run.running;   // 실행 중에만 고정. 중단 상태에서는 다른 repo 로 새로 시작할 수 있어야 한다.
+  // 실행 중은 물론 **중단 상태에서도 고정**한다. [이어서 진행]은 시작 시점 repo 를 쓰므로,
+  // 여기서 바꾸게 두면 반영되는 것처럼 보이지만 무시된다(조작 가능한 컨트롤이 거짓말을 하면 안 된다).
+  // 바꾸려면 '다른 repo 로 새로 시작'으로 잠금을 풀고, 그 값은 [연속 개발 시작]에만 적용된다.
+  const repoLocked = run.running || (paused && !newRunMode);
   const finished = !run.running && run.status === "done";
   const cur = run.current;
   const total = run.total || (children && children.items.length) || 0;
   const idx = run.index || 0;
 
   return (
-    <Section title="에픽 연속 개발" collapsible defaultOpen={false}
+    <Section title={`${epicLabel} 연속 개발`} collapsible defaultOpen={false}
       right={<span className="text-xs text-slate-500">하위 태스크를 생성순으로 하나씩 · 개발 → PR → 리뷰 승인 → 병합하면 다음</span>}>
       <div className="grid grid-cols-2 gap-4 mb-3">
         <label className="block">
@@ -1493,12 +1531,12 @@ function EpicPanel({ projects, flash }) {
         </label>
         <label className="block">
           <span className="text-sm text-slate-400 inline-flex items-center gap-1">
-            에픽
-            <InfoTip title="에픽" text={"연속 개발할 상위 에픽입니다.\n에픽 본문(설계안)이 하위 태스크의 plan·build 프롬프트에 함께 주입되어, 모든 태스크가 같은 설계 방향으로 구현됩니다."} />
+            {epicLabel}
+            <InfoTip title={epicLabel} text={`연속 개발할 상위 ${epicLabel}입니다.\n${epicLabel} 본문(설계안)이 하위 태스크의 plan·build 프롬프트에 함께 주입되어, 모든 태스크가 같은 설계 방향으로 구현됩니다.`} />
           </span>
           <select value={epicKey} onChange={(e) => setEpicKey(e.target.value)} disabled={run.running}
             className="mt-1 w-full bg-slate-800 border border-slate-600 rounded-lg px-3 py-2 text-sm disabled:opacity-50 focus:outline-none focus:border-indigo-400">
-            <option value="">— 에픽 선택 —</option>
+            <option value="">— {epicLabel} 선택 —</option>
             {epics.map((ep) => <option key={ep.key} value={ep.key}>{ep.key} · {ep.summary}</option>)}
           </select>
         </label>
@@ -1509,8 +1547,10 @@ function EpicPanel({ projects, flash }) {
           <div className="mb-3">
             <div className="text-xs text-slate-400 mb-1 inline-flex items-center gap-1">
               대상 repo
-              <InfoTip title="대상 repo" text={"에픽 작업이 진행될 레포지토리입니다.\n각 하위 카드에 repo_<name> 라벨로 부여되며, 그 repo 들에서만 개발·PR 이 이뤄집니다.\n\n실행이 시작되면 그 실행에 고정되므로 변경할 수 없고, 체크 표시는 '지금 돌고 있는 실행이 실제로 쓰는 repo' 를 보여줍니다.\n바꾸려면 중지하고 새로 시작하세요."} />
+              <InfoTip title="대상 repo" text={`${epicLabel} 작업이 진행될 레포지토리입니다.\n각 하위 카드에 repo_<name> 라벨로 부여되며, 그 repo 들에서만 개발·PR 이 이뤄집니다.\n\n한 번 시작하면 그 실행에 고정됩니다 — 실행 중이든 중단 상태든 체크박스는 잠기고, 표시되는 값은 '그 실행이 실제로 쓰는 repo' 입니다.\n[이어서 진행]은 언제나 이 repo 로 재개합니다.\n\n다른 repo 로 돌리려면 '다른 repo 로 새로 시작'을 눌러 잠금을 풀고 [연속 개발 시작]으로 새 실행을 만드세요. 이때 이전 실행의 재개 지점은 버려집니다.`} />
               {run.running && <span className="text-[11px] text-slate-500">— 실행에 고정됨 (지금 이 실행이 쓰는 repo)</span>}
+              {paused && !newRunMode && <span className="text-[11px] text-slate-500">— 이 실행에 고정됨 ([이어서 진행]이 쓰는 repo)</span>}
+              {paused && newRunMode && <span className="text-[11px] text-amber-300">— 새 실행용으로 고르는 중</span>}
             </div>
             <div className="flex flex-wrap gap-3">
               {repoNames.length === 0 && <span className="text-xs text-slate-500">프로젝트에 등록된 repo 가 없습니다.</span>}
@@ -1526,7 +1566,20 @@ function EpicPanel({ projects, flash }) {
               })}
             </div>
             {run.running && <p className="text-[11px] text-slate-500 mt-1">실행 중에는 대상 repo 를 바꿀 수 없습니다. 다른 repo 로 돌리려면 중지하고 새로 시작하세요.</p>}
-            {paused && <p className="text-[11px] text-slate-500 mt-1"><b>[이어서 진행]</b> 은 이 실행이 시작할 때 고른 repo 를 그대로 씁니다. 여기서 바꾼 값은 <b>[연속 개발 시작]</b>(새 실행)에만 적용됩니다.</p>}
+            {paused && !newRunMode && (
+              <p className="text-[11px] text-slate-500 mt-1">
+                <b>[이어서 진행]</b> 은 이 실행이 시작할 때 고른 repo 로 재개합니다 — 그래서 여기서는 바꿀 수 없습니다.
+                {" "}<button type="button" onClick={enterNewRunMode}
+                  className="underline text-indigo-300 hover:text-indigo-200">다른 repo 로 새로 시작</button>
+              </p>
+            )}
+            {paused && newRunMode && (
+              <p className="text-[11px] text-amber-300/90 mt-1">
+                고른 repo 는 <b>[연속 개발 시작]</b>(새 실행)에만 적용됩니다. 새로 시작하면 <b>이전 실행의 재개 지점은 버려집니다.</b>
+                {" "}<button type="button" onClick={cancelNewRunMode}
+                  className="underline text-slate-300 hover:text-slate-100">취소하고 이어서 진행으로 돌아가기</button>
+              </p>
+            )}
           </div>
 
           {/* 진행 상태 */}
@@ -1552,8 +1605,9 @@ function EpicPanel({ projects, flash }) {
                 </div>
                 <div className="flex gap-2">
                   {run.running && <Btn color="red" disabled={busy === "중지"} onClick={stop}>{busy === "중지" ? "중지 중…" : (run.stopping ? "중지 요청됨" : "중지")}</Btn>}
-                  {paused && <Btn color="green" disabled={!!busy} onClick={() => resume(false)}>{busy === "이어서 진행" ? "재개 중…" : "이어서 진행"}</Btn>}
-                  {paused && run.step && <Btn color="slate" disabled={!!busy} onClick={() => resume(true)}>{busy === "건너뛰기" ? "건너뛰는 중…" : "이 단계 건너뛰기"}</Btn>}
+                  {paused && !newRunMode && <Btn color="green" disabled={!!busy} onClick={() => resume(false)}>{busy === "이어서 진행" ? "재개 중…" : "이어서 진행"}</Btn>}
+                  {paused && !newRunMode && run.step && <Btn color="slate" disabled={!!busy} onClick={() => resume(true)}>{busy === "건너뛰기" ? "건너뛰는 중…" : "이 단계 건너뛰기"}</Btn>}
+                  {paused && newRunMode && <span className="text-xs text-amber-300">repo 를 고른 뒤 아래 <b>[연속 개발 시작]</b> 을 누르세요 (재개는 잠금을 되돌려야 가능).</span>}
                 </div>
               </div>
               {run.running && cur && cur.waitingSince && run.step === "await-merge" && (
@@ -1580,7 +1634,7 @@ function EpicPanel({ projects, flash }) {
                 <input type="checkbox" checked={autoMerge}
                   onChange={(e) => saveAutoMerge({ autoMerge: e.target.checked, min: autoMergeMin })} />
                 리뷰 승인 후 자동 병합
-                <InfoTip title="리뷰 승인 후 자동 병합" text={"리뷰 승인이 끝난 PR 을 지정한 시간 동안 아무도 병합하지 않으면 대시보드가 대신 병합합니다.\n\n· 열린 PR 이 '모두' 리뷰 승인된 경우에만 병합합니다. 미승인 PR 이 하나라도 있으면 시간이 지나도 병합하지 않습니다.\n· 대기 시간은 '병합 대기' 단계에 들어간 시점부터 셉니다.\n· 실행 중에 켜고 끄면 바로 반영됩니다.\n· 병합에 실패하면(충돌·권한 등) 에픽을 중단하고 알립니다.\n· 대시보드가 켜져 있어야 동작합니다(병합 + 카드 완료 처리를 대시보드가 함께 수행)."} />
+                <InfoTip title="리뷰 승인 후 자동 병합" text={"리뷰 승인이 끝난 PR 을 지정한 시간 동안 아무도 병합하지 않으면 대시보드가 대신 병합합니다.\n\n· 열린 PR 이 '모두' 리뷰 승인된 경우에만 병합합니다. 미승인 PR 이 하나라도 있으면 시간이 지나도 병합하지 않습니다.\n· 대기 시간은 '병합 대기' 단계에 들어간 시점부터 셉니다.\n· 실행 중에 켜고 끄면 바로 반영됩니다.\n· 병합에 실패하면(충돌·권한 등) 실행을 중단하고 알립니다.\n· 대시보드가 켜져 있어야 동작합니다(병합 + 카드 완료 처리를 대시보드가 함께 수행)."} />
               </label>
               <label className={`inline-flex items-center gap-1.5 text-sm ${autoMerge ? "text-slate-300" : "text-slate-600"}`}>
                 대기
@@ -1658,7 +1712,7 @@ function EpicPanel({ projects, flash }) {
           </div>
           <p className="text-xs text-slate-500 mt-3">
             트리거 라벨은 <b>그 태스크 차례가 됐을 때만</b> 붙습니다(스케줄 루프가 순서를 앞질러 가져가지 않도록).
-            이미 <code>claude-work</code> 가 붙어 있던 하위 카드는 plan/build 루프도 볼 수 있으니, 에픽 실행 중에는 두 루프를 멈춰두는 것을 권장합니다.
+            이미 <code>claude-work</code> 가 붙어 있던 하위 카드는 plan/build 루프도 볼 수 있으니, {epicLabel} 실행 중에는 두 루프를 멈춰두는 것을 권장합니다.
           </p>
         </React.Fragment>
       )}

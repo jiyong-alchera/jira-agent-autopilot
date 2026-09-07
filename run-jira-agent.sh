@@ -51,6 +51,9 @@ PR_OPEN_LABEL="${PR_OPEN_LABEL:-claude-pr}"     # PR 올림(병합 대기) 표�
 TARGET_BRANCH_LABEL="${TARGET_BRANCH_LABEL:-claude-branched}"   # plan 이 타겟(작업) 브랜치를 만들었음을 표시하는 라벨
 TARGET_BRANCH_MARK="🌿 타겟 브랜치:"           # Jira 코멘트에 타겟 브랜치명을 남기는 마커(build 가 이걸로 브랜치 인식)
 NO_REWORK_MARK="NO_REWORK_NEEDED"               # rework 무변경(반영할 새 피드백 없음) 마커 — run-review-loop.sh 와 동일해야 함
+# CI_FIX 모드가 '무엇을 했는지' 알리는 마커 — run-ci-loop.sh 가 이걸로 재리뷰 필요 여부를 정한다.
+CI_RERUN_MARK="CI_RERUN_ONLY"                   # 코드 변경 없이 재실행만(인프라 장애·플레이크) → 재리뷰 불필요
+CI_PUSHED_MARK="CI_FIX_PUSHED"                  # 코드를 고쳐 푸시함 → 재리뷰 필요
 MAX_RETRIES="${MAX_RETRIES:-3}"                 # 연속 실패 N회 초과 시 실패 처리
 TEST_CMD="${TEST_CMD:-}"                        # 테스트 명령(비우면 claude 가 자동 감지)
 BUILD_CMD="${BUILD_CMD:-}"                      # 빌드 명령(비우면 claude 가 자동 감지)
@@ -363,6 +366,51 @@ ${FEEDBACK_INSTR}
  - '반영할 새 피드백이 없음'(지적이 이미 모두 반영돼 고칠 것이 없음): 정상입니다. 확인 근거를 쓴 뒤 마지막 줄에 정확히 '${NO_REWORK_MARK}' 한 줄만 출력하고 '정상 종료'하세요. 커밋·푸시·Jira 코멘트는 하지 마세요(반영 사실이 없는데 '반영 완료'를 남기지 않습니다).
  - '반영할 PR 자체가 없음 / 반영을 시도했으나 실패': 비정상입니다. 사유를 출력하고 비정상 종료하세요.
 완료 후 갱신한 PR URL 들을 출력하세요."
+elif [[ -n "${CI_FIX:-}" ]]; then
+  echo ">> [${ISSUE_KEY}] [CI-FIX] CI 실패 원인 파악 + 수정${REWORK_ONLY_OWNER:+ · 대상 PR ${REWORK_ONLY_OWNER}#${REWORK_ONLY_NUM:-}}"
+  CI_FOCUS=""
+  if [[ -n "${REWORK_ONLY_OWNER:-}" && -n "${REWORK_ONLY_NUM:-}" ]]; then
+    CI_FOCUS="[대상 PR 한정] 이번 작업은 오직 '${REWORK_ONLY_OWNER}' 저장소의 PR #${REWORK_ONLY_NUM} 하나에만 수행하세요. 그 외 repo/PR 은 절대 건드리지 마세요.
+"
+  fi
+  # 호출부(run-ci-loop.sh)가 실패한 체크 목록을 넘겨준다. 없으면 에이전트가 직접 조회한다.
+  CI_FAILED_TEXT=""
+  [[ -n "${CI_FAILED_CHECKS:-}" ]] && CI_FAILED_TEXT="
+현재 실패한 체크(호출부가 확인한 목록):
+${CI_FAILED_CHECKS}
+"
+  PROMPT="${CI_FOCUS}당신은 Jira 이슈 ${ISSUE_KEY} 의 '기존 PR'에서 실패한 CI 를 초록으로 만듭니다. 새 PR/새 브랜치는 만들지 마세요.
+대상 repo 들은 아래 경로에 clone 되어 있습니다(여러 repo 일 수 있음):
+${REPO_LIST_TEXT}
+${CI_FAILED_TEXT}
+[매우 중요] 헤드리스 1회 실행입니다. 백그라운드로 미루지 말고 이 턴 안에서 끝까지 동기 수행하세요. 오래 걸리는 테스트/빌드는 Bash 'timeout' 파라미터를 넉넉히(최대 600000ms=10분) 줘서 '포그라운드'로 실행하세요(기본 120초를 넘기면 자동 백그라운드로 넘어가 헤드리스에서 유실됨). 'Monitor'·대기 루프·waiter 로 기다리며 턴을 끝내지 마세요.
+
+절차:
+1. 'gh pr list --state open --search \"${ISSUE_KEY}\"' 로 이 이슈의 열린 PR 을 찾으세요(위 '대상 PR 한정' 이 있으면 그 PR 만). 없으면 사유를 출력하고 비정상 종료하세요.
+2. 실패한 체크를 확인하세요: 'gh pr checks <번호> --repo <owner/repo>'.
+3. '실패한 잡의 로그를 반드시 읽으세요' — 로그를 안 보고 원인을 추측해 고치지 마세요.
+   'gh run view <실행id> --repo <owner/repo> --log-failed' (실행id 는 체크 URL 의 '/actions/runs/<id>' 부분).
+   로그가 너무 길면 실패 잡별로 'gh run view --job <잡id> --log-failed' 로 좁혀 읽으세요.
+4. 로그를 근거로 원인을 '두 갈래'로 분류하세요. 근거 없는 분류는 금지이며, 어느 쪽인지 판단 근거를 출력에 남기세요.
+   (a) '코드와 무관한 일시적 실패' — 패키지 미러/레지스트리 다운, 네트워크 타임아웃, 러너 자원 부족, 외부 서비스 5xx, 도커 이미지 pull 실패, 명백한 플레이크(재실행하면 통과하는 경합) 등.
+       → 코드를 고치지 말고 'gh run rerun <실행id> --repo <owner/repo> --failed' 로 실패 잡만 재실행하세요.
+         재실행을 걸었으면 결과를 기다리지 말고(다음 회차가 확인합니다), 마지막 줄에 정확히 '${CI_RERUN_MARK}' 한 줄만 출력하고 정상 종료하세요.
+   (b) '이 PR 의 코드/설정 때문에 깨진 것' — 테스트 실패, 타입·린트 오류, 컴파일 실패, 마이그레이션 충돌, 이 PR 이 바꾼 설정 탓의 실패 등.
+       → 아래 5~8 로 진행하세요.
+   판단이 애매하면 (b) 로 보고 고치세요. 단, 같은 잡이 이미 재실행으로 한 번 더 깨졌다면 그건 플레이크가 아닙니다.
+5. 그 PR 의 head 브랜치를 checkout 하세요('gh pr view <번호> --json headRefName' → 'git fetch origin' → 'git checkout <head>' → 'git pull --ff-only'). base 브랜치에는 절대 커밋/푸시하지 마세요.
+6. 실패 원인을 '근본적으로' 고치세요. 다음은 '절대 금지'입니다 — CI 를 초록으로 만드는 것이 목적이지, 검사를 없애는 것이 목적이 아닙니다:
+   - 실패하는 테스트를 삭제·주석처리·skip/xfail 처리해서 통과시키기
+   - 린트/타입 검사 규칙을 끄거나 무시 주석(noqa·eslint-disable·type: ignore 등)을 덧붙여 덮기
+   - CI 워크플로 파일에서 실패하는 잡·스텝을 빼거나 'continue-on-error' 를 붙이기
+   테스트가 잘못돼서 고쳐야 하는 경우라면, 왜 테스트가 틀렸는지 근거를 출력에 남기고 테스트를 '올바르게' 고치세요.
+7. 고친 뒤 '로컬에서' 같은 검사를 포그라운드로 돌려 통과를 확인하세요(테스트 수단: ${TEST_DESC} · 빌드 수단: ${BUILD_DESC}). CI 에서 깨진 그 잡에 해당하는 검사를 반드시 포함하세요. 로컬 확인 없이 푸시하지 마세요.
+   - env 파일(.env 또는 복사된 env)은 절대 커밋/푸시하지 마세요.
+8. 통과하면 그 PR 의 head 브랜치에 커밋·푸시하세요. 커밋 메시지는 'fix(ci): ' 로 시작하고 무엇이 왜 깨졌는지 한 줄로 쓰되, 이슈 키 '${ISSUE_KEY}' 를 포함하세요. 강제 푸시는 하지 마세요(rebase 금지 — 이 모드는 충돌 해소가 아닙니다).
+   푸시 후 Jira 이슈 ${ISSUE_KEY} 에 'CI 수정' 코멘트(깨진 잡·원인·수정 요약 + PR URL)를 남기세요. 이슈 '상태·라벨은 바꾸지 마세요'.
+   마지막 줄에 정확히 '${CI_PUSHED_MARK}' 한 줄만 출력하고 정상 종료하세요.
+
+고칠 수 없으면(원인 불명, 로컬 재현 불가로 안전한 수정이 불가능, 검사 무력화 외에 방법이 없음) 사유와 읽은 로그의 핵심을 출력하고 '비정상 종료'하세요. 억지로 통과시키지 마세요."
 elif [[ -n "${RESOLVE_CONFLICT:-}" ]]; then
   echo ">> [${ISSUE_KEY}] [RESOLVE-CONFLICT] base 충돌 rebase 해소 + 재푸시${REWORK_ONLY_OWNER:+ · 대상 PR ${REWORK_ONLY_OWNER}#${REWORK_ONLY_NUM:-}}"
   CONFLICT_FOCUS=""
@@ -481,6 +529,17 @@ if [[ "${CLAUDE_OK}" -eq 0 ]]; then
     [[ -z "${PR_URL}" && -n "${REWORK_ONLY_OWNER:-}" && -n "${REWORK_ONLY_NUM:-}" ]] \
       && PR_URL="https://github.com/${REWORK_ONLY_OWNER}/pull/${REWORK_ONLY_NUM}"
     echo ">> [${ISSUE_KEY}] 반영할 새 리뷰 피드백 없음 → 변경 없이 종료(정상)"
+  elif [[ -n "${CI_FIX:-}" ]]; then
+    # CI 수정 모드는 '재실행만' 하고 끝나는 회차가 정상적으로 있다(인프라 플레이크). 그때는 PR 이
+    # 갱신되지 않으므로 아래 'PR 없이 종료 → 미완료' 규칙에 걸리면 안 된다.
+    RESULT="ci-fix"
+    [[ -z "${PR_URL}" && -n "${REWORK_ONLY_OWNER:-}" && -n "${REWORK_ONLY_NUM:-}" ]] \
+      && PR_URL="https://github.com/${REWORK_ONLY_OWNER}/pull/${REWORK_ONLY_NUM}"
+    if grep -qF "${CI_RERUN_MARK}" "${CLAUDE_OUT}"; then
+      echo ">> [${ISSUE_KEY}] CI 실패가 코드와 무관(일시적) → 실패 잡만 재실행"
+    elif grep -qF "${CI_PUSHED_MARK}" "${CLAUDE_OUT}"; then
+      echo ">> [${ISSUE_KEY}] CI 실패 원인 수정 후 푸시"
+    fi
   elif [[ "${PHASE}" == "build" && -z "${PR_URL}" ]]; then
     # build/rework 인데 PR URL 이 없으면 미완료(예: 작업을 백그라운드로 미루고 종료) → 재시도 대상
     RESULT="incomplete"
@@ -492,7 +551,7 @@ if [[ "${CLAUDE_OK}" -eq 0 ]]; then
   fi
 fi
 
-if [[ "${RESULT}" == "success" || "${RESULT}" == "skip" || "${RESULT}" == "rework" || "${RESULT}" == "noop" ]]; then
+if [[ "${RESULT}" == "success" || "${RESULT}" == "skip" || "${RESULT}" == "rework" || "${RESULT}" == "noop" || "${RESULT}" == "ci-fix" ]]; then
   rm -f "${FAIL_FILE}"
   echo ">> [${ISSUE_KEY}] 완료 (phase=${PHASE}, result=${RESULT})"
   record_history_prs "${RESULT}"   # 생성된 PR 을 repo 별로 각각 이력에 기록(멀티 repo)

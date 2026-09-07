@@ -89,6 +89,19 @@ function cardRepos(p, labels) {
   return sel.length ? sel : (repos.length ? [repos[0]] : []);
 }
 
+// 에픽 러너의 prepare 단계가 카드에 맞춰야 할 라벨 변경분.
+// 라벨을 '추가만' 하면 이전 실행이 남긴 repo_<name> 이 그대로 붙어 있고, 카드 단위 경로
+// (run-cycle.js 의 예약 루프 · 대시보드 개별 실행)는 CARD_REPOS 가 아니라 이 라벨로 대상 repo 를
+// 정하므로 이번 실행에서 뺀 repo 가 계속 딸려온다. 그래서 '이번 실행에 없는 repo_ 라벨'은 지운다.
+// 다른 라벨(claude-*, 사람이 붙인 것)은 건드리지 않는다.
+function epicPrepareLabelDiff(labels, repoNames, cfg) {
+  const cur = labels || [];
+  const want = [(cfg && cfg.triggerLabel) || "claude-work", ...(repoNames || []).map((n) => REPO_LABEL_PREFIX + n)];
+  const add = want.filter((l) => !cur.includes(l));
+  const remove = cur.filter((l) => l.indexOf(REPO_LABEL_PREFIX) === 0 && !want.includes(l));
+  return { add, remove };
+}
+
 function triggerClause(cfg) {
   return cfg.triggerMode === "text" ? `text ~ "${cfg.triggerText}"` : `labels = "${cfg.triggerLabel}"`;
 }
@@ -354,7 +367,31 @@ function parseSuggestedAnswers(comments) {
 // ===== 에픽 연속 개발(run-epic-loop.js) 순수 로직 =====
 // 한 에픽의 하위 태스크를 생성순으로 하나씩: prepare→plan→adopt→build(+리뷰 승인 루프)→await-merge.
 // 러너는 상태를 <CLONE_BASE>/.state/<EPIC>.epic.json 에 쓰고 대시보드가 폴링한다.
-const EPIC_STEPS = ["prepare", "plan", "adopt", "build", "approve", "await-merge"];
+// 연속 개발의 '상위 카드' 는 에픽 계층(hierarchyLevel 1)이면 무엇이든 된다 — 프로젝트마다 이름이
+// 다르다(에픽 · 워크스트림 · Initiative …). 러너는 parent 로만 하위를 찾으므로 타입 이름과 무관하게 돈다.
+const EPIC_HIERARCHY_LEVEL = 1;
+const EPIC_LABEL_FALLBACK = "에픽";
+// 프로젝트 메타(project.issueTypes)에서 에픽 계층 타입만 추린다.
+function topLevelIssueTypes(issueTypes) {
+  return (issueTypes || []).filter((t) => t && t.id && !t.subtask && Number(t.hierarchyLevel) === EPIC_HIERARCHY_LEVEL);
+}
+// 에픽 계층 카드 목록 JQL.
+// Jira 는 JQL 의 issuetype 을 '지역화된 표시 이름' 으로 매칭하지 못한다 — `issuetype = "워크스트림"`,
+// `issuetype = "에픽"` 모두 에러 없이 0건을 준다. 반드시 타입 id 로 조회하고, 메타를 못 읽었을 때만
+// 영문 canonical 이름으로 떨어진다.
+function epicSearchJql(projectKey, types) {
+  const ids = topLevelIssueTypes(types).map((t) => String(t.id));
+  const clause = ids.length ? `issuetype IN (${ids.join(", ")})` : "issuetype = Epic";
+  return `project = "${projectKey}" AND ${clause} ORDER BY created DESC`;
+}
+// 이 프로젝트가 에픽 계층을 부르는 이름(UI·Slack 문구용). 못 찾으면 "에픽".
+function epicTypeLabel(types) {
+  const t = topLevelIssueTypes(types)[0];
+  return (t && t.name) || EPIC_LABEL_FALLBACK;
+}
+// ci 는 build(+리뷰 승인 루프) 와 approve 사이에 있다. CI 를 고치면 코드가 바뀌므로 그 자리에서
+// 리뷰 루프를 다시 태우고, 뒤따르는 approve 가 '최종 승인 마커' 를 확인하는 순서가 된다.
+const EPIC_STEPS = ["prepare", "plan", "adopt", "build", "ci", "approve", "await-merge"];
 // 하위 태스크 조회 JQL — 미완료(완료 상태·Done 카테고리 제외) 전부, 생성순.
 // link: "parent"(기본) 또는 "epic-link" — 구형 company-managed 프로젝트는 'Epic Link' 만 먹는다.
 function epicChildrenJql(epicKey, cfg, link) {
@@ -368,7 +405,9 @@ function epicTaskStep(task, cfg) {
   const c = cfg || {};
   const labels = (task && task.labels) || [];
   if (task && task.done) return null;                                   // 이미 완료된 카드는 건너뜀
-  if (labels.includes(c.prOpenLabel || "claude-pr")) return "await-merge"; // PR 올림 → 병합 대기
+  // PR 올림 → ci 부터. ci 는 초록이면 즉시 통과하므로, 재개할 때마다 CI 를 한 번 더 확인하는 값이
+  // 비용보다 크다(중단된 사이 base 가 움직여 깨져 있는 경우가 실제로 있다).
+  if (labels.includes(c.prOpenLabel || "claude-pr")) return "ci";
   if (!labels.includes(c.triggerLabel || "claude-work")) return "prepare";
   if (!labels.includes(c.plannedLabel || "claude-planned")) return "plan";
   if (!labels.includes(c.answeredLabel || "claude-answered")) return "adopt";
@@ -385,9 +424,9 @@ function nextEpicStep(step) {
   return (i < 0 || i >= EPIC_STEPS.length - 1) ? null : EPIC_STEPS[i + 1];
 }
 // 제안 답변 → Jira 답변 코멘트 본문. 자동 채택임을 명시해 사람이 나중에 구분할 수 있게 한다.
-function buildAdoptedAnswerBody(suggested, epicKey) {
+function buildAdoptedAnswerBody(suggested, epicKey, label) {
   if (!suggested || !suggested.items || !suggested.items.length) return "";
-  const head = `[에픽 연속 개발${epicKey ? ` · ${epicKey}` : ""}] plan 이 제시한 제안 답변을 그대로 채택합니다.`;
+  const head = `[${label || EPIC_LABEL_FALLBACK} 연속 개발${epicKey ? ` · ${epicKey}` : ""}] plan 이 제시한 제안 답변을 그대로 채택합니다.`;
   const lines = suggested.items.map((it, i) => {
     const n = it.n || i + 1;
     return it.question ? `${n}. ${it.question}\n→ ${it.suggestion}` : `${n}. ${it.suggestion}`;
@@ -406,6 +445,67 @@ function prBelongsToCard(pr, key) {
   return has(pr.branch) || has(pr.title);
 }
 
+// ===== CI(체크) 상태 판정 =====
+// gh 의 statusCheckRollup 은 두 종류가 섞여 온다:
+//   CheckRun      { name, status: QUEUED|IN_PROGRESS|COMPLETED, conclusion: SUCCESS|FAILURE|SKIPPED|… }
+//   StatusContext { context, state: SUCCESS|PENDING|FAILURE|ERROR }
+// 병합 게이트(shouldAutoMerge)와 CI 수정 루프가 '같은 기준'으로 판정하도록 여기 한 곳에 둔다.
+const CI_FAIL_CONCLUSIONS = new Set(["FAILURE", "TIMED_OUT", "STARTUP_FAILURE", "ACTION_REQUIRED", "CANCELLED"]);
+const CI_FAIL_STATES = new Set(["FAILURE", "ERROR"]);
+// 체크 1건의 상태 → "pass" | "fail" | "pending"
+// CANCELLED 를 실패로 본다: 새 푸시에 밀려 취소된 경우든 진짜 취소든, 초록이 아닌 채로 병합되면 안 된다.
+// (재실행으로 풀릴 종류인지는 CI 수정 루프가 로그를 보고 판단한다)
+function ciCheckState(c) {
+  if (!c) return "pass";
+  if (c.__typename === "StatusContext" || (!c.status && c.state)) {
+    const s = String(c.state || "").toUpperCase();
+    if (CI_FAIL_STATES.has(s)) return "fail";
+    return (s === "PENDING" || s === "EXPECTED") ? "pending" : "pass";
+  }
+  if (String(c.status || "").toUpperCase() !== "COMPLETED") return "pending";
+  return CI_FAIL_CONCLUSIONS.has(String(c.conclusion || "").toUpperCase()) ? "fail" : "pass";
+}
+// PR 1건의 CI 상태 → "pass" | "fail" | "pending" | "none"(체크 자체가 없음)
+// 하나라도 실패면 실패, 실패는 없고 도는 게 있으면 대기.
+function ciStateOf(rollup) {
+  const list = Array.isArray(rollup) ? rollup : [];
+  if (!list.length) return "none";
+  let pending = false;
+  for (const c of list) {
+    const s = ciCheckState(c);
+    if (s === "fail") return "fail";
+    if (s === "pending") pending = true;
+  }
+  return pending ? "pending" : "pass";
+}
+// 실패한 체크만 추림 — 알림 문구와 CI_FIX 프롬프트에 '무엇이 왜 깨졌는지' 넣기 위한 것.
+function failedChecks(rollup) {
+  return (Array.isArray(rollup) ? rollup : [])
+    .filter((c) => ciCheckState(c) === "fail")
+    .map((c) => ({
+      name: c.name || c.context || "(이름없음)",
+      conclusion: String(c.conclusion || c.state || "").toUpperCase(),
+      url: c.detailsUrl || c.targetUrl || "",
+    }));
+}
+// 체크 상세 URL 에서 Actions 실행 id 를 뽑는다(…/actions/runs/<id>/job/<jid>) — 'gh run view <id> --log-failed' 용.
+function runIdFromCheckUrl(url) {
+  const m = /\/actions\/runs\/(\d+)/.exec(String(url || ""));
+  return m ? m[1] : "";
+}
+
+// ===== 에픽 CI 수정 루프 =====
+// CI 가 깨진 PR 을 '원인 파악 → 수정/재실행 → 재검증' 으로 초록이 될 때까지 반복한다.
+// 리뷰 승인 루프와 같은 기본값(5회)을 쓴다 — 두 루프의 성격(엔진 1회 실행 × N회차)이 같다.
+const CI_LOOP_MAX_DEFAULT = 5;
+const CI_LOOP_MAX_LIMIT = 20;
+function clampCiLoopMax(v, cfg) {
+  const raw = (v === undefined || v === null || v === "") ? (cfg && cfg.ciLoopMax) : v;
+  const n = parseInt(raw, 10);
+  if (!Number.isFinite(n) || n <= 0) return CI_LOOP_MAX_DEFAULT;
+  return Math.min(n, CI_LOOP_MAX_LIMIT);
+}
+
 // ===== 에픽 자동 병합 옵션 =====
 // 리뷰 승인까지 끝난 PR 을 사람이 오래 병합하지 않으면 대기 시간 뒤에 자동 병합한다.
 // 기본 60분, 1분~24시간(1440분) 범위.
@@ -416,12 +516,20 @@ function clampAutoMergeMin(v) {
   if (!Number.isFinite(n) || n <= 0) return EPIC_AUTO_MERGE_MIN_DEFAULT;
   return Math.min(n, EPIC_AUTO_MERGE_MIN_LIMIT);
 }
-// 자동 병합 판정 — 켜져 있고, 대기 시간을 넘겼고, 열린 PR 이 '모두 리뷰 승인' 됐을 때만.
+// 자동 병합 판정 — 켜져 있고, 대기 시간을 넘겼고, 열린 PR 이 '모두 리뷰 승인 + CI 초록' 일 때만.
 // 미승인 PR 이 하나라도 있으면 시간이 지나도 병합하지 않는다(승인 게이트를 우회하지 않기 위해).
+//
+// CI 게이트: ci 단계에서 초록을 확인하고 왔더라도, 병합 대기 중에 base 가 움직여 다시 깨질 수 있다.
+// 그 회귀를 여기서 한 번 더 막는다. 판정 불능("unknown" — gh 조회 실패)도 막는다: 모르면 병합하지
+// 않는 쪽이 안전하고, 다음 폴링에서 다시 판정하므로 스스로 풀린다.
+// "none"(체크 자체가 없는 repo)과 undefined(CI 필드를 안 채우는 옛 호출부)는 통과시킨다.
+const CI_BLOCKING = { fail: "ci-failed", pending: "ci-pending", unknown: "ci-unknown" };
 function shouldAutoMerge(opts, waitStartedAt, openPRs, now) {
   if (!opts || !opts.autoMerge) return { merge: false, reason: "off" };
   const prs = openPRs || [];
   if (!prs.length) return { merge: false, reason: "no-open-pr" };
+  const blocked = prs.map((p) => CI_BLOCKING[p.ci]).find(Boolean);
+  if (blocked) return { merge: false, reason: blocked };
   if (!prs.every((p) => p.approved)) return { merge: false, reason: "not-approved" };
   const start = Date.parse(waitStartedAt || "");
   if (!Number.isFinite(start)) return { merge: false, reason: "no-start" };
@@ -485,7 +593,8 @@ function classifyPause(reason, lastError) {
     return { retryable: true, kind: "usage-limit", label: "사용량 한도(토큰) 소진" };
   }
   // 사람 판단이 필요한 것들 — 재시도해도 결과가 같다
-  if (/제안 답변이 없|리뷰 승인이 남았|자동 병합 실패/.test(t)) {
+  // 'CI 수정 반복' 은 루프를 다 쓰고도 초록이 안 된 경우 — 같은 수정을 다시 돌려도 결과가 같다.
+  if (/제안 답변이 없|리뷰 승인이 남았|자동 병합 실패|CI 수정 반복/.test(t)) {
     return { retryable: false, kind: "needs-human", label: "사람 확인 필요" };
   }
   if (/답변 대기|awaiting answers/i.test(t)) {
@@ -514,12 +623,15 @@ function planRetry(run, attempt, cfg, now) {
 module.exports = {
   DEFAULT_CREDS, readJson, writeJson, slugify, triggerClause, detectJql,
   adfToText, adfSegments, toADF, mdInline, mdToADF, buildReplyADF, maskCreds, applyCreds, createStore, doneStatusList, effectiveDoneStatuses,
-  REPO_LABEL_PREFIX, repoNameFromUrl, normalizeRepos, cardRepos, REVIEW_APPROVED_MARKER,
+  REPO_LABEL_PREFIX, repoNameFromUrl, normalizeRepos, cardRepos, epicPrepareLabelDiff, REVIEW_APPROVED_MARKER,
   loadOrCreateEnvKey, encryptEnv, decryptEnv,
   ENGINES, DEFAULT_ENGINE, DEFAULT_MODEL, resolveEngine,
   REVIEW_LOOP_MAX_DEFAULT, REVIEW_LOOP_MAX_LIMIT, clampReviewLoopMax,
+  ciCheckState, ciStateOf, failedChecks, runIdFromCheckUrl,
+  CI_LOOP_MAX_DEFAULT, CI_LOOP_MAX_LIMIT, clampCiLoopMax,
   SUGGEST_MARK, parseSuggestedAnswers,
   EPIC_STEPS, epicChildrenJql, epicTaskStep, nextEpicTask, nextEpicStep, buildAdoptedAnswerBody, prBelongsToCard,
+  EPIC_HIERARCHY_LEVEL, EPIC_LABEL_FALLBACK, topLevelIssueTypes, epicSearchJql, epicTypeLabel,
   EPIC_AUTO_MERGE_MIN_DEFAULT, EPIC_AUTO_MERGE_MIN_LIMIT, clampAutoMergeMin, shouldAutoMerge,
   EPIC_RETRY_MAX_DEFAULT, EPIC_RETRY_MAX_LIMIT, EPIC_RETRY_BACKOFF_MIN, clampRetryMax,
   parseUsageLimitReset, classifyPause, planRetry,

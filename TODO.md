@@ -112,6 +112,53 @@
     (상태 파일 기반이라 재시작 후에도 복구). `/api/epics*` 5개 엔드포인트 + 대시보드 '에픽 연속 개발' 패널 + `loop-epic.log` 추가.
     `run-cycle.js` 의 env 구성 로직은 `lib-project-env.js` 로 분리해 공유.
 
+- [x] **13a. 워크스트림 등 '에픽이 아닌 상위 계층'도 연속 개발 대상으로**
+  - 내용: 연속 개발 대상을 이슈 타입 이름(`Epic`)이 아니라 **계층(`hierarchyLevel` 1)** 으로 잡아,
+    그 계층을 '워크스트림' 등 다른 이름으로 부르는 프로젝트(PHYS)에서도 하위 태스크를 연속 개발한다.
+  - AC: 워크스트림 프로젝트에서 패널 드롭다운에 상위 카드가 뜨고, 하위 태스크 목록·단계가 조회되며,
+    화면·알림 문구가 그 프로젝트의 용어를 쓴다. 기존 에픽 프로젝트는 그대로 동작한다.
+  - 영향: `dashboard/lib.js`, `dashboard/server.js`, `dashboard/public/index.html`, `run-epic-loop.js`,
+    `dashboard/test/epic-loop.test.js`
+  → (완료 2026-09-07) Jira JQL 이 `issuetype` 을 **지역화된 표시 이름으로 매칭하지 못하는** 것이 원인
+    (`issuetype = "워크스트림"`·`issuetype = "에픽"` 모두 0건). 프로젝트 메타에서 `hierarchyLevel === 1` 타입을 골라
+    **타입 id 로** 조회하도록 전환(`lib.topLevelIssueTypes` / `epicSearchJql` / `epicTypeLabel`, 5분 캐시).
+    표시 이름은 `/api/epics` 의 `label` · `/api/jira/meta` 의 `epicLabel` 로 내려 패널 제목·드롭다운·툴팁에 쓰고,
+    러너에는 `EPIC_LABEL` 로 넘겨 로그·Slack·자동 채택 코멘트 문구에 반영. 러너 로직은 `parent` 기반이라 무변경.
+    검증: PHYS 워크스트림 13건 조회, PHYS-123 하위 14건 단계 판정 정상 / EKYB·FSIF 기존 동작 유지.
+
+- [x] **13b. 연속 개발 대상 repo 가 선택과 다르게 넓어지는 문제**
+  - 내용: agentsystem 만 골랐는데 [이어서 진행] 시 workbench 까지 실행되던 문제. 원인 3가지를 함께 정리한다.
+  - AC: 중단 상태에서 repo 체크박스가 잠기고, 바꾸려면 명시적으로 새 실행을 만들어야 한다.
+    이전 실행이 남긴 `repo_*` 라벨이 정리되어 카드 단위 경로도 같은 repo 만 본다. 빈 repo 목록은 전체로 넓어지지 않는다.
+  - 영향: `dashboard/lib.js`, `dashboard/server.js`, `dashboard/public/index.html`, `run-epic-loop.js`,
+    `dashboard/test/epic-loop.test.js`
+  → (완료 2026-09-07) ① UI: `repoLocked` 를 `run.running || (paused && !newRunMode)` 로 바꿔 **중단 상태에서도 잠금**,
+    '다른 repo 로 새로 시작' 모드에서만 편집 가능하고 그때는 [이어서 진행]·[건너뛰기] 를 숨겨 새 실행임을 분명히 함.
+    ② `prepare` 가 `lib.epicPrepareLabelDiff` 로 **이번 실행에 없는 `repo_*` 라벨을 제거**(추가 전용 → 동기화).
+    카드 단위 경로(`run-cycle.js`·개별 실행)가 `lib.cardRepos` 로 라벨을 보기 때문에 이게 실제 유출 경로였음.
+    ③ 빈 `EPIC_REPOS` 의 '전체' 폴백 제거 — 러너·`runEpicLoop`·resume 핸들러 3곳에서 거부.
+
+- [x] **14. CI 실패 자동 수정 + 병합 CI 게이트**
+  - 내용: 자동 병합이 CI 를 전혀 보지 않아 빨간 PR 이 그대로 병합되던 문제(실측: PHYS-126 #45, PHYS-127 #46)와,
+    PR 조회 실패가 조용히 "PR 없음"으로 둔갑해 자동 병합이 사유 없이 죽던 문제(로그에 `HTTP 200` 만 남음)를 함께 정리한다.
+  - AC: CI 가 깨지면 러너가 원인을 파악해 스스로 고치고 초록이 된 뒤에만 다음 단계로 간다.
+    CI 수정으로 코드가 바뀌면 기존 리뷰 승인은 무효가 되고 재리뷰를 받는다.
+    CI 가 빨갛거나 진행 중이면 자동 병합이 시간·승인과 무관하게 막힌다. 조회 실패는 사유가 로그에 남는다.
+  - 영향: `run-jira-agent.sh`, `run-epic-loop.js`, `dashboard/lib.js`, `dashboard/server.js`,
+    `dashboard/public/index.html`, `dashboard/test/epic-loop.test.js`
+  → (완료 2026-09-08) ① `lib.ciStateOf`/`failedChecks` 로 CI 판정을 한 곳에 모으고, 에픽 단계에
+    `ci` 를 신설(build → **ci** → approve → await-merge). `claude-pr` 재개 지점도 `ci` 로 변경.
+    ② `run-jira-agent.sh` 에 `CI_FIX` 모드 추가 — 실패 잡 로그를 반드시 읽고 (a) 인프라·플레이크는
+    `gh run rerun --failed`(`CI_RERUN_ONLY`) (b) 코드 문제는 수정·로컬검증·푸시(`CI_FIX_PUSHED`) 로 분기.
+    테스트 삭제·skip·무시 주석·`continue-on-error` 로 통과시키는 것은 프롬프트에서 금지.
+    ③ CI 수정 커밋이 생기면 승인 마커를 `CLAUDE-REVIEW-SUPERSEDED-BY-CI-FIX` 로 치환해 무효화하고
+    `run-review-loop.sh` 재실행 → 다음 회차에서 CI 재판정. 상한 `EPIC_CI_LOOP_MAX`(기본 5).
+    ④ `shouldAutoMerge` 에 CI 게이트(`ci-failed`/`ci-pending`/`ci-unknown`) 추가.
+    `/api/cards/:key/merge` 도 동일 게이트(사람이 확인창에서 넘길 때만 `force`).
+    ⑤ `listCardPRs` 가 `list.ok` 를 검사하고, 병합 대상이 없으면 `message` 를 실어 응답.
+    러너의 승인·CI 조회는 `ghJsonStrict` 로 실패를 던짐. `await-merge` 는 조회 실패 회차를 판정하지 않음(`pr-lookup-failed`).
+    검증: `npm test` 107건 통과(CI 판정·게이트·단계 순서 신규 12건 포함).
+
 ---
 
 *완료된 항목은 위 "완료 정의"에 따라 체크 표시 + 문서 동기화 후 마감합니다.*

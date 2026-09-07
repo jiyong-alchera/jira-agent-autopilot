@@ -33,7 +33,7 @@ test("epicTaskStep: 라벨 상태에 따라 시작 단계를 정한다", () => {
   assert.equal(step(["claude-work"]), "plan");                                    // plan 아직
   assert.equal(step(["claude-work", "claude-planned"]), "adopt");                 // 질문은 있고 답변 전
   assert.equal(step(["claude-work", "claude-planned", "claude-answered"]), "build");
-  assert.equal(step(["claude-work", "claude-planned", "claude-answered", "claude-pr"]), "await-merge"); // PR 올림
+  assert.equal(step(["claude-work", "claude-planned", "claude-answered", "claude-pr"]), "ci");   // PR 올림 → CI 확인부터
   assert.equal(step(["claude-work"], { done: true }), null);                      // 완료 카드는 건너뜀
 });
 
@@ -60,7 +60,8 @@ test("nextEpicTask: 남은 태스크가 없으면 null (=에픽 완료)", () => 
 test("nextEpicStep: 단계 순서대로 진행하고 마지막은 null", () => {
   assert.equal(lib.nextEpicStep("prepare"), "plan");
   assert.equal(lib.nextEpicStep("adopt"), "build");
-  assert.equal(lib.nextEpicStep("build"), "approve");
+  assert.equal(lib.nextEpicStep("build"), "ci");
+  assert.equal(lib.nextEpicStep("ci"), "approve");
   assert.equal(lib.nextEpicStep("approve"), "await-merge");
   assert.equal(lib.nextEpicStep("await-merge"), null);
   assert.equal(lib.nextEpicStep("없는단계"), null);
@@ -213,4 +214,178 @@ test("clampRetryMax: 기본 5, 1~20", () => {
   assert.equal(lib.clampRetryMax(0), 5);
   assert.equal(lib.clampRetryMax(3), 3);
   assert.equal(lib.clampRetryMax(999), 20);
+});
+
+// ===== 에픽 계층 타입(에픽 · 워크스트림 …) 해석 =====
+// Jira JQL 은 issuetype 을 지역화된 표시 이름으로 매칭하지 못한다(`issuetype = "워크스트림"`,
+// `issuetype = "에픽"` 모두 에러 없이 0건). 반드시 타입 id 로 조회해야 한다.
+const PHYS_TYPES = [
+  { id: "12219", name: "워크스트림", subtask: false, hierarchyLevel: 1 },
+  { id: "12220", name: "작업", subtask: false, hierarchyLevel: 0 },
+  { id: "12221", name: "하위 작업", subtask: true, hierarchyLevel: -1 },
+  { id: "12228", name: "버그", subtask: false, hierarchyLevel: 0 },
+];
+const EKYB_TYPES = [
+  { id: "10872", name: "작업", subtask: false, hierarchyLevel: 0 },
+  { id: "10873", name: "에픽", subtask: false, hierarchyLevel: 1 },
+  { id: "10874", name: "하위 작업", subtask: true, hierarchyLevel: -1 },
+];
+
+test("topLevelIssueTypes: 이름과 무관하게 hierarchyLevel 1 만 고른다", () => {
+  assert.deepEqual(lib.topLevelIssueTypes(PHYS_TYPES).map((t) => t.id), ["12219"]);
+  assert.deepEqual(lib.topLevelIssueTypes(EKYB_TYPES).map((t) => t.id), ["10873"]);
+  assert.deepEqual(lib.topLevelIssueTypes([]), []);
+  assert.deepEqual(lib.topLevelIssueTypes(null), []);
+  // 하위작업은 hierarchyLevel 이 -1 이지만 방어적으로 subtask 도 배제한다
+  assert.deepEqual(lib.topLevelIssueTypes([{ id: "1", name: "x", subtask: true, hierarchyLevel: 1 }]), []);
+});
+
+test("epicSearchJql: 표시 이름이 아니라 타입 id 로 조회한다", () => {
+  const phys = lib.epicSearchJql("PHYS", PHYS_TYPES);
+  assert.match(phys, /^project = "PHYS" AND issuetype IN \(12219\) ORDER BY created DESC$/);
+  assert.doesNotMatch(phys, /워크스트림/);   // 이름 매칭은 0건이라 절대 쓰면 안 된다
+
+  const ekyb = lib.epicSearchJql("EKYB", EKYB_TYPES);
+  assert.match(ekyb, /issuetype IN \(10873\)/);
+});
+
+test("epicSearchJql: 계층 타입이 여러 개면 모두 포함, 메타가 없으면 Epic 으로 떨어진다", () => {
+  const multi = lib.epicSearchJql("X", [
+    { id: "1", name: "에픽", subtask: false, hierarchyLevel: 1 },
+    { id: "2", name: "워크스트림", subtask: false, hierarchyLevel: 1 },
+  ]);
+  assert.match(multi, /issuetype IN \(1, 2\)/);
+  assert.match(lib.epicSearchJql("X", []), /issuetype = Epic/);
+  assert.match(lib.epicSearchJql("X", null), /issuetype = Epic/);
+});
+
+test("epicTypeLabel: 화면·알림 문구는 프로젝트가 쓰는 이름을 따른다", () => {
+  assert.equal(lib.epicTypeLabel(PHYS_TYPES), "워크스트림");
+  assert.equal(lib.epicTypeLabel(EKYB_TYPES), "에픽");
+  assert.equal(lib.epicTypeLabel([]), "에픽");
+});
+
+test("buildAdoptedAnswerBody: 채택 코멘트도 프로젝트 용어를 쓴다", () => {
+  const suggested = lib.parseSuggestedAnswers([{ id: "1", body: "1. 기본값은?\n   💡 제안: 비활성" }]);
+  assert.match(lib.buildAdoptedAnswerBody(suggested, "PHYS-123", "워크스트림"), /^\[워크스트림 연속 개발 · PHYS-123\]/);
+  assert.match(lib.buildAdoptedAnswerBody(suggested, "EKYB-800"), /^\[에픽 연속 개발 · EKYB-800\]/);
+});
+
+// ===== prepare 라벨 동기화 =====
+// 라벨을 '추가만' 하면 이전 실행이 남긴 repo_<name> 이 카드에 그대로 붙어 있고,
+// 카드 단위 경로(run-cycle.js 예약 루프 · 대시보드 개별 실행)는 CARD_REPOS 가 아니라 이 라벨로
+// 대상 repo 를 정하므로 이번 실행에서 뺀 repo 가 계속 딸려온다.
+test("epicPrepareLabelDiff: 이번 실행에 없는 repo_ 라벨은 제거 대상", () => {
+  const labels = ["claude-work", "repo_physical-ai-agentsystem", "repo_physical-ai-workbench"];
+  const d = lib.epicPrepareLabelDiff(labels, ["physical-ai-agentsystem"], CFG);
+  assert.deepEqual(d.add, []);
+  assert.deepEqual(d.remove, ["repo_physical-ai-workbench"]);
+});
+
+test("epicPrepareLabelDiff: 트리거·repo 라벨을 함께 채운다", () => {
+  const d = lib.epicPrepareLabelDiff([], ["be", "fe"], CFG);
+  assert.deepEqual(d.add, ["claude-work", "repo_be", "repo_fe"]);
+  assert.deepEqual(d.remove, []);
+});
+
+test("epicPrepareLabelDiff: repo_ 가 아닌 라벨은 절대 건드리지 않는다", () => {
+  const labels = ["claude-work", "claude-planned", "claude-answered", "hotfix", "repo_be"];
+  const d = lib.epicPrepareLabelDiff(labels, ["be"], CFG);
+  assert.deepEqual(d.add, []);
+  assert.deepEqual(d.remove, []);   // 사람이 붙인 hotfix, 진행 라벨 모두 보존
+});
+
+test("epicPrepareLabelDiff: 이미 맞으면 변경 없음(불필요한 PUT 방지)", () => {
+  const d = lib.epicPrepareLabelDiff(["claude-work", "repo_be"], ["be"], CFG);
+  assert.equal(d.add.length + d.remove.length, 0);
+});
+
+// ===== CI(체크) 상태 판정과 병합 게이트 =====
+// 실측 사례: PR #47 이 collect-agent·dataset-service 실패(코드 오류) + eval-service 실패(도커 미러 다운)인데
+// develop 에 브랜치 보호가 없어 GitHub 가 막지 않았다. 자동 병합의 유일한 방어선이 이 판정이다.
+const CHECK = (name, conclusion, status) => ({ __typename: "CheckRun", name, status: status || "COMPLETED", conclusion });
+
+test("ciStateOf: 하나라도 실패면 fail, 도는 게 있으면 pending, 없으면 none", () => {
+  assert.equal(lib.ciStateOf([]), "none");
+  assert.equal(lib.ciStateOf(null), "none");
+  assert.equal(lib.ciStateOf([CHECK("a", "SUCCESS"), CHECK("b", "SKIPPED")]), "pass");
+  assert.equal(lib.ciStateOf([CHECK("a", "SUCCESS"), CHECK("b", "FAILURE")]), "fail");
+  // 실패가 있으면 도는 게 있어도 fail — 기다릴 이유가 없다
+  assert.equal(lib.ciStateOf([CHECK("a", null, "IN_PROGRESS"), CHECK("b", "FAILURE")]), "fail");
+  assert.equal(lib.ciStateOf([CHECK("a", "SUCCESS"), CHECK("b", null, "QUEUED")]), "pending");
+});
+
+test("ciStateOf: SKIPPED·NEUTRAL 은 통과, CANCELLED·TIMED_OUT 은 실패로 본다", () => {
+  assert.equal(lib.ciStateOf([CHECK("a", "NEUTRAL"), CHECK("b", "SKIPPED")]), "pass");
+  assert.equal(lib.ciStateOf([CHECK("a", "CANCELLED")]), "fail");
+  assert.equal(lib.ciStateOf([CHECK("a", "TIMED_OUT")]), "fail");
+  assert.equal(lib.ciStateOf([CHECK("a", "ACTION_REQUIRED")]), "fail");
+});
+
+test("ciStateOf: StatusContext(구형 상태 API) 도 같은 기준으로 읽는다", () => {
+  const ctx = (context, state) => ({ __typename: "StatusContext", context, state });
+  assert.equal(lib.ciStateOf([ctx("ci/x", "SUCCESS")]), "pass");
+  assert.equal(lib.ciStateOf([ctx("ci/x", "ERROR")]), "fail");
+  assert.equal(lib.ciStateOf([ctx("ci/x", "FAILURE")]), "fail");
+  assert.equal(lib.ciStateOf([ctx("ci/x", "PENDING")]), "pending");
+});
+
+test("failedChecks: 실패한 체크만 이름·사유·URL 로 추린다", () => {
+  const rollup = [
+    CHECK("collect-agent", "FAILURE"),
+    CHECK("ops-web", "SUCCESS"),
+    { __typename: "CheckRun", name: "eval-service", status: "COMPLETED", conclusion: "FAILURE", detailsUrl: "https://github.com/o/r/actions/runs/123/job/9" },
+  ];
+  const f = lib.failedChecks(rollup);
+  assert.deepEqual(f.map((x) => x.name), ["collect-agent", "eval-service"]);
+  assert.equal(f[1].url, "https://github.com/o/r/actions/runs/123/job/9");
+  assert.equal(lib.runIdFromCheckUrl(f[1].url), "123");
+  assert.equal(lib.runIdFromCheckUrl("https://example.com/nope"), "");
+});
+
+test("shouldAutoMerge: CI 가 빨갛거나 아직 도는 중이면 승인·시간과 무관하게 병합하지 않는다", () => {
+  const start = "2026-09-02T00:00:00Z";
+  const at = (m) => Date.parse(start) + m * 60000;
+  const opts = { autoMerge: true, autoMergeAfterMin: 60 };
+  assert.equal(lib.shouldAutoMerge(opts, start, [{ approved: true, ci: "fail" }], at(600)).reason, "ci-failed");
+  assert.equal(lib.shouldAutoMerge(opts, start, [{ approved: true, ci: "pending" }], at(600)).reason, "ci-pending");
+  // 판정 불능(조회 실패)도 막는다 — 모르면 병합하지 않는다
+  assert.equal(lib.shouldAutoMerge(opts, start, [{ approved: true, ci: "unknown" }], at(600)).reason, "ci-unknown");
+  // 여러 PR 중 하나만 빨개도 전체를 막는다
+  assert.equal(lib.shouldAutoMerge(opts, start, [{ approved: true, ci: "pass" }, { approved: true, ci: "fail" }], at(600)).reason, "ci-failed");
+});
+
+test("shouldAutoMerge: CI 초록이거나 체크가 없는 repo 는 종전대로 병합", () => {
+  const start = "2026-09-02T00:00:00Z";
+  const at = (m) => Date.parse(start) + m * 60000;
+  const opts = { autoMerge: true, autoMergeAfterMin: 60 };
+  assert.equal(lib.shouldAutoMerge(opts, start, [{ approved: true, ci: "pass" }], at(60)).merge, true);
+  assert.equal(lib.shouldAutoMerge(opts, start, [{ approved: true, ci: "none" }], at(60)).merge, true);
+  // ci 필드를 안 채우는 옛 호출부는 그대로 동작(하위 호환)
+  assert.equal(lib.shouldAutoMerge(opts, start, [{ approved: true }], at(60)).merge, true);
+});
+
+test("clampCiLoopMax: 기본 5, 상한 20, 잘못된 값은 기본값", () => {
+  assert.equal(lib.clampCiLoopMax(null, {}), 5);
+  assert.equal(lib.clampCiLoopMax("", {}), 5);
+  assert.equal(lib.clampCiLoopMax(3, {}), 3);
+  assert.equal(lib.clampCiLoopMax(999, {}), 20);
+  assert.equal(lib.clampCiLoopMax("abc", {}), 5);
+  assert.equal(lib.clampCiLoopMax(null, { ciLoopMax: 7 }), 7);
+});
+
+test("ci 단계: build 와 approve 사이에 있고, PR 이 올라간 카드는 ci 부터 재개한다", () => {
+  assert.equal(lib.nextEpicStep("build"), "ci");
+  assert.equal(lib.nextEpicStep("ci"), "approve");
+  assert.equal(lib.epicTaskStep({ key: "K-1", labels: ["claude-work", "claude-planned", "claude-answered", "claude-pr"] }, CFG), "ci");
+});
+
+test("classifyPause: CI 수정 반복 소진은 사람 확인 대상(재시도 무의미)", () => {
+  const c = lib.classifyPause("PHYS-128 · ci: o/r#47 CI 수정 반복 5회 후에도 정리되지 않았습니다", "");
+  assert.equal(c.retryable, false);
+  assert.equal(c.kind, "needs-human");
+  // 다만 한도 소진으로 죽은 것이라면 그건 시간이 풀어준다 — 그쪽이 우선
+  const u = lib.classifyPause("PHYS-128 · ci: CI 수정 실행 실패 (exit 1)", "You've hit your session limit · resets 6:10pm (Asia/Seoul)");
+  assert.equal(u.retryable, true);
+  assert.equal(u.kind, "usage-limit");
 });
