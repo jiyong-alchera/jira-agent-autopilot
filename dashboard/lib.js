@@ -527,13 +527,24 @@ function clampAutoMergeMin(v) {
 // 않는 쪽이 안전하고, 다음 폴링에서 다시 판정하므로 스스로 풀린다.
 // "none"(체크 자체가 없는 repo)과 undefined(CI 필드를 안 채우는 옛 호출부)는 통과시킨다.
 const CI_BLOCKING = { fail: "ci-failed", pending: "ci-pending", unknown: "ci-unknown" };
+
+// '병합만 남은' 상태인지 — 열린 PR 이 있고, CI 가 막지 않으며, 전부 리뷰 승인됨.
+// 대기 시간은 보지 않는다(자동 병합 시점 판정은 shouldAutoMerge 몫).
+function mergeReadyState(openPRs) {
+  const prs = openPRs || [];
+  if (!prs.length) return "no-open-pr";
+  const blocked = prs.map((p) => CI_BLOCKING[p.ci]).find(Boolean);
+  if (blocked) return blocked;
+  if (!prs.every((p) => p.approved)) return "not-approved";
+  return "ready";
+}
+const isMergeReady = (openPRs) => mergeReadyState(openPRs) === "ready";
+
 function shouldAutoMerge(opts, waitStartedAt, openPRs, now) {
   if (!opts || !opts.autoMerge) return { merge: false, reason: "off" };
   const prs = openPRs || [];
-  if (!prs.length) return { merge: false, reason: "no-open-pr" };
-  const blocked = prs.map((p) => CI_BLOCKING[p.ci]).find(Boolean);
-  if (blocked) return { merge: false, reason: blocked };
-  if (!prs.every((p) => p.approved)) return { merge: false, reason: "not-approved" };
+  const state = mergeReadyState(prs);
+  if (state !== "ready") return { merge: false, reason: state };
   const start = Date.parse(waitStartedAt || "");
   if (!Number.isFinite(start)) return { merge: false, reason: "no-start" };
   const dueMs = start + clampAutoMergeMin(opts.autoMergeAfterMin) * 60000;
@@ -694,7 +705,7 @@ module.exports = {
   SUGGEST_MARK, parseSuggestedAnswers,
   EPIC_STEPS, epicChildrenJql, epicTaskStep, nextEpicTask, nextEpicStep, buildAdoptedAnswerBody, prBelongsToCard,
   EPIC_HIERARCHY_LEVEL, EPIC_LABEL_FALLBACK, topLevelIssueTypes, epicSearchJql, epicTypeLabel,
-  EPIC_AUTO_MERGE_MIN_DEFAULT, EPIC_AUTO_MERGE_MIN_LIMIT, clampAutoMergeMin, shouldAutoMerge,
+  EPIC_AUTO_MERGE_MIN_DEFAULT, EPIC_AUTO_MERGE_MIN_LIMIT, clampAutoMergeMin, shouldAutoMerge, mergeReadyState, isMergeReady,
   EPIC_RETRY_MAX_DEFAULT, EPIC_RETRY_MAX_LIMIT, EPIC_RETRY_BACKOFF_MIN, clampRetryMax,
   parseUsageLimitReset, classifyPause, planRetry,
   SLACK_ACTIONS, SLACK_ACTION_PREFIX, encodeSlackAction, decodeSlackAction, slackMessage, slackActorAllowed,

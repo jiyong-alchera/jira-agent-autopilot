@@ -108,3 +108,51 @@ test("셸용 알림 전송기가 액션 문자열을 버튼으로 변환한다",
   assert.strictEqual(parseAction("epic-resume", ctx).id, "epic-resume");
   assert.strictEqual(parseAction("nope", ctx), null);
 });
+
+// 실패해도 버튼이 남아야 한다 — 사라지면 Slack 에서 재시도할 방법이 없다.
+test("실패하면 원본 버튼을 남기고 사유만 덧붙인다", async () => {
+  const sent = [];
+  const orig = lib.slackMessage("승인됨", [act()]).blocks;
+  const p = { ...payload(lib.encodeSlackAction(act()), "U1"), response_url: "https://slack/r", message: { blocks: orig } };
+  const deps = {
+    getProjectCreds: () => ({ slackAllowUsers: "U1" }),
+    runAction: async () => ({ ok: false, errors: ["repo #51: CI 가 아직 진행 중이라 병합하지 않았습니다"] }),
+    fetch: null,
+  };
+  global.fetch = async (url, opt) => { sent.push(JSON.parse(opt.body)); return { ok: true, text: async () => "ok" }; };
+  await handleInteractive(p, deps);
+  const last = sent[sent.length - 1];
+  const btns = (last.blocks || []).find((b) => b.type === "actions");
+  assert.ok(btns, "실패 응답에 버튼 블록이 남아야 한다");
+  assert.strictEqual(btns.elements[0].action_id, "jaa:merge");
+  assert.match(JSON.stringify(last.blocks), /CI 가 아직 진행 중/);
+});
+
+test("성공하면 버튼을 없애 이중 실행을 막는다", async () => {
+  const sent = [];
+  const orig = lib.slackMessage("승인됨", [act()]).blocks;
+  const p = { ...payload(lib.encodeSlackAction(act()), "U1"), response_url: "https://slack/r", message: { blocks: orig } };
+  global.fetch = async (url, opt) => { sent.push(JSON.parse(opt.body)); return { ok: true, text: async () => "ok" }; };
+  await handleInteractive(p, {
+    getProjectCreds: () => ({ slackAllowUsers: "U1" }),
+    runAction: async () => ({ ok: true, merged: 1 }),
+  });
+  const last = sent[sent.length - 1];
+  assert.strictEqual(last.blocks, undefined, "성공 응답에는 버튼이 남지 않아야 한다");
+  assert.match(last.text, /병합 완료/);
+});
+
+test("재시도해도 결과 줄이 쌓이지 않는다", async () => {
+  const sent = [];
+  const withNote = [...lib.slackMessage("승인됨", [act()]).blocks,
+    { type: "context", block_id: "jaa-note", elements: [{ type: "mrkdwn", text: "이전 실패" }] }];
+  const p = { ...payload(lib.encodeSlackAction(act()), "U1"), response_url: "https://slack/r", message: { blocks: withNote } };
+  global.fetch = async (url, opt) => { sent.push(JSON.parse(opt.body)); return { ok: true, text: async () => "ok" }; };
+  await handleInteractive(p, {
+    getProjectCreds: () => ({ slackAllowUsers: "U1" }),
+    runAction: async () => ({ ok: false, message: "또 실패" }),
+  });
+  const notes = (sent[sent.length - 1].blocks || []).filter((b) => b.block_id === "jaa-note");
+  assert.strictEqual(notes.length, 1);
+  assert.match(notes[0].elements[0].text, /또 실패/);
+});

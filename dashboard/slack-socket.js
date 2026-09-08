@@ -54,15 +54,26 @@ function resultLine(actId, r) {
 }
 
 // 원본 메시지를 결과로 교체한다 — 버튼이 사라지므로 중복 클릭·이중 병합이 막힌다.
-async function respond(responseUrl, text, replaceOriginal) {
+async function respond(responseUrl, text, replaceOriginal, blocks) {
   if (!responseUrl) return;
+  const body = { text, replace_original: !!replaceOriginal, response_type: "in_channel" };
+  if (blocks) body.blocks = blocks;
   try {
     await fetch(responseUrl, {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text, replace_original: !!replaceOriginal, response_type: "in_channel" }),
-      signal: AbortSignal.timeout(10000),
+      body: JSON.stringify(body), signal: AbortSignal.timeout(10000),
     });
   } catch {}
+}
+
+const NOTE_BLOCK_ID = "jaa-note";   // 우리가 덧붙인 결과 줄 — 재시도할 때 갈아끼운다
+
+// 실패했을 때 쓸 블록: 원본(버튼 포함)을 그대로 두고 사유 한 줄만 덧붙인다.
+// 실패는 되돌릴 게 없으므로 버튼을 지우면 Slack 에서 재시도할 방법이 사라진다.
+function blocksWithNote(originalBlocks, note) {
+  const kept = (originalBlocks || []).filter((b) => b && b.block_id !== NOTE_BLOCK_ID);
+  if (!kept.length) return null;
+  return [...kept, { type: "context", block_id: NOTE_BLOCK_ID, elements: [{ type: "mrkdwn", text: note }] }];
 }
 
 // payload 1건 처리. 테스트 가능하도록 소켓과 분리했다.
@@ -83,9 +94,14 @@ async function handleInteractive(payload, deps) {
   }
 
   const label = (lib.SLACK_ACTIONS[act.id] || {}).label || act.id;
+  const original = (payload.message && payload.message.blocks) || null;
   await respond(responseUrl, `⏳ [${act.key}] ${label} 실행 중… (요청: <@${userId}>)`, true);
   const r = await (deps.runAction || runAction)(deps.baseUrl, act);
-  await respond(responseUrl, `[${act.key}] ${label} · <@${userId}>\n${resultLine(act.id, r)}`, true);
+  const line = resultLine(act.id, r);
+  const failed = !r || r.ok === false;
+  // 실패 → 버튼을 살려둬 다시 누를 수 있게, 성공 → 결과로 교체해 이중 실행을 막는다.
+  const keep = failed ? blocksWithNote(original, `${line} · <@${userId}>`) : null;
+  await respond(responseUrl, `[${act.key}] ${label} · <@${userId}>\n${line}`, true, keep);
   return r;
 }
 

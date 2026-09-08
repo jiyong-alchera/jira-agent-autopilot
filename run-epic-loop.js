@@ -485,7 +485,7 @@ async function stepAwaitMerge(task) {
   await slack(`⏳ [${EPIC_KEY}] ${task.key} PR 병합 대기 중 — 병합하면 다음 태스크로 넘어갑니다.`
     + (o0.autoMerge ? ` (승인 상태로 ${o0.autoMergeAfterMin}분 경과 시 자동 병합)` : ""),
     [{ id: "merge", project: project.id, key: task.key }, ...epicBtn("epic-stop")]);
-  let autoMergeTried = false;
+  let autoMergeTried = false, readyNotified = false;
   for (;;) {
     if (stopRequested()) return { ok: false, stop: true };
     const dash = process.env.DASHBOARD_URL;
@@ -499,7 +499,20 @@ async function stepAwaitMerge(task) {
     // 자동 병합 판정 — 옵션은 매 회 다시 읽어 실행 중 on/off 가 바로 반영되게 한다.
     const opts = readOpts();
     let openPRs = [], prsErr = "";
-    if (opts.autoMerge) { try { openPRs = await cardOpenPRs(task.key); } catch (e) { prsErr = e.message; } }
+    // 자동 병합이 꺼져 있어도 '병합만 남음' 을 한 번은 알려야 하므로 그때까지는 PR 을 본다.
+    const needPRs = opts.autoMerge || !readyNotified;
+    if (needPRs) { try { openPRs = await cardOpenPRs(task.key); } catch (e) { prsErr = e.message; } }
+
+    // 승인 + CI 통과가 되는 순간 병합 버튼을 1회 보낸다. 리뷰 루프의 승인 알림은 승인 시점에
+    // 딱 한 번 나가는데 그때는 CI 가 아직 도는 경우가 많아, 그 버튼이 CI 게이트에 막히고
+    // 이후 CI 가 초록이 돼도 아무도 알려주지 않던 빈틈을 메운다.
+    if (needPRs && !prsErr && !readyNotified && lib.isMergeReady(openPRs)) {
+      readyNotified = true;
+      const btns = [{ id: "merge", project: project.id, key: task.key }];
+      if (openPRs.length === 1) btns.push({ url: openPRs[0].url, label: "🔗 PR 열기" });
+      log(`${task.key} 승인 + CI 통과 → 병합 대기 알림 (PR ${openPRs.length}건)`);
+      await slack(`✅ [${EPIC_KEY}] ${task.key} — 리뷰 승인 + CI 통과. 병합만 남았습니다 (PR ${openPRs.length}건).`, btns);
+    }
     // 조회 자체가 실패한 회차는 판정하지 않는다 — '못 물어봤다'를 '열린 PR 이 없다'로 읽으면
     // 승인·CI 게이트를 통째로 건너뛰게 된다. 다음 폴링에서 다시 본다.
     const d = prsErr ? { merge: false, reason: "pr-lookup-failed" }

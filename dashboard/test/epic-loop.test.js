@@ -389,3 +389,26 @@ test("classifyPause: CI 수정 반복 소진은 사람 확인 대상(재시도 �
   assert.equal(u.retryable, true);
   assert.equal(u.kind, "usage-limit");
 });
+
+// ----- '병합만 남음' 판정 (await-merge 알림 + 자동 병합이 공유) -----
+test("mergeReadyState: 승인 + CI 통과일 때만 ready", () => {
+  assert.equal(lib.mergeReadyState([{ ci: "pass", approved: true }]), "ready");
+  assert.equal(lib.mergeReadyState([{ ci: "pass", approved: true }, { ci: "pass", approved: true }]), "ready");
+  assert.equal(lib.mergeReadyState([]), "no-open-pr");
+  assert.equal(lib.mergeReadyState([{ ci: "pending", approved: true }]), "ci-pending");
+  assert.equal(lib.mergeReadyState([{ ci: "fail", approved: true }]), "ci-failed");
+  assert.equal(lib.mergeReadyState([{ ci: "unknown", approved: true }]), "ci-unknown");
+  assert.equal(lib.mergeReadyState([{ ci: "pass", approved: false }]), "not-approved");
+  // 한 건이라도 막히면 전체가 막힌다
+  assert.equal(lib.mergeReadyState([{ ci: "pass", approved: true }, { ci: "pending", approved: true }]), "ci-pending");
+});
+
+test("shouldAutoMerge 는 mergeReadyState 의 사유를 그대로 쓴다", () => {
+  const t = Date.parse("2026-01-01T00:00:00Z");
+  assert.equal(lib.shouldAutoMerge({ autoMerge: true }, "2026-01-01T00:00:00Z", [{ ci: "pending", approved: true }], t).reason, "ci-pending");
+  assert.equal(lib.shouldAutoMerge({ autoMerge: true }, "2026-01-01T00:00:00Z", [{ ci: "pass", approved: false }], t).reason, "not-approved");
+  assert.equal(lib.shouldAutoMerge({ autoMerge: false }, "2026-01-01T00:00:00Z", [{ ci: "pass", approved: true }], t).reason, "off");
+  // 준비됐지만 대기 시간 전
+  const r = lib.shouldAutoMerge({ autoMerge: true, autoMergeAfterMin: 10 }, "2026-01-01T00:00:00Z", [{ ci: "pass", approved: true }], t);
+  assert.equal(r.merge, false); assert.equal(r.reason, "waiting");
+});
