@@ -51,6 +51,7 @@ npm start
 | Anthropic API Key | 루프 안의 `claude` 실행 | `ANTHROPIC_API_KEY` 환경변수로 주입 |
 | GitHub Token | clone / push / PR | `GH_TOKEN` 환경변수로 주입 (gh·git 자격증명) |
 | Atlassian 이메일+토큰 | 대시보드 카드 상태 조회 | 백엔드가 Jira REST(Basic auth) 호출 |
+| Slack App-Level Token | 알림 버튼 클릭 수신 | 대시보드가 Socket Mode(아웃바운드 WebSocket)로 접속 — 포트 개방 불필요 |
 
 > 참고: 루프 안에서 `claude` 가 Jira에 코멘트/상태 전환을 하는 부분은 여전히
 > Claude Code 의 **Atlassian MCP(OAuth)** 인증을 사용합니다(`claude mcp add atlassian`).

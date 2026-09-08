@@ -192,8 +192,8 @@ test("buildReplyADF: replyTo 없으면 인용/멘션 없음", () => {
 });
 
 test("maskCreds: 토큰은 boolean, 이메일은 평문", () => {
-  const m = lib.maskCreds({ anthropicApiKey: "sk", openaiApiKey: "", geminiApiKey: "g", githubToken: "", atlassianEmail: "a@b.c", atlassianToken: "t", slackWebhookUrl: "u" });
-  assert.deepEqual(m, { anthropicApiKey: true, openaiApiKey: false, geminiApiKey: true, githubToken: false, atlassianEmail: "a@b.c", atlassianToken: true, slackWebhookUrl: true });
+  const m = lib.maskCreds({ anthropicApiKey: "sk", openaiApiKey: "", geminiApiKey: "g", githubToken: "", atlassianEmail: "a@b.c", atlassianToken: "t", slackWebhookUrl: "u", slackAppToken: "xapp", slackAllowUsers: "U1" });
+  assert.deepEqual(m, { anthropicApiKey: true, openaiApiKey: false, geminiApiKey: true, githubToken: false, atlassianEmail: "a@b.c", atlassianToken: true, slackWebhookUrl: true, slackAppToken: true, slackAllowUsers: "U1" });
 });
 
 test("applyCreds: 빈값 유지 / __CLEAR__ 삭제 / 값 갱신", () => {
@@ -205,6 +205,9 @@ test("applyCreds: 빈값 유지 / __CLEAR__ 삭제 / 값 갱신", () => {
   assert.equal(next.githubToken, "new");        // 값 → 갱신
   assert.equal(next.atlassianToken, "");        // __CLEAR__ → 삭제
   assert.equal(next.slackWebhookUrl, "u");      // 미지정 → 유지
+  assert.equal(lib.applyCreds(cur, { slackAppToken: "xapp-1" }).slackAppToken, "xapp-1");
+  assert.equal(lib.applyCreds({ ...cur, slackAllowUsers: "U1" }, {}).slackAllowUsers, "U1");        // 미지정 → 유지
+  assert.equal(lib.applyCreds({ ...cur, slackAllowUsers: "U1" }, { slackAllowUsers: "" }).slackAllowUsers, "");  // 목록은 빈값으로 비울 수 있다
 });
 
 test("createStore: 마이그레이션 + CRUD + 자격증명", () => {

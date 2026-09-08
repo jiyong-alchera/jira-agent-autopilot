@@ -355,7 +355,7 @@ function ProjectCard({ proj, onDeleted, flash, jumpTo }) {
 
   const [config, setConfig] = useState(proj);
   const [creds, setCreds] = useState({});
-  const [credInput, setCredInput] = useState({ anthropicApiKey: "", openaiApiKey: "", geminiApiKey: "", githubToken: "", atlassianEmail: "", atlassianToken: "", slackWebhookUrl: "" });
+  const [credInput, setCredInput] = useState({ anthropicApiKey: "", openaiApiKey: "", geminiApiKey: "", githubToken: "", atlassianEmail: "", atlassianToken: "", slackWebhookUrl: "", slackAppToken: "", slackAllowUsers: "" });
   const [jiraMeta, setJiraMeta] = useState({ issueTypes: [], epics: [], epicLabel: "에픽", loaded: false, err: "" });
   const [jiraStatuses, setJiraStatuses] = useState({ list: [], loaded: false, err: "" });   // 상태→단계 매핑 UI용
   const [newCard, setNewCard] = useState({ issueType: "", summary: "", description: "", epicKey: "", parentInput: "", addTriggerLabel: true, assignSelf: true, attachments: [], repos: [], env: "" });
@@ -396,7 +396,7 @@ function ProjectCard({ proj, onDeleted, flash, jumpTo }) {
 
   const loadCreds = async () => {
     const c = await api.get(`/api/projects/${PID}/credentials`);
-    setCreds(c); setCredInput((p) => ({ ...p, atlassianEmail: c.atlassianEmail || "" }));
+    setCreds(c); setCredInput((p) => ({ ...p, atlassianEmail: c.atlassianEmail || "", slackAllowUsers: c.slackAllowUsers || "" }));
   };
   const loadMeta = async () => {
     const r = await api.get(withP("/api/jira/meta"));
@@ -433,7 +433,7 @@ function ProjectCard({ proj, onDeleted, flash, jumpTo }) {
   const saveConfig = async () => { const r = await api.post("/api/projects", { ...config, id: PID }); if (r.ok) { setConfig(r.project); flash("설정 저장됨"); loadMeta(); } };
   const saveCreds = async () => {
     await api.post(`/api/projects/${PID}/credentials`, credInput);
-    setCredInput((p) => ({ ...p, anthropicApiKey: "", openaiApiKey: "", geminiApiKey: "", githubToken: "", atlassianToken: "", slackWebhookUrl: "" }));
+    setCredInput((p) => ({ ...p, anthropicApiKey: "", openaiApiKey: "", geminiApiKey: "", githubToken: "", atlassianToken: "", slackWebhookUrl: "", slackAppToken: "" }));
     loadCreds(); flash("자격증명 저장됨");
   };
   const refineDesc = async () => {
@@ -765,6 +765,10 @@ function ProjectCard({ proj, onDeleted, flash, jumpTo }) {
             info={"카드 조회·탐지·등록·완료 처리에 쓰는 Jira API 토큰입니다.\n\nid.atlassian.com/manage-profile/security/api-tokens 에서 발급하세요. 위 Atlassian 이메일과 함께 사용됩니다."} />
           <Field label={`Slack Webhook ${credSet("slackWebhookUrl") ? "✓" : ""}`} type="password" value={credInput.slackWebhookUrl} onChange={(v) => setCredInput({ ...credInput, slackWebhookUrl: v })} placeholder={credSet("slackWebhookUrl") ? "••• 저장됨" : "https://hooks.slack.com/services/..."}
             info={"처리 완료/실패 알림을 보낼 Slack Incoming Webhook URL입니다(선택).\n\n비우면 알림을 보내지 않습니다."} />
+          <Field label={`Slack App-Level Token ${credSet("slackAppToken") ? "✓" : ""}`} type="password" value={credInput.slackAppToken} onChange={(v) => setCredInput({ ...credInput, slackAppToken: v })} placeholder={credSet("slackAppToken") ? "••• 저장됨" : "xapp-..."}
+            info={"Slack 알림 메시지의 버튼(병합·이어서 진행 등)을 눌렀을 때 그 클릭을 받기 위한 App-Level Token 입니다(선택).\n\nSlack 앱 설정에서 Socket Mode 를 켜고 connections:write 스코프로 발급하세요. Socket Mode 는 아웃바운드 WebSocket 이라 대시보드 포트를 외부에 열 필요가 없습니다.\n\n비우면 알림은 그대로 오고 버튼만 동작하지 않습니다. 저장 후 대시보드를 재시작해야 연결됩니다."} />
+          <Field label="Slack 실행 허용 사용자" value={credInput.slackAllowUsers} onChange={(v) => setCredInput({ ...credInput, slackAllowUsers: v })} placeholder="U01ABCDEF, U02GHIJKL"
+            info={"Slack 버튼을 눌러 병합·재개를 실행할 수 있는 Slack 사용자 ID 목록입니다(쉼표 구분).\n\n비워두면 아무도 실행할 수 없습니다 — 채널의 누구나 병합하는 것을 막기 위한 기본값입니다.\n\n사용자 ID 는 Slack 프로필 → 더보기 → '멤버 ID 복사' 에서 확인합니다(U 로 시작)."} />
         </div>
       </SubSection>
 

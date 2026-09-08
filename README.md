@@ -21,6 +21,7 @@ Jira 카드를 자동 탐지해 **Claude로 개발 → PR 생성 → 카드 완�
 ```
 
 - 중간 실패는 카드별 재시도/백오프 후 `claude-failed` 라벨로 격리, 완료/실패는 Slack 알림(설정 시).
+- Slack 알림 메시지의 버튼으로 **병합·이어서 진행·재실행을 원격 수행**(설정 시). Socket Mode 라 포트를 열지 않는다 — DOCUMENTATION.md 7.5 참고.
 - 탐지는 대시보드 백엔드의 Jira REST 를 우선 사용하고(결정적·저비용), 실패 시 claude(+MCP)로 폴백합니다.
 
 ## 구성
@@ -78,6 +79,7 @@ npm test           # 단위 테스트 (node:test, 무설치) — lib.js 순수 �
 - Node.js ≥ 18 (대시보드 + claude 실행 전사 렌더러)
 - Atlassian 이메일 + API 토큰 (대시보드의 카드 조회·REST 탐지·카드 등록/답변용 — 자격증명 섹션에 입력)
 - (선택) Slack Incoming Webhook (처리 완료/실패 알림)
+- (선택) Slack App-Level Token (`xapp-`, Socket Mode) — 알림 버튼으로 원격 병합·재개까지 하려면 필요
 
 ## 설정 항목 (환경변수 / 대시보드 공통)
 

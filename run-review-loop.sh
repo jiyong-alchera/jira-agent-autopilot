@@ -51,6 +51,15 @@ notify_slack() {
   curl -fsS -X POST -H 'Content-type: application/json' \
     --data "{\"text\":\"$1\"}" "${SLACK_WEBHOOK_URL}" >/dev/null 2>&1 || true
 }
+
+# 버튼(Block Kit) 포함 알림 — Slack 에서 바로 병합·재개 등을 실행하게 한다.
+# 인자: <텍스트> [액션 ...]  (액션 형식은 slack-notify.js 참고). node 가 없으면 텍스트만 보낸다.
+notify_slack_btn() {
+  [[ -z "${SLACK_WEBHOOK_URL:-}" ]] && return 0
+  if ! command -v node >/dev/null 2>&1; then notify_slack "$1"; return 0; fi
+  ISSUE_KEY="${ISSUE_KEY:-}" PROJECT_ID="${PROJECT_ID:-}" \
+    node "${SELF_DIR}/slack-notify.js" "$@" >/dev/null 2>&1 || true
+}
 record_history() {  # result
   local ts; ts="$(date -u +%FT%TZ)"
   mkdir -p "$(dirname "${HISTORY_FILE}")"
@@ -170,7 +179,7 @@ while (( ITER < REVIEW_LOOP_MAX )); do
       NOOP_STREAK=$(( NOOP_STREAK + 1 ))
       if (( NOOP_STREAK >= 2 )); then
         echo ">> [${ISSUE_KEY}] ${ITER}회차도 반영할 새 피드백 없음(연속 ${NOOP_STREAK}회) → 진전 없음, 루프 중단" >&2
-        notify_slack "⏸ [${ISSUE_KEY}] 리뷰 승인 루프 ${ITER}/${REVIEW_LOOP_MAX}회차 — 반영할 새 피드백이 없어 진전 없음, 사람 확인 필요 · ${OR}#${PR_NUM} · ${PR_URL}"
+        notify_slack_btn "⏸ [${ISSUE_KEY}] 리뷰 승인 루프 ${ITER}/${REVIEW_LOOP_MAX}회차 — 반영할 새 피드백이 없어 진전 없음, 사람 확인 필요 · ${OR}#${PR_NUM}" "merge:${OR}:${PR_NUM}" "url:🔗 PR 열기:${PR_URL}"
         FINAL="noop"; break
       fi
       echo ">> [${ISSUE_KEY}] ${ITER}회차 반영할 새 피드백 없음 → 재리뷰로 판정"
@@ -192,7 +201,7 @@ while (( ITER < REVIEW_LOOP_MAX )); do
   # 3) 판정 — 승인 마커는 GitHub 에서 재확인(신뢰 가능한 판정)
   if is_approved; then
     echo ">> [${ISSUE_KEY}] ${OR}#${PR_NUM} ${ITER}회차에서 리뷰 승인 → 루프 종료"
-    notify_slack "✅ [${ISSUE_KEY}] 리뷰 승인 완료 (루프 ${ITER}/${REVIEW_LOOP_MAX}회차) · ${OR}#${PR_NUM} · ${PR_URL}"
+    notify_slack_btn "✅ [${ISSUE_KEY}] 리뷰 승인 완료 (루프 ${ITER}/${REVIEW_LOOP_MAX}회차) · ${OR}#${PR_NUM}" "merge:${OR}:${PR_NUM}" "url:🔗 PR 열기:${PR_URL}"
     record_history "approved"
     FINAL="approved"; break
   fi
@@ -203,7 +212,7 @@ done
 
 if [[ "${FINAL}" == "exhausted" ]]; then
   echo ">> [${ISSUE_KEY}] ${OR}#${PR_NUM} ${REVIEW_LOOP_MAX}회 반복 후에도 미승인 → 사람 확인 필요"
-  notify_slack "⏸ [${ISSUE_KEY}] 리뷰 승인 루프 ${REVIEW_LOOP_MAX}회 반복 후에도 미승인 — 사람 확인 필요 · ${OR}#${PR_NUM} · ${PR_URL}"
+  notify_slack_btn "⏸ [${ISSUE_KEY}] 리뷰 승인 루프 ${REVIEW_LOOP_MAX}회 반복 후에도 미승인 — 사람 확인 필요 · ${OR}#${PR_NUM}" "review-loop:${OR}:${PR_NUM}" "merge:${OR}:${PR_NUM}" "url:🔗 PR 열기:${PR_URL}"
   record_history "failed"
 fi
 [[ "${FINAL}" == "approved" ]] && exit 0

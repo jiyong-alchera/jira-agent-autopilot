@@ -572,6 +572,8 @@ Jira 카드를 자동으로 탐지해 **Claude가 개발 → PR 생성 → 카�
 | 빌드 명령 | `BUILD_CMD` | (없음=자동 감지) | 테스트 없을 때 시도할 빌드 명령 |
 | 이력 파일 | `HISTORY_FILE` | `<WORK_DIR>/history.jsonl` | 처리 이력 기록 파일(대시보드 `/api/history` 가 읽음) |
 | Slack 웹훅 | `SLACK_WEBHOOK_URL` | (없음) | 설정 시 처리 완료/실패 알림 발송, 비면 스킵 |
+| Slack App-Level Token | (자격증명 `slackAppToken`) | (없음) | 알림 버튼 클릭을 받는 Socket Mode 토큰(`xapp-`, scope `connections:write`). 비면 버튼 수신 비활성. **저장 후 대시보드 재시작 시 연결** |
+| Slack 실행 허용 사용자 | (자격증명 `slackAllowUsers`) | (없음=전원 거부) | 버튼으로 병합·재개를 실행할 수 있는 Slack 사용자 ID 목록(쉼표 구분). **비우면 아무도 실행할 수 없다** — 채널의 누구나 병합하는 것을 막는 기본값 |
 | 주기(초) | `LOOP_INTERVAL` | `3600` | plan/build 루프 주기 |
 | review 주기(초) | `REVIEW_LOOP_INTERVAL` (설정 `reviewIntervalSeconds`) | `3600` | review 루프 주기(별도) |
 | PR 승인 마커 | (고정) `CLAUDE-REVIEW-APPROVED` | — | review 루프가 PR 승인 표시로 남기는 고유 코멘트 텍스트. 존재하면 이후 리뷰 스킵(lib `REVIEW_APPROVED_MARKER`) |
@@ -693,6 +695,42 @@ tail -f loop-plan.log loop-build.log
 
 ---
 
+### 7.5 Slack 알림 버튼으로 원격 조작
+
+알림 메시지에 실행 버튼을 붙여, Slack 에서 바로 **병합·재개·재실행**을 수행한다.
+
+**왜 Socket Mode 인가** — 버튼 클릭을 받으려면 Slack 이 우리 서버로 POST 를 보내야 하는데,
+이 대시보드는 로컬 전용이라 공개 URL 이 없다. Socket Mode 는 대시보드가 Slack 으로
+**아웃바운드 WebSocket** 을 열어 이벤트를 받으므로 **포트 개방·터널링이 전혀 필요 없다**.
+메시지 갱신은 클릭 payload 의 `response_url` 로 하므로 봇 토큰도 필요 없다.
+
+**준비**(Slack 앱 설정 1회)
+1. Socket Mode 켜기 → App-Level Token 발급(scope `connections:write`, `xapp-` 로 시작)
+2. Interactivity 켜기 (Socket Mode 면 Request URL 불필요)
+3. 대시보드 → 자격증명에 **App-Level Token** 과 **실행 허용 사용자**(Slack 멤버 ID) 저장 후 **대시보드 재시작**
+
+**버튼이 붙는 알림과 동작**
+
+| 알림 | 버튼 | 호출되는 API |
+|------|------|--------------|
+| `✅ 리뷰 승인 완료` / `✅ PR 리뷰 승인` | `🔀 병합` · `🔗 PR 열기` | `POST /api/cards/:key/merge` |
+| `⏸ 상한 도달·진전 없음 — 사람 확인 필요` | `🔁 재리뷰 루프` · `🔀 병합` · `🔗 PR` | `POST /api/cards/:key/review-loop` |
+| `⏸ 에픽 중단(paused)` | `▶️ 이어서 진행` · `⏭ 건너뛰기` · `⏹ 중지` | `POST /api/epics/:key/run/resume{,skip}` · `/run/stop` |
+| `⏳ PR 병합 대기 중` | `🔀 병합` · `⏹ 중지` | `POST /api/cards/:key/merge` |
+| `❌ 카드 처리 실패` | `🔁 다시 실행` | `POST /api/cards/:key/run` |
+
+**안전장치**
+- **허용 사용자 화이트리스트**: `slackAllowUsers` 에 없는 사람이 누르면 실행되지 않고 거부 안내만 뜬다.
+  **비워두면 전원 거부**가 기본값이다 — 채널의 누구나 병합하는 상황을 막는다.
+- **CI 게이트 유지**: 버튼은 대시보드 라우트를 그대로 호출하므로, CI 실패·진행 중 PR 은
+  화면에서 누를 때와 똑같이 병합되지 않는다([4.4](#44-대시보드-백엔드) 병합 참고).
+- **중복 클릭 방지**: 클릭 즉시 원본 메시지를 `⏳ 실행 중…` → 결과로 교체해 버튼이 사라진다.
+- **payload 검증**: 버튼 `value` 는 화이트리스트에 있는 동작 id 와 이슈 키 형식(`ABC-123`)만 통과한다.
+
+**끄려면** App-Level Token 을 비우면 된다 — 알림은 그대로 오고 버튼만 동작하지 않는다.
+
+---
+
 ## 8. 인증 구조
 
 | 인증 | 사용처 | 주입/사용 방식 | 비우면 |
@@ -703,6 +741,7 @@ tail -f loop-plan.log loop-build.log
 | GitHub Token | clone / push / PR | `GH_TOKEN` 환경변수(gh·git) | 로컬 `gh auth`로 폴백 |
 | Atlassian 이메일+토큰 | 대시보드 카드 조회(REST) | 백엔드 Basic auth | 카드 조회 화면만 동작 안 함 |
 | Slack Incoming Webhook | 처리 완료/실패 알림 | `SLACK_WEBHOOK_URL` 환경변수(루프→curl) | 알림 스킵 |
+| Slack App-Level Token | 알림 메시지의 **버튼 클릭 수신**(Socket Mode) | 대시보드가 `xapp-` 토큰으로 아웃바운드 WebSocket 접속(자격증명 `slackAppToken`) | 알림은 오고 버튼만 동작 안 함 |
 
 > 중요: 루프 안에서 `claude`가 Jira에 코멘트/상태 전환을 하는 부분은 **Claude Code의 Atlassian MCP(OAuth)**를 사용합니다.
 > 대시보드에 넣는 Atlassian 토큰은 대시보드 자체의 카드 조회용입니다.
@@ -737,17 +776,20 @@ loop-work/                     # (= 저장소 루트)
 ├─ lib-office.js               # docx·xlsx·pptx → 텍스트 변환(최소 zip 리더 + XML 파싱, 무의존성)
 ├─ append-summary.js           # 완료 요약을 설명 ADF 에 안전 append(기존 이미지/노드 보존)
 ├─ render-claude-stream.js     # claude stream-json → 사람이 읽는 전사 + 결과 추출
+├─ slack-notify.js             # 셸 스크립트용 Slack 알림 전송기(버튼 포함 Block Kit)
 ├─ history.jsonl               # 처리 이력 JSONL (gitignore, 런타임 생성)
 ├─ loop-*.pid                  # 루프 pidfile (gitignore, 런타임 생성)
 ├─ agent-logs/                # 카드별 claude 상세 실행 로그 (gitignore, 런타임 생성)
 └─ dashboard/
    ├─ server.js                # Express 백엔드 (라우팅·루프·Jira REST)
    ├─ lib.js                   # 순수 로직 + 프로젝트 스토어 (단위 테스트 대상)
+   ├─ slack-socket.js          # Slack 버튼 클릭 수신(Socket Mode) → 대시보드 API 실행
    ├─ test/lib.test.js         # 단위 테스트 (node:test) — `npm test`
    ├─ test/review-loop.test.js # run-review-loop.sh 회귀 테스트 (하위 스크립트·gh 스텁, 네트워크 불필요)
    ├─ test/attachments.test.js # 카드 첨부(이미지·문서) 인식 회귀 테스트 (fetch 스텁, 네트워크 불필요)
    ├─ test/office.test.js      # docx·xlsx·pptx 변환 테스트 (실제 zip 컨테이너를 만들어 검증)
    ├─ test/epic-loop.test.js   # 에픽 연속 개발 순수 로직(단계 판정·다음 태스크·제안 답변 채택) 테스트
+   ├─ test/slack-actions.test.js # Slack 버튼 블록 생성·payload 디코드·권한 판정 테스트
    ├─ package.json
    ├─ public/index.html        # React 대시보드 (CDN)
    ├─ projects.json            # 프로젝트 목록(설정) (gitignore)

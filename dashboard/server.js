@@ -1655,5 +1655,11 @@ app.listen(PORT, () => {
   setInterval(scanRetries, EPIC_RETRY_SCAN_MS).unref?.();
   setTimeout(scanRetries, 12000).unref?.();
   console.log(`  에픽 자동 재시도 감시: ${EPIC_RETRY_SCAN_MS / 1000}s 주기`);
+  // Slack 알림 버튼 수신(Socket Mode) — 아웃바운드 WebSocket 이라 포트를 열지 않는다.
+  try {
+    require("./slack-socket").startSlackSocket({
+      listProjects, getProjectCreds, baseUrl: `http://127.0.0.1:${PORT}`,
+    });
+  } catch (e) { console.warn("  Slack 버튼 수신 시작 실패:", e.message); }
   console.log("");
 });

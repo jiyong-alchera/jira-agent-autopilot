@@ -147,6 +147,15 @@ notify_slack() {
     --data "{\"text\":\"${text}\"}" "${SLACK_WEBHOOK_URL}" >/dev/null 2>&1 || true
 }
 
+# 버튼(Block Kit) 포함 알림 — Slack 에서 바로 병합·재개 등을 실행하게 한다.
+# 인자: <텍스트> [액션 ...]  (액션 형식은 slack-notify.js 참고). node 가 없으면 텍스트만 보낸다.
+notify_slack_btn() {
+  [[ -z "${SLACK_WEBHOOK_URL:-}" ]] && return 0
+  if ! command -v node >/dev/null 2>&1; then notify_slack "$1"; return 0; fi
+  ISSUE_KEY="${ISSUE_KEY:-}" PROJECT_ID="${PROJECT_ID:-}" \
+    node "${SELF_DIR}/slack-notify.js" "$@" >/dev/null 2>&1 || true
+}
+
 # ===== 처리 이력 기록 (JSONL 한 줄 추가) =====
 # 값은 이슈키/단계/결과/URL/브랜치 등 토큰류라 별도 JSON escape 없이 안전.
 record_history() {
@@ -629,7 +638,7 @@ else
 ---
 ${ERR_TAIL}
 ---" || true
-    notify_slack "❌ [${ISSUE_KEY}] ${PHASE} 처리 실패 (${MAX_RETRIES}회 연속) — 수동 확인 필요"
+    notify_slack_btn "❌ [${ISSUE_KEY}] ${PHASE} 처리 실패 (${MAX_RETRIES}회 연속) — 수동 확인 필요" "card-run:${PHASE}"
   fi
   exit 1
 fi

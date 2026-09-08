@@ -149,11 +149,15 @@ async function fetchTask(key) {
 }
 
 // ----- 알림 / 이력 -----
-async function slack(text) {
+async function slack(text, actions) {
   const url = cred.slackWebhookUrl;
   if (!url) return;
-  try { await fetch(url, { method: "POST", headers: { "Content-type": "application/json" }, body: JSON.stringify({ text }), signal: AbortSignal.timeout(10000) }); } catch {}
+  // actions 가 있으면 Block Kit 버튼을 붙인다 — Slack 에서 바로 병합·재개할 수 있다.
+  const payload = actions && actions.length ? lib.slackMessage(text, actions) : { text };
+  try { await fetch(url, { method: "POST", headers: { "Content-type": "application/json" }, body: JSON.stringify(payload), signal: AbortSignal.timeout(10000) }); } catch {}
 }
+// 이 에픽 실행에 대한 버튼 묶음(프로젝트·에픽 키는 항상 같다)
+const epicBtn = (...ids) => ids.map((id) => ({ id, project: project.id, key: EPIC_KEY }));
 function history(key, result, extra) {
   try {
     fs.appendFileSync(HISTORY_FILE, JSON.stringify({
@@ -479,7 +483,8 @@ async function stepAwaitMerge(task) {
   const waitStartedAt = STATE.stepStartedAt || nowIso();
   const o0 = readOpts();
   await slack(`⏳ [${EPIC_KEY}] ${task.key} PR 병합 대기 중 — 병합하면 다음 태스크로 넘어갑니다.`
-    + (o0.autoMerge ? ` (승인 상태로 ${o0.autoMergeAfterMin}분 경과 시 자동 병합)` : ""));
+    + (o0.autoMerge ? ` (승인 상태로 ${o0.autoMergeAfterMin}분 경과 시 자동 병합)` : ""),
+    [{ id: "merge", project: project.id, key: task.key }, ...epicBtn("epic-stop")]);
   let autoMergeTried = false;
   for (;;) {
     if (stopRequested()) return { ok: false, stop: true };
@@ -585,7 +590,7 @@ const STEP_FN = { prepare: stepPrepare, plan: stepPlan, adopt: stepAdopt, build:
       if (!r || !r.ok) {
         const reason = (r && r.reason) || `${step} 실패`;
         log(`중단: ${reason}`);
-        await slack(`⏸ [${EPIC_KEY}] ${task.key} · ${step} 에서 중단 — ${reason}\n대시보드에서 조치 후 [이어서 진행] 하세요.`);
+        await slack(`⏸ [${EPIC_KEY}] ${task.key} · ${step} 에서 중단 — ${reason}`, epicBtn("epic-resume", "epic-skip", "epic-stop"));
         history(task.key, "paused");
         finish("paused", `${task.key} · ${step}: ${reason}`, 1, { lastError: r.lastError || "", pausedAt: nowIso() });
       }

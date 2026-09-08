@@ -61,6 +61,15 @@ notify_slack() {
     --data "{\"text\":\"$1\"}" "${SLACK_WEBHOOK_URL}" >/dev/null 2>&1 || true
 }
 
+# 버튼(Block Kit) 포함 알림 — Slack 에서 바로 병합·재개 등을 실행하게 한다.
+# 인자: <텍스트> [액션 ...]  (액션 형식은 slack-notify.js 참고). node 가 없으면 텍스트만 보낸다.
+notify_slack_btn() {
+  [[ -z "${SLACK_WEBHOOK_URL:-}" ]] && return 0
+  if ! command -v node >/dev/null 2>&1; then notify_slack "$1"; return 0; fi
+  ISSUE_KEY="${ISSUE_KEY:-}" PROJECT_ID="${PROJECT_ID:-}" \
+    node "${SELF_DIR}/slack-notify.js" "$@" >/dev/null 2>&1 || true
+}
+
 # 동시 실행 방지 락(빌드 락과 별개 — review 전용)
 STATE_DIR="${CLONE_BASE}/.state"; mkdir -p "${STATE_DIR}"
 LOCK_DIR="${STATE_DIR}/${ISSUE_KEY}.review.lock"
@@ -157,7 +166,7 @@ for OR in "${R_OWNER[@]}"; do
       if [[ "${BOT_REVIEW_CNT:-0}" -ge 1 ]]; then
         if [[ "${BOT_REVIEW_CNT}" -ge "${MAX_AUTO_REWORK}" ]]; then
           echo ">> [${ISSUE_KEY}] ${OR}#${N} 자동 리뷰 반영 ${BOT_REVIEW_CNT}회에도 미승인 → 자동 반영/리뷰 중단(사람 확인 필요)"
-          notify_slack "⏸ [${ISSUE_KEY}] 자동 리뷰 반영 ${BOT_REVIEW_CNT}회 후에도 미승인 · ${OR}#${N} · ${PR_URL} — 사람 확인 필요"
+          notify_slack_btn "⏸ [${ISSUE_KEY}] 자동 리뷰 반영 ${BOT_REVIEW_CNT}회 후에도 미승인 · ${OR}#${N} — 사람 확인 필요" "review-loop:${OR}:${N}" "url:🔗 PR 열기:${PR_URL}"
           reviewed_any=1
           continue
         fi
@@ -258,7 +267,7 @@ ${LAST_BODY}
     if printf '%s' "${BODIES2}" | grep -q "${APPROVED_MARKER}"; then
       echo ">> [${ISSUE_KEY}] ${OR}#${N} 리뷰 승인(마커 작성)"
       record_history "approved" "${PR_URL}"
-      notify_slack "✅ [${ISSUE_KEY}] PR 리뷰 승인 · ${OR}#${N} · ${PR_URL}"
+      notify_slack_btn "✅ [${ISSUE_KEY}] PR 리뷰 승인 · ${OR}#${N}" "merge:${OR}:${N}" "url:🔗 PR 열기:${PR_URL}"
     else
       echo ">> [${ISSUE_KEY}] ${OR}#${N} 리뷰 코멘트(미승인 — 다음 주기 재리뷰)"
       record_history "reviewed" "${PR_URL}"

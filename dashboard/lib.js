@@ -27,7 +27,7 @@ function decryptEnv(data, key) {
   return Buffer.concat([d.update(buf.subarray(28)), d.final()]).toString("utf8");
 }
 
-const DEFAULT_CREDS = { anthropicApiKey: "", openaiApiKey: "", geminiApiKey: "", githubToken: "", atlassianEmail: "", atlassianToken: "", slackWebhookUrl: "" };
+const DEFAULT_CREDS = { anthropicApiKey: "", openaiApiKey: "", geminiApiKey: "", githubToken: "", atlassianEmail: "", atlassianToken: "", slackWebhookUrl: "", slackAppToken: "", slackAllowUsers: "" };
 
 const readJson = (p, f) => { try { return JSON.parse(fs.readFileSync(p, "utf8")); } catch { return f; } };
 const writeJson = (p, obj, mode) => fs.writeFileSync(p, JSON.stringify(obj, null, 2), { mode: mode || 0o644 });
@@ -269,6 +269,7 @@ function maskCreds(c) {
   return {
     anthropicApiKey: !!c.anthropicApiKey, openaiApiKey: !!c.openaiApiKey, geminiApiKey: !!c.geminiApiKey, githubToken: !!c.githubToken,
     atlassianEmail: c.atlassianEmail || "", atlassianToken: !!c.atlassianToken, slackWebhookUrl: !!c.slackWebhookUrl,
+    slackAppToken: !!c.slackAppToken, slackAllowUsers: c.slackAllowUsers || "",
   };
 }
 
@@ -282,6 +283,8 @@ function applyCreds(cur, b) {
     atlassianEmail: b.atlassianEmail !== undefined ? b.atlassianEmail : cur.atlassianEmail,
     atlassianToken: apply("atlassianToken"),
     slackWebhookUrl: apply("slackWebhookUrl"),
+    slackAppToken: apply("slackAppToken"),
+    slackAllowUsers: b.slackAllowUsers !== undefined ? b.slackAllowUsers : cur.slackAllowUsers,
   };
 }
 
@@ -620,6 +623,65 @@ function planRetry(run, attempt, cfg, now) {
   return { retry: true, at, kind: c.kind, label: c.label, max, source: reset ? "reset-time" : "backoff" };
 }
 
+
+// ----- Slack 인터랙티브 알림 (Block Kit + Socket Mode) -----
+// 알림 메시지에 버튼을 붙여 Slack 에서 바로 병합·재개 등을 수행한다.
+// 버튼 클릭은 Socket Mode(아웃바운드 WebSocket)로 받는다 — 대시보드 포트를 외부에 열지 않는다.
+
+// 버튼 id → 대시보드 API. 여기 없는 id 는 무시된다(위조 payload 방어).
+const SLACK_ACTIONS = {
+  "merge":       { label: "🔀 병합",        style: "primary", api: (a) => `/api/cards/${a.key}/merge`,            body: (a) => (a.owner && a.number ? { owner: a.owner, number: a.number } : {}) },
+  "review-loop": { label: "🔁 재리뷰 루프",  style: undefined, api: (a) => `/api/cards/${a.key}/review-loop`,      body: (a) => ({ owner: a.owner, number: a.number }) },
+  "card-run":    { label: "🔁 다시 실행",    style: undefined, api: (a) => `/api/cards/${a.key}/run`,              body: (a) => ({ phase: a.step || "build" }) },
+  "epic-resume": { label: "▶️ 이어서 진행",  style: "primary", api: (a) => `/api/epics/${a.key}/run/resume`,       body: () => ({}) },
+  "epic-skip":   { label: "⏭ 건너뛰기",      style: undefined, api: (a) => `/api/epics/${a.key}/run/resume`,       body: () => ({ skip: true }) },
+  "epic-stop":   { label: "⏹ 중지",          style: "danger",  api: (a) => `/api/epics/${a.key}/run/stop`,         body: () => ({}) },
+};
+const SLACK_ACTION_PREFIX = "jaa:";   // action_id 접두사 — 우리 버튼만 골라낸다
+
+// 버튼 value(Slack 상한 2000자)에는 실행에 필요한 최소 필드만 담는다.
+function encodeSlackAction(a) {
+  return JSON.stringify({ a: a.id, p: a.project || "", k: a.key || "", o: a.owner || "", n: a.number == null ? "" : String(a.number), s: a.step || "" });
+}
+function decodeSlackAction(value) {
+  let o; try { o = JSON.parse(value); } catch { return null; }
+  if (!o || !Object.prototype.hasOwnProperty.call(SLACK_ACTIONS, o.a)) return null;
+  if (!/^[A-Z][A-Z0-9]+-[0-9]+$/.test(String(o.k || ""))) return null;   // 이슈 키 형식 강제
+  return { id: o.a, project: String(o.p || ""), key: String(o.k), owner: String(o.o || ""), number: String(o.n || ""), step: String(o.s || "") };
+}
+
+// 알림 1건 → Slack payload. actions 는 [{ id, project, key, owner, number, step }] 또는 { url, label } 링크.
+function slackMessage(text, actions) {
+  const body = String(text || "");
+  const blocks = [{ type: "section", text: { type: "mrkdwn", text: body.slice(0, 2900) } }];
+  const elements = [];
+  for (const a of actions || []) {
+    if (a.url) {   // 링크 버튼은 인터랙션을 처리하지 않는다(그냥 열기)
+      elements.push({ type: "button", text: { type: "plain_text", text: a.label || "열기", emoji: true }, url: a.url, action_id: `${SLACK_ACTION_PREFIX}link${elements.length}` });
+      continue;
+    }
+    const def = SLACK_ACTIONS[a.id];
+    if (!def) continue;
+    const btn = {
+      type: "button", text: { type: "plain_text", text: a.label || def.label, emoji: true },
+      action_id: SLACK_ACTION_PREFIX + a.id, value: encodeSlackAction(a),
+    };
+    if (def.style) btn.style = def.style;
+    elements.push(btn);
+    if (elements.length >= 5) break;   // Slack actions 블록 상한
+  }
+  if (elements.length) blocks.push({ type: "actions", elements });
+  return { text: body, blocks };
+}
+
+// 버튼을 누른 사람이 실행 권한이 있는지. slackAllowUsers 미설정이면 거부한다 —
+// 채널의 누구나 병합할 수 있게 되는 것을 막기 위한 기본값이다.
+function slackActorAllowed(cred, userId) {
+  const list = String((cred && cred.slackAllowUsers) || "").split(/[\s,]+/).filter(Boolean);
+  if (!list.length) return false;
+  return list.includes(String(userId || ""));
+}
+
 module.exports = {
   DEFAULT_CREDS, readJson, writeJson, slugify, triggerClause, detectJql,
   adfToText, adfSegments, toADF, mdInline, mdToADF, buildReplyADF, maskCreds, applyCreds, createStore, doneStatusList, effectiveDoneStatuses,
@@ -635,4 +697,5 @@ module.exports = {
   EPIC_AUTO_MERGE_MIN_DEFAULT, EPIC_AUTO_MERGE_MIN_LIMIT, clampAutoMergeMin, shouldAutoMerge,
   EPIC_RETRY_MAX_DEFAULT, EPIC_RETRY_MAX_LIMIT, EPIC_RETRY_BACKOFF_MIN, clampRetryMax,
   parseUsageLimitReset, classifyPause, planRetry,
+  SLACK_ACTIONS, SLACK_ACTION_PREFIX, encodeSlackAction, decodeSlackAction, slackMessage, slackActorAllowed,
 };

@@ -159,6 +159,21 @@
     러너의 승인·CI 조회는 `ghJsonStrict` 로 실패를 던짐. `await-merge` 는 조회 실패 회차를 판정하지 않음(`pr-lookup-failed`).
     검증: `npm test` 107건 통과(CI 판정·게이트·단계 순서 신규 12건 포함).
 
+- [x] **15. Slack 알림 버튼으로 원격 조작 (병합·재개·재실행)**
+  - 내용: 알림을 받기만 하던 Slack 을 양방향으로 — 메시지의 버튼으로 PR 병합, 에픽 이어서 진행/건너뛰기/중지,
+    카드 재실행, 리뷰 승인 루프 재시작을 Slack 에서 바로 수행한다.
+  - AC: 리뷰 승인·에픽 중단·병합 대기·처리 실패 알림에 버튼이 붙고, 허용된 사용자가 누르면
+    대시보드에서 누른 것과 동일하게 실행된다(CI 게이트 유지). 대시보드 포트를 외부에 열지 않는다.
+  - 영향: `dashboard/lib.js`, `dashboard/slack-socket.js`(신규), `slack-notify.js`(신규),
+    `dashboard/server.js`, `dashboard/public/index.html`, `run-review-loop.sh`, `run-review.sh`,
+    `run-jira-agent.sh`, `run-epic-loop.js`, `dashboard/test/slack-actions.test.js`(신규)
+  → (완료 2026-09-08) Slack **Socket Mode**(아웃바운드 WebSocket)로 버튼 클릭을 수신 — 공개 URL·터널링·포트 개방이 필요 없다.
+    메시지 갱신은 payload 의 `response_url` 로 하므로 봇 토큰도 불필요. 버튼은 기존 대시보드 라우트를 그대로 호출해
+    CI 게이트·카드 완료처리 로직을 공유한다. 안전장치: `slackAllowUsers` 화이트리스트(**미설정 시 전원 거부**),
+    동작 id·이슈 키 형식 화이트리스트 검증, 클릭 즉시 원본 메시지를 결과로 교체해 중복 클릭 차단.
+    자격증명에 `slackAppToken`(마스킹) · `slackAllowUsers` 추가. 검증: `npm test` 120건 통과(신규 13건).
+
+
 ---
 
 *완료된 항목은 위 "완료 정의"에 따라 체크 표시 + 문서 동기화 후 마감합니다.*
