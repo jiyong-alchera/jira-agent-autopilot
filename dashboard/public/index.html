@@ -429,7 +429,8 @@ function ProjectCard({ proj, onDeleted, flash, jumpTo }) {
     return () => clearInterval(t);
   }, [expandedKey]);
 
-  const saveConfig = async () => { const r = await api.post("/api/projects", { ...config, id: PID }); if (r.ok) { setConfig(r.project); flash("설정 저장됨"); } };
+  // 저장 후 메타를 다시 부른다 — 프로젝트 키를 채우기 전 실패했던 조회 에러가 그대로 남지 않도록.
+  const saveConfig = async () => { const r = await api.post("/api/projects", { ...config, id: PID }); if (r.ok) { setConfig(r.project); flash("설정 저장됨"); loadMeta(); } };
   const saveCreds = async () => {
     await api.post(`/api/projects/${PID}/credentials`, credInput);
     setCredInput((p) => ({ ...p, anthropicApiKey: "", openaiApiKey: "", geminiApiKey: "", githubToken: "", atlassianToken: "", slackWebhookUrl: "" }));
