@@ -595,11 +595,16 @@ app.post("/api/cards/:key/resolve-conflict", async (req, res) => {
     const { id, cfg, cred } = resolveProject(req);
     if (epic) {
       const st = epicRunStatus(cfg, epic);
-      if (st.running && st.step === "await-merge") {
+      // 요청 파일을 읽을 줄 아는 러너인지: 충돌 처리를 아는 러너만 병합 대기 폴링에서 conflictState 를 쓴다.
+      // 이 구분이 없으면 코드 업데이트 전에 뜬 러너에게 요청을 넘겨놓고 '요청했습니다' 라고 답한 뒤
+      // 아무 일도 일어나지 않는다(러너는 그 파일을 영영 읽지 않는다).
+      const runnerKnowsConflict = st.conflictState !== undefined;
+      if (st.running && st.step === "await-merge" && runnerKnowsConflict) {
         writeConflictRequest(cfg, epic, { key, owner, number, requestedAt: new Date().toISOString() });
         return res.json({ ok: true, queued: true, message: `${owner}#${number} 충돌 해소를 연속 개발 러너에 요청했습니다(병합 대기 폴링에서 바로 처리).` });
       }
-      if (st.running) {
+      // 구버전 러너가 병합 대기 중이면 여기서 직접 실행한다 — 폴링만 하는 단계라 카드 락이 비어 있다.
+      if (st.running && st.step !== "await-merge") {
         return res.json({ ok: false, message: `연속 개발이 '${st.step || "실행"}' 단계 실행 중입니다. 그 단계가 끝난 뒤(또는 중지 후) 다시 눌러주세요.` });
       }
     }
