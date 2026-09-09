@@ -315,7 +315,7 @@ Jira 카드를 자동으로 탐지해 **Claude가 개발 → PR 생성 → 카�
 | `build` | `REVIEW_LOOP_AFTER=1 run-jira-agent.sh <KEY> build` — 개발·PR 생성 후 **[승인까지 리뷰 루프](#43c-run-review-loopsh-승인까지-반복-루프--대시보드-승인까지-루프)** 가 이어서 실행 | 중단 |
 | `ci` | 열린 PR 의 **CI(체크)가 초록이 될 때까지** '원인 파악 → 수정/재실행 → 재검증' 을 반복(기본 5회, `EPIC_CI_LOOP_MAX`) — [4.3e](#43e-ci-단계-ci-실패-자동-수정) | 상한을 다 써도 빨간색이면 중단 |
 | `approve` | 카드의 **열린 봇 PR 전부**에 승인 마커(`CLAUDE-REVIEW-APPROVED`)가 있는지 확인 | 미승인 PR 이 있으면 중단 |
-| `await-merge` | **사용자가 그 카드의 PR 을 모두 병합할 때까지 대기.** `EPIC_MERGE_POLL`(기본 60초)마다 `/api/cards/sync-merged` 를 호출해 외부 병합 감지를 앞당긴 뒤 카드가 완료됐는지 확인. **자동 병합**이 켜져 있으면 조건 충족 시 대신 병합 | 자동 병합 실패 시 중단 |
+| `await-merge` | **사용자가 그 카드의 PR 을 모두 병합할 때까지 대기.** `EPIC_MERGE_POLL`(기본 60초)마다 `/api/cards/sync-merged` 를 호출해 외부 병합 감지를 앞당긴 뒤 카드가 완료됐는지 확인. **자동 병합**이 켜져 있으면 조건 충족 시 대신 병합. **base 충돌**이 나면 알림 후(버튼 포함) **자동 충돌 해소**가 켜져 있으면 대기 시간 뒤 `rebase 해소 → 재푸시 → 승인 무효화 → 재리뷰` | 자동 병합 실패 · 충돌 해소 실패 시 중단 |
 
 - **이미 진행된 카드는 건너뛴다**: 시작 단계는 카드의 라벨/상태로 판정한다(`lib.epicTaskStep`) —
   `claude-pr` 있으면 `ci`, `claude-answered` 있으면 `build`, `claude-planned` 만 있으면 `adopt` …
@@ -350,7 +350,7 @@ Jira 카드를 자동으로 탐지해 **Claude가 개발 → PR 생성 → 카�
   `status:"running"` 으로 남은 상태 파일은 러너가 비정상 종료된 것으로 보고 `paused` 로 정규화해 재개 대상이 된다.
 - **동시 실행 방지**: 에픽당 하나 — `.state/<EPIC>.epic.lock`(+`.pid`/`.phase`).
 - **중지**: `.state/<EPIC>.epic.stop` 플래그(대시보드 '중지' 버튼) 또는 프로세스 트리 SIGTERM. 진행 중 하위 작업까지 함께 종료된다.
-- **상태 파일**: `.state/<EPIC>.epic.json` — `{status, reason, lastError, pausedAt, step, stepStartedAt, index, total, current:{key,summary,step}, tasks[], repos[], autoMerge, autoMergeAfterMin, autoMergeAt, autoMergeState}`.
+- **상태 파일**: `.state/<EPIC>.epic.json` — `{status, reason, lastError, pausedAt, step, stepStartedAt, index, total, current:{key,summary,step}, tasks[], repos[], autoMerge, autoMergeAfterMin, autoMergeAt, autoMergeState, autoResolveConflict, conflictAfterMin, conflictSince, conflictAt, conflictState, conflictPRs[]}`.
   `lastError` 는 실패한 엔진 출력의 끝 2000자 — 자동 재시도가 사유를 분류하고 한도 해제 시각을 읽는 근거다.
   옵션 파일은 별도(`.state/<EPIC>.epic.opts.json`) — 러너가 쓰는 상태 파일과 분리해 대시보드가 실행 중에도 안전하게 고칠 수 있게 했다.
   대시보드가 5초마다 폴링해 진행률·현재 단계·**단계 경과 시간**·중단 사유를 표시한다.
@@ -369,9 +369,25 @@ Jira 카드를 자동으로 탐지해 **Claude가 개발 → PR 생성 → 카�
   - **한 번만 시도**한다. 실패하면(충돌·권한 등) 사유와 함께 `paused` 로 중단하고 알린다(무한 재시도로 PR 을 계속 두드리지 않음).
   - 옵션은 `.state/<EPIC>.epic.opts.json` 에 저장되고 러너가 **폴링마다 다시 읽으므로 실행 중에 켜고 꺼도 즉시 반영**된다.
     재개(`/run/resume`)도 저장된 설정을 그대로 이어간다.
+- **base 충돌 자동 해소(선택, 기본 꺼짐)**: 병합 대기 중 base 가 움직여 **충돌**(`mergeable=CONFLICTING`)난 PR 은
+  병합도 리뷰도 더 나아가지 못한다. 러너가 이를 감지해 **버튼이 달린 알림을 1회** 보내고,
+  옵션이 켜져 있으면 **대기 시간**(기본 15분, 1~1440) 뒤 대신 해소한다.
+  - 순서: `RESOLVE_CONFLICT=1 run-jira-agent.sh <KEY> build`(그 PR 한정) → `git rebase origin/<base>` 로 충돌 해소 →
+    **PR 전 검증**(테스트/빌드) → `git push --force-with-lease` → **기존 승인 무효화**
+    (`CLAUDE-REVIEW-APPROVED` → `CLAUDE-REVIEW-SUPERSEDED-BY-CONFLICT-FIX`) → `run-review-loop.sh`(REVIEW_FIRST=1)로 **재리뷰**.
+    해소 커밋은 아무도 보지 않은 코드이므로 CI 수정([4.3e](#43e-ci-단계-ci-실패-자동-수정))과 **같은 규칙**으로 다시 리뷰를 받는다.
+  - **대기 시간의 기준은 '충돌을 처음 감지한 시점'** 이다. 사람이 먼저 해소하면 기준 시각은 사라지고, 다시 충돌나면 처음부터 센다.
+  - 안전하게 해소할 수 없으면 하위 스크립트가 **푸시하지 않고 비정상 종료**하고, 러너는 사유와 함께 `paused` 로 중단한다.
+  - **자동 병합 게이트에도 반영**된다(`mergeReadyState → "conflicting"`): 충돌 PR 은 승인·시간과 무관하게 자동 병합하지 않는다.
+    예전엔 병합을 시도했다가 실패해 그대로 멈췄다.
+  - 꺼져 있어도 **PR 목록의 `⚠️ 충돌 해소·재푸시` 버튼**과 **Slack 알림 버튼**으로 즉시 실행할 수 있다.
+    러너가 **병합 대기 중**이면 요청 파일(`.state/<EPIC>.epic.conflict.json`)로 러너에게 넘겨 **러너가 직접** 처리하고
+    (밖에서 따로 돌리면 카드 락이 부딪히고 승인 무효화·재리뷰를 러너가 모른 채 지나간다),
+    러너가 **멈춰 있으면** 대시보드가 단건 실행한 뒤 **끝나면 그 지점부터 자동으로 이어서 진행**한다.
 - **병합 대기 PR 조작**: 패널의 **PR 목록**(`EpicPrs`)에서 현재 태스크의 PR 을 repo 별로 보고 바로 병합한다 —
   PR 마다 리뷰 승인 여부(`✓ 리뷰 승인`/`미승인`)·병합 가능 여부(`✓ 병합 가능`/`⚠️ 충돌`/`⟳ base 갱신됨`)·
   사람/자동화 구분을 배지로 표시하고, **개별 병합 · 체크박스 선택 병합 · 전체 병합(자동화 PR)** 을 지원한다(15초 갱신).
+  **`⚠️ 충돌` PR 에는 `충돌 해소·재푸시` 버튼**이 함께 뜬다(개별 · 상단 일괄).
   멀티 repo 로 PR 이 여러 개인 경우가 기본이라, 병합 전 대상 목록을 확인 창에 나열하고 순차로 병합한 뒤 성공/실패 건수를 알린다.
   목록은 `?strict=1` 로 **브랜치·제목에 그 카드 키가 있는 PR 만** 가져온다(형제 카드 PR 혼입 방지).
 - **진행 상황 확인**: 대시보드 '에픽 연속 개발' 패널의 로그 창에서 두 가지를 3초 간격으로 볼 수 있다 —
@@ -382,8 +398,8 @@ Jira 카드를 자동으로 탐지해 **Claude가 개발 → PR 생성 → 카�
   이 루프는 **별도 프로세스라 에픽 상태 파일에 나오지 않는다**. 그대로 두면 build 가 30분 넘게 멈춘 것처럼 보이므로,
   패널이 `/api/cards/:key/review-loop` 를 함께 폴링해 **`🔁 승인 루프 2/5회차 · 리뷰 중`** 을 표시하고,
   엔진 로그의 `●` 도 `build` 가 아니라 실제로 갱신되는 `review` 로그를 가리킨다.
-- **Slack 알림**: 시작 `🧭`, 태스크 시작 `▶️`, 병합 대기 `⏳`, **병합만 남음 `✅ … 리뷰 승인 + CI 통과`**, 태스크 완료 `✅`, 중단 `⏸`, 중지 `⏹`, 에픽 완료 `🎉`.
-- **'병합만 남음' 알림**: `await-merge` 폴링에서 열린 PR 이 **전부 승인 + CI 통과**(`lib.isMergeReady`)가 되는 순간 **병합 버튼과 함께 1회** 보낸다. 리뷰 루프의 승인 알림은 승인 시점에 한 번만 나가는데 그때는 CI 가 아직 도는 경우가 많아, 그 버튼이 CI 게이트에 막힌 뒤 CI 가 초록이 돼도 아무도 알려주지 않던 빈틈을 메운다. 자동 병합이 꺼져 있어도 이 알림까지는 PR 을 조회한다.
+- **Slack 알림**: 시작 `🧭`, 태스크 시작 `▶️`, 병합 대기 `⏳`, **병합만 남음 `✅ … 리뷰 승인 + CI 통과`**, **base 충돌 `⚠️`**, 태스크 완료 `✅`, 중단 `⏸`, 중지 `⏹`, 에픽 완료 `🎉`.
+- **'병합만 남음' 알림**: `await-merge` 폴링에서 열린 PR 이 **전부 승인 + CI 통과**(`lib.isMergeReady`)가 되는 순간 **병합 버튼과 함께 1회** 보낸다. 리뷰 루프의 승인 알림은 승인 시점에 한 번만 나가는데 그때는 CI 가 아직 도는 경우가 많아, 그 버튼이 CI 게이트에 막힌 뒤 CI 가 초록이 돼도 아무도 알려주지 않던 빈틈을 메운다. `await-merge` 폴링은 **매 회 PR 을 조회**한다 — 자동 병합·자동 충돌 해소가 꺼져 있어도 '병합만 남음'·'base 충돌' 은 알려야 하기 때문.
 - 진행 로그는 `loop-epic.log`(대시보드 '실시간 로그'), 엔진 상세 로그는 기존대로 `agent-logs/<KEY>-<phase>.log`.
 - **요구사항**: 하위 태스크 조회는 `parent = <EPIC>` JQL 을 쓰고, 안 먹는 구형(company-managed) 프로젝트는
   `"Epic Link" = <EPIC>` 로 자동 폴백한다. `await-merge` 의 병합 감지 가속은 대시보드가 떠 있을 때만 동작하고,
@@ -456,9 +472,9 @@ Jira 카드를 자동으로 탐지해 **Claude가 개발 → PR 생성 → 카�
 | GET | `/api/epics` | 프로젝트의 **에픽 계층(`hierarchyLevel` 1) 카드 목록**(`{key,summary,status}`) + 그 계층의 표시 이름 `label`(에픽·워크스트림 …) — 연속 개발 시작 폼용. **JQL 은 타입 id 로 조회한다**(아래 주의) |
 | GET | `/api/epics/:key/children` | 상위 카드의 **미완료 하위 태스크(생성순)** + 각 카드의 시작 단계(`step`). `parent` 절 실패 시 `"Epic Link"` 로 폴백 |
 | GET | `/api/epics/:key/run` | **에픽 연속 개발 상태**(대시보드 5초 폴링) — `{running,pid,status,reason,step,index,total,current,tasks,repos}`. 락 PID 생존 확인 + 스테일 락 정리, 락 없이 `running` 인 상태 파일은 `paused` 로 정규화(크래시 복구). 중단 상태면 `retry`(`{attempt,max,willRetry,at,kind,label,why,source}`)로 **자동 재시도 예정/미실행 사유**를 함께 준다 |
-| POST | `/api/epics/:key/run` | **에픽 연속 개발 시작** — body `{repos:[name], reviewLoopMax?, autoMerge?, autoMergeAfterMin?, autoRetry?, autoRetryMax?}`. `run-epic-loop.js` 를 detached 로 띄워 하위 태스크를 생성순으로 처리([4.3d](#43d-run-epic-loopjs-에픽-연속-개발--하위-태스크-순차-자동화)). 에픽당 1개만 실행. repo 미선택이면 거부 |
+| POST | `/api/epics/:key/run` | **에픽 연속 개발 시작** — body `{repos:[name], reviewLoopMax?, autoMerge?, autoMergeAfterMin?, autoRetry?, autoRetryMax?, autoResolveConflict?, conflictAfterMin?}`. `run-epic-loop.js` 를 detached 로 띄워 하위 태스크를 생성순으로 처리([4.3d](#43d-run-epic-loopjs-에픽-연속-개발--하위-태스크-순차-자동화)). 에픽당 1개만 실행. repo 미선택이면 거부 |
 | POST | `/api/epics/:key/run/resume` | **멈춘 지점부터 이어서 진행** — body `{skip?}`. `skip:true` 면 멈춘 단계를 건너뛰고 다음 단계부터. `paused`/`stopped` 상태에서만 수용하며, 재개 단계는 멈췄던 그 카드에만 적용. **대상 repo 는 상태 파일에 기록된 시작 시점 값**을 그대로 쓴다(요청 body 로 못 바꾼다). 기록이 비어 있으면 **전체로 넓히지 않고 거부**한다 |
-| POST | `/api/epics/:key/run/options` | **자동 병합·자동 재시도 옵션 변경**(실행 중에도 즉시 반영) — body `{autoMerge?, autoMergeAfterMin?, autoRetry?, autoRetryMax?}`. 생략한 필드는 기존 값 유지, 분은 1~1440 으로 clamp. `.state/<EPIC>.epic.opts.json` 에 저장하고 러너가 병합 대기 폴링마다 다시 읽는다 |
+| POST | `/api/epics/:key/run/options` | **자동 병합·자동 재시도·자동 충돌 해소 옵션 변경**(실행 중에도 즉시 반영) — body `{autoMerge?, autoMergeAfterMin?, autoRetry?, autoRetryMax?, autoResolveConflict?, conflictAfterMin?}`. 생략한 필드는 기존 값 유지, 분은 1~1440 으로 clamp. `.state/<EPIC>.epic.opts.json` 에 저장하고 러너가 병합 대기 폴링마다 다시 읽는다 |
 | POST | `/api/epics/:key/run/stop` | **에픽 연속 개발 중지** — `.epic.stop` 플래그를 먼저 쓴 뒤 프로세스 트리를 SIGTERM→6초 후 SIGKILL·락 정리(상태 파일은 남겨 재개 가능) |
 | POST | `/api/cards/:key/repos` | 기존 카드의 대상 repo 라벨(`repo_<name>`) 설정(프로젝트 repo 목록과 교집합만 반영) |
 | GET | `/api/cards/:key/prs` | **카드의 모든 PR(1:N) 조회** — 대상 repo 들에서 카드 키로 검색. PR별 `{repo,owner,number,url,title,state,branch,isDraft,author,isBot,mergeable,mergeState,ci,ciFailed[]}` 반환. `ci` 는 `pass`/`fail`/`pending`/`none`(`lib.ciStateOf`), `ciFailed[]` 는 실패한 체크의 `{name,conclusion,url}` — 대시보드가 CI 배지로 표시하고 병합 확인창에서 경고한다. **repo 하나라도 PR 목록 조회에 실패하면 빈 목록 대신 에러를 반환한다**(조회 실패를 'PR 없음'으로 삼키면 승인·CI 게이트가 통째로 건너뛰어진다). `isBot`=봇 계정(GH_TOKEN 사용자)이 만든 자동화 PR 여부, `botLogin` 도 함께 반환 **`?approved=1`** 이면 열린 PR 마다 리뷰 승인 마커(`CLAUDE-REVIEW-APPROVED`) 유무를 `approved` 로 붙인다(PR 당 API 1회라 opt-in). **`?strict=1`** 이면 **브랜치·제목에 그 카드 키가 있는 PR 만** 남긴다 — `gh pr list --search` 가 PR 본문까지 전문 검색해 본문이 이 키를 언급한 **형제 카드의 PR 까지 끌어오기** 때문(에픽 패널의 병합 목록이 사용) |
@@ -476,6 +492,7 @@ Jira 카드를 자동으로 탐지해 **Claude가 개발 → PR 생성 → 카�
 | GET | `/api/livereload` | 라이브 리로드용 SSE 스트림(프론트 파일 변경 시 reload 이벤트 푸시) |
 | GET | `/api/jira/meta` | 카드 등록용 메타(프로젝트 이슈 타입 + 에픽 계층 카드 목록 + 그 계층 표시 이름 `epicLabel`). 호출 시 이슈 타입 캐시(5분)를 강제 갱신하므로 '메타 새로고침' 버튼이 곧 캐시 무효화다 |
 | GET | `/api/jira/statuses` | 프로젝트 상태 파이프라인(이슈타입별 상태를 이름 기준 dedup) — 설정 '상태 → 단계 매핑' UI 용. `[{name,category}]` |
+| POST | `/api/cards/:key/resolve-conflict` | **base 충돌 해소 → 재푸시 → 재리뷰**(카드 상세·연속 개발 패널·Slack 버튼 공용). body `{owner, number, epic?}`. `epic` 이 **병합 대기 중**이면 요청 파일(`.state/<EPIC>.epic.conflict.json`)로 러너에 넘기고 `queued:true` 로 응답(러너가 다음 폴링에서 처리), **다른 단계 실행 중**이면 거부한다. 그 외에는 여기서 단건 실행 — 충돌 상태일 때만 기존 승인을 무효화(`CLAUDE-REVIEW-SUPERSEDED-BY-CONFLICT-FIX`)하고 `RESOLVE_CONFLICT=1`+`REVIEW_LOOP_AFTER=1` 로 실행하며, 에픽이 멈춰 있으면 **끝난 뒤 그 지점부터 자동 재개**한다. 응답 `pid`·`queued`·`superseded`·`mergeable`·`resumeEpic` |
 | POST | `/api/cards/:key/stop` | 처리 중인 카드의 claude 작업 중지. **`body.phase`** 지정 시 그 단계만(`review`→`<KEY>.review.lock`, `plan`/`build`→`<KEY>.lock`), 없으면 살아있는 락 전부(**승인까지 루프 `<KEY>.reviewloop.lock` 포함** — 이때 `.reviewloop.stop` 플래그도 함께 써 다음 회차를 막는다). 해당 PID 프로세스 트리를 SIGTERM→4초후 SIGKILL. 루프/다른 카드는 무영향. 이력에 `stopped` 기록 |
 | POST | `/api/jira/issue` | Jira 카드 생성(요약·설명·이슈타입·상위키·라벨·할당·파일 첨부 — 이미지·HTML·문서 등 모든 타입) |
 | POST | `/api/ai/refine-description` | 러프 설명을 Claude 로 체계적 설명(배경/요구사항/AC)으로 변환 |
@@ -494,7 +511,7 @@ Jira 카드를 자동으로 탐지해 **Claude가 개발 → PR 생성 → 카�
 빌드 도구 없이 CDN(React + Tailwind)으로 동작하는 단일 페이지(본문 폭 `max-w-7xl`). 카드 상태·처리 이력 표는 `table-fixed` 로 열 폭을 고정하고 티켓 이름·브랜치·프로젝트는 **한 줄 표시 + 넘치면 `…`(truncate, 전체 텍스트는 hover title)** 로 정돈한다. **멀티 프로젝트** 구조: 전역 섹션(루프 제어·**에픽 연속 개발**·**활성화된 작업**·처리 이력·실시간 로그)과 **프로젝트 카드 목록**으로 구성된다(에픽 연속 개발 패널은 루프 제어와 프로젝트 목록 사이, 활성화된 작업 패널은 프로젝트 목록과 처리 이력 사이).
 연속 개발 패널의 **용어는 선택한 프로젝트를 따른다** — 에픽 계층 타입 이름이 '워크스트림'인 프로젝트(PHYS)에서는
 패널 제목이 `워크스트림 연속 개발`, 드롭다운이 `— 워크스트림 선택 —` 이 된다(`/api/epics` 의 `label`; 실행 중에는
-상태 파일의 `label` 을 따라 그 실행이 시작될 때의 용어를 유지). **에픽 연속 개발** 패널은 프로젝트·상위 카드·대상 repo 를 고르면 하위 태스크 목록과 각 카드의 다음 단계를 보여주고, 실행 중에는 `3/7 · EKYB-812 · PR 병합 대기 · 12분째` 형태의 진행 상황과 중지 버튼을, 중단되면 사유와 **[이어서 진행]·[이 단계 건너뛰기]** 버튼을 띄운다(5초 폴링). **리뷰 승인 후 자동 병합**(+대기 분)과 **중단 시 자동 재시도**(+최대 횟수) 체크박스가 있어 실행 중에도 켜고 끌 수 있고, 병합 대기 중에는 `자동 병합 예정: 14:30 (약 42분 후)`, 중단 상태에서는 `🔄 자동 재시도 1/5회 — 사용량 한도(토큰) 소진 · 13:42 예정` 또는 재시도하지 않는 사유를 표시한다. 그 아래 **PR 목록**(`EpicPrs`: 현재 태스크 PR 의 승인·병합 가능 여부 배지 + 개별/선택/전체 병합)과 **로그 창**(`EpicLogs`)에서 러너 진행 로그(`loop-epic.log`)와 **현재 태스크의 엔진 상세 로그**(`agent-logs/<KEY>-<phase>.log`)를 탭으로 전환해 3초마다 확인할 수 있다(현재 단계 탭에 `●`, '맨 아래 따라가기' 자동 스크롤). **대상 repo 체크박스는 실행 기록이 있으면 그 실행이 실제로 쓰는 repo(`run.repos`)를 표시**한다 — 기본값(전체 선택)을 그리면 3개만 골라 돌려도 5개가 체크된 것처럼 보이기 때문. **실행 중이든 중단 상태든 잠긴다**: [이어서 진행]은 시작 시점 repo 로 재개하므로, 중단 상태에서 체크박스를 열어두면 바꾼 값이 반영되는 것처럼 보이지만 무시된다(조작 가능한 컨트롤이 거짓 신호를 주면 안 된다). 바꾸려면 **'다른 repo 로 새로 시작'** 링크로 잠금을 풀어야 하고, 이 모드에서는 **[이어서 진행]·[이 단계 건너뛰기] 가 숨겨져** 고른 값이 **[연속 개발 시작]**(새 실행, 이전 재개 지점은 폐기)에만 적용됨이 분명해진다. '취소' 로 되돌리면 폴링이 실행 기록의 repo 를 다시 표시한다. 각 프로젝트 카드는 접이식이며, 그 안의 **설정·자격증명·카드 등록·카드 상태** 각 영역도 개별 접기/펼치기(`SubSection`, **기본 접힘**) — 헤더 클릭으로 토글, 액션 버튼(저장·조회 등)은 펼쳤을 때만 노출. 설정·자격증명·카드 등록의 **각 입력 항목 라벨 옆 'i' 버튼**을 누르면 그 항목에 무엇을 입력해야 하는지 설명 모달이 뜬다(`InfoTip` 컴포넌트, 포털로 렌더).
+상태 파일의 `label` 을 따라 그 실행이 시작될 때의 용어를 유지). **에픽 연속 개발** 패널은 프로젝트·상위 카드·대상 repo 를 고르면 하위 태스크 목록과 각 카드의 다음 단계를 보여주고, 실행 중에는 `3/7 · EKYB-812 · PR 병합 대기 · 12분째` 형태의 진행 상황과 중지 버튼을, 중단되면 사유와 **[이어서 진행]·[이 단계 건너뛰기]** 버튼을 띄운다(5초 폴링). **리뷰 승인 후 자동 병합**(+대기 분)·**중단 시 자동 재시도**(+최대 횟수)·**base 충돌 시 자동 해소·재푸시**(+대기 분) 체크박스가 있어 실행 중에도 켜고 끌 수 있고, 병합 대기 중에는 `자동 병합 예정: 14:30 (약 42분 후)`·`⚠️ 충돌 Org/repo#12 · 자동 해소 예정: 14:05 (약 12분 후)`, 중단 상태에서는 `🔄 자동 재시도 1/5회 — 사용량 한도(토큰) 소진 · 13:42 예정` 또는 재시도하지 않는 사유를 표시한다. 그 아래 **PR 목록**(`EpicPrs`: 현재 태스크 PR 의 승인·병합 가능 여부 배지 + 개별/선택/전체 병합 + **충돌 PR 의 `⚠️ 충돌 해소·재푸시`**)과 **로그 창**(`EpicLogs`)에서 러너 진행 로그(`loop-epic.log`)와 **현재 태스크의 엔진 상세 로그**(`agent-logs/<KEY>-<phase>.log`)를 탭으로 전환해 3초마다 확인할 수 있다(현재 단계 탭에 `●`, '맨 아래 따라가기' 자동 스크롤). **대상 repo 체크박스는 실행 기록이 있으면 그 실행이 실제로 쓰는 repo(`run.repos`)를 표시**한다 — 기본값(전체 선택)을 그리면 3개만 골라 돌려도 5개가 체크된 것처럼 보이기 때문. **실행 중이든 중단 상태든 잠긴다**: [이어서 진행]은 시작 시점 repo 로 재개하므로, 중단 상태에서 체크박스를 열어두면 바꾼 값이 반영되는 것처럼 보이지만 무시된다(조작 가능한 컨트롤이 거짓 신호를 주면 안 된다). 바꾸려면 **'다른 repo 로 새로 시작'** 링크로 잠금을 풀어야 하고, 이 모드에서는 **[이어서 진행]·[이 단계 건너뛰기] 가 숨겨져** 고른 값이 **[연속 개발 시작]**(새 실행, 이전 재개 지점은 폐기)에만 적용됨이 분명해진다. '취소' 로 되돌리면 폴링이 실행 기록의 repo 를 다시 표시한다. 각 프로젝트 카드는 접이식이며, 그 안의 **설정·자격증명·카드 등록·카드 상태** 각 영역도 개별 접기/펼치기(`SubSection`, **기본 접힘**) — 헤더 클릭으로 토글, 액션 버튼(저장·조회 등)은 펼쳤을 때만 노출. 설정·자격증명·카드 등록의 **각 입력 항목 라벨 옆 'i' 버튼**을 누르면 그 항목에 무엇을 입력해야 하는지 설명 모달이 뜬다(`InfoTip` 컴포넌트, 포털로 렌더).
 
 모든 백엔드 호출은 `api.get/post/del` → `request()` 를 거친다. `request()` 는 **어떤 경우에도 reject 하지 않고** 네트워크 실패·비 JSON 응답을 서버 에러와 같은 `{ ok:false, message }` 로 정규화한다. 호출부는 `setLoading(true)` 이후 구간을 `try/finally` 로 감싸 로딩 플래그를 반드시 되돌린다 — 이 두 규칙이 깨지면 버튼이 "…중" 상태로 영구 고착된다(회귀 테스트: `dashboard/test/frontend-api.test.js`).
 
@@ -525,7 +542,7 @@ Jira 카드를 자동으로 탐지해 **Claude가 개발 → PR 생성 → 카�
     - **🔁 승인까지 루프**: '반영+재리뷰' 옆 버튼. **리뷰가 승인될 때까지 '반영 → 재리뷰'를 반복**한다(`run-review-loop.sh`, [4.3c](#43c-run-review-loopsh-승인까지-반복-루프--대시보드-승인까지-루프)). 확인 다이얼로그 후 시작하며, 실행 중에는 버튼 자리에 **`🔁 승인 루프 i/N회차 · 반영 중|리뷰 중` 배지와 `⏹ 루프 중지` 버튼**이 나타난다(5초 폴링, `GET /api/cards/:key/review-loop`). 회차마다 **Slack 으로 결과를 알리며, 미승인이면 `📝 리뷰 루프 i/N회차 — 수정 필요(미승인)`** 처럼 회차를 명시한다. 상한(기본 5회) 도달 시 사람 확인 요청 후 종료. **`⏹ 루프 중지`** 는 진행 중인 반영/리뷰까지 즉시 종료한다(`POST /api/cards/:key/review-loop/stop`). 루프는 카드당 1개만 돌며, 다른 PR 에서 실행 중이면 버튼이 비활성화된다. 메모를 적어두면 **루프 시작 시 1회만** PR 코멘트로 남는다.
   - **엔진 실행 로그**: 같은 줄의 "엔진 실행 로그 plan/build" 버튼으로 그 카드의 claude 상세 전사(도구 호출·메시지·결과)를 펼쳐 봅니다(3초마다 갱신). build 중 claude 가 무엇을 했는지 단계별로 확인할 수 있습니다.
   - **🌿 브랜치 영역**: 펼친 패널 Git·PR 영역 상단에 **이 카드 관련 브랜치를 따로 표시** — plan 이 만든 **타겟(작업) 브랜치**(카드 코멘트 `🌿 타겟 브랜치:` 마커에서 추출)와, ('PR 불러오기' 시) **각 PR 의 head 브랜치 목록**(repo·번호·상태, 타겟과 일치하면 '타겟 일치' 표시).
-  - **PR 목록 (카드 1:PR N)**: 펼친 패널 Git·PR 영역의 "PR 불러오기"로 카드의 **모든 PR을 개별 행**으로 본다(`/api/cards/:key/prs`) — repo·번호·상태(OPEN/MERGED/DRAFT)·`head → base` 브랜치·작성자와 **자동화/사람 배지**(봇 계정 author 기준). **병합 가능 상태 배지**도 표시(`gh pr list --json mergeable,mergeStateStatus`): **`⚠️ base 충돌`**(mergeable=CONFLICTING — base/타겟 브랜치가 갱신돼 충돌), `⟳ base 갱신됨`(mergeStateStatus=BEHIND), `✓ 병합 가능`(MERGEABLE·CLEAN), `병합상태 확인중`(UNKNOWN — GitHub 계산 중). 각 PR에 **"이 PR 병합"(그 PR만)·"이 PR 리뷰"(그 PR만)·"열기"** 버튼. **`⚠️ base 충돌`(CONFLICTING) 인 PR에는 "⚠️ 충돌 해소 후 재푸시" 버튼**이 추가로 노출돼(담당자·열림 PR), 누르면 `resolveConflict` 모드로 그 PR 브랜치를 `git rebase origin/<base>` 로 충돌 해소 → PR 전 검증 → `--force-with-lease` push 한다(force-push 경고 확인 다이얼로그 후 실행). 일괄 "PR 병합"·자동 완료·review 루프는 **자동화 PR만** 대상이라, 다른 사람이 같은 카드로 올린 PR이 섞여도 자동으로 병합/리뷰되지 않는다(원하면 개별 버튼으로 처리).
+  - **PR 목록 (카드 1:PR N)**: 펼친 패널 Git·PR 영역의 "PR 불러오기"로 카드의 **모든 PR을 개별 행**으로 본다(`/api/cards/:key/prs`) — repo·번호·상태(OPEN/MERGED/DRAFT)·`head → base` 브랜치·작성자와 **자동화/사람 배지**(봇 계정 author 기준). **병합 가능 상태 배지**도 표시(`gh pr list --json mergeable,mergeStateStatus`): **`⚠️ base 충돌`**(mergeable=CONFLICTING — base/타겟 브랜치가 갱신돼 충돌), `⟳ base 갱신됨`(mergeStateStatus=BEHIND), `✓ 병합 가능`(MERGEABLE·CLEAN), `병합상태 확인중`(UNKNOWN — GitHub 계산 중). 각 PR에 **"이 PR 병합"(그 PR만)·"이 PR 리뷰"(그 PR만)·"열기"** 버튼. **`⚠️ base 충돌`(CONFLICTING) 인 PR에는 "⚠️ 충돌 해소 후 재푸시" 버튼**이 추가로 노출돼(담당자·열림 PR), 누르면 `POST /api/cards/:key/resolve-conflict` 로 그 PR 브랜치를 `git rebase origin/<base>` 로 충돌 해소 → PR 전 검증 → `--force-with-lease` push → **기존 승인 무효화 + 재리뷰**까지 이어서 진행한다(force-push·승인 무효화 경고 확인 다이얼로그 후 실행). 일괄 "PR 병합"·자동 완료·review 루프는 **자동화 PR만** 대상이라, 다른 사람이 같은 카드로 올린 PR이 섞여도 자동으로 병합/리뷰되지 않는다(원하면 개별 버튼으로 처리).
   - **PR 리뷰/코멘트(PR 목록 인라인)**: 'PR 목록'의 각 PR 항목에서 **`▸ 리뷰/코멘트`** 를 누르면 그 PR 아래로 펼쳐져 **GitHub 리뷰(승인/변경요청 + 본문)·PR 코멘트·인라인 리뷰 코멘트(파일:라인)**를 본다(`/api/cards/:key/reviews` 를 최초 1회 로드해 owner+번호로 매칭). 각 항목은 **작성자 헤더 + 마크다운 렌더 본문**의 코멘트 카드(`PrReviewBody`) — `marked`(GFM)+`DOMPurify` 로 **제목·표·굵게·코드블록·목록을 GitHub PR 페이지처럼** 렌더(HTML 주석 마커 비표시). 열린 PR뿐 아니라 병합된 PR 의 리뷰도 표시. (별도 'PR 리뷰' 영역은 제거되고 PR 목록에 통합됨. '이 PR 리뷰 실행'은 claude 로 새 리뷰를 수행하는 별개 버튼)
   - **코멘트 답글(인용)**: 각 코멘트의 "↳ 답글" 을 누르면 그 코멘트를 대상으로 답변을 작성합니다. Jira 이슈 코멘트는 구조적으로 평면(스레드 미지원)이라, 답글은 **원문 인용(blockquote) + 작성자 @멘션**을 포함한 새 코멘트로 등록됩니다(Jira UI 의 "인용 답글"과 동일 방식). 표시할 때 인용 줄은 `> ` 로 보여 스레드처럼 구분됩니다.
 - **활성화된 작업**(전역, **프로젝트 카드 목록과 처리 이력 사이**에 위치): 프로젝트를 일일이 펼치지 않고 **완료 전 진행 카드를 전 프로젝트에서 한 곳에 모아** 보여주는 표(`/api/active`, **30초 자동 갱신** + 수동 새로고침). 열은 **프로젝트 · 키(번호) · 티켓 이름 · 단계**, `stage !== done` 카드만 표시하고 **단계 설정 시각(Jira `updated`) 최신순으로 정렬**(방금 단계가 바뀐 카드가 위, 행 툴팁에 수정 시각 표기). 처리 중(살아있는 락) 카드는 `처리 중(plan|build|review)` 배지로 강조된다. **행을 클릭하면 해당 프로젝트 카드로 스크롤 이동 + 그 카드가 자동으로 펼쳐진다** — App 이 `jumpTo{projectId,key,nonce}` 를 각 `ProjectCard` 에 내려주고, 대상 카드가 `Section`·'카드 상태' `SubSection` 을 강제로 열고(`openSignal`), **그 카드가 있는 페이지로 이동**한 뒤(`cardJumpPage`) 상세를 로드한다. **검색어는 건드리지 않는다** — 예전엔 검색창에 카드 키를 써넣어 노출시켰는데, 점프 이후 목록이 그 카드 1건만 남은 채로 유지됐다(11 트러블슈팅). 사용자가 친 검색어에 대상 카드가 안 걸릴 때만 검색을 해제한다. 페이지 이동은 `nonce` 로 점프당 1회만 수행해 60초 폴링이 사용자의 페이지 이동을 되돌리지 않는다. 일부 프로젝트 조회 실패 시(`errors[]`) 나머지는 그대로 두고 상단에 안내만 표시.
@@ -590,6 +607,8 @@ Jira 카드를 자동으로 탐지해 **Claude가 개발 → PR 생성 → 카�
 | 에픽 설계안 파일 | `EPIC_DESIGN_FILE` | `<CLONE_BASE>/.state/<EPIC>.epic-design.md` | 에픽 본문(설계안). 프롬프트가 "작업 전 `Read` 로 먼저 읽어라"고 지시한다(러너가 저장·주입) |
 | 자동 병합 | `EPIC_AUTO_MERGE` (옵션 파일 `autoMerge`) | (꺼짐) | `1` 이면 `await-merge` 에서 조건 충족 시 자동 병합. 대시보드 '에픽 연속 개발' 패널의 체크박스가 설정하며 실행 중에도 변경 가능 |
 | 자동 병합 대기(분) | `EPIC_AUTO_MERGE_AFTER_MIN` (옵션 파일 `autoMergeAfterMin`) | `60` | 병합 대기 진입 후 이 시간이 지나고 열린 PR 이 전부 **리뷰 승인 + CI 초록**이면 자동 병합(1~1440) |
+| 자동 충돌 해소 | `EPIC_AUTO_RESOLVE_CONFLICT` (옵션 파일 `autoResolveConflict`) | (꺼짐) | `1` 이면 `await-merge` 에서 base 충돌 PR 을 대기 시간 뒤 `rebase 해소 → 재푸시 → 승인 무효화 → 재리뷰` 로 되살린다. 패널 체크박스가 설정하며 실행 중에도 변경 가능 |
+| 자동 충돌 해소 대기(분) | `EPIC_CONFLICT_AFTER_MIN` (옵션 파일 `conflictAfterMin`) | `15` | **충돌을 처음 감지한 시점**부터 이 시간이 지나면 자동 해소(1~1440). 사람이 먼저 해소하면 카운트는 사라진다 |
 | CI 수정 반복 상한 | `EPIC_CI_LOOP_MAX` (설정 `ciLoopMax`) | `5` | `ci` 단계에서 'CI 수정 → 재리뷰 → 재판정' 을 반복하는 최대 회차(1~20). 소진하면 `needs-human` 으로 중단(자동 재시도 안 함) |
 | CI 폴링(초) | `EPIC_CI_POLL` | `30` | `ci` 단계에서 CI 완료 여부를 확인하는 주기 |
 | CI 완료 대기 한도(분) | `EPIC_CI_WAIT_MAX_MIN` | `40` | 이 시간 안에 CI 가 끝나지 않으면 '아직 진행 중' 사유로 중단 |
@@ -698,7 +717,7 @@ tail -f loop-plan.log loop-build.log
 
 ### 7.5 Slack 알림 버튼으로 원격 조작
 
-알림 메시지에 실행 버튼을 붙여, Slack 에서 바로 **병합·재개·재실행**을 수행한다.
+알림 메시지에 실행 버튼을 붙여, Slack 에서 바로 **병합·재개·재실행·충돌 해소**를 수행한다.
 
 **왜 Socket Mode 인가** — 버튼 클릭을 받으려면 Slack 이 우리 서버로 POST 를 보내야 하는데,
 이 대시보드는 로컬 전용이라 공개 URL 이 없다. Socket Mode 는 대시보드가 Slack 으로
@@ -719,6 +738,7 @@ tail -f loop-plan.log loop-build.log
 | `⏸ 에픽 중단(paused)` | `▶️ 이어서 진행` · `⏭ 건너뛰기` · `⏹ 중지` | `POST /api/epics/:key/run/resume{,skip}` · `/run/stop` |
 | `⏳ PR 병합 대기 중` | `🔀 병합` · `⏹ 중지` | `POST /api/cards/:key/merge` |
 | `❌ 카드 처리 실패` | `🔁 다시 실행` | `POST /api/cards/:key/run` |
+| `⚠️ base 충돌로 병합할 수 없습니다` | `⚠️ 충돌 해소·재푸시` · `🔗 PR 열기` · `⏹ 중지` | `POST /api/cards/:key/resolve-conflict` |
 
 **안전장치**
 - **허용 사용자 화이트리스트**: `slackAllowUsers` 에 없는 사람이 누르면 실행되지 않고 거부 안내만 뜬다.
@@ -830,7 +850,7 @@ loop-work/                     # (= 저장소 루트)
 | 작업은 됐는데 처리 이력에 안 남음 | (해결됨) stream-json 경로에서 `PIPESTATUS[1]` 을 세미콜론으로 나눠 읽어 `set -u` 로 record_history 전에 스크립트가 죽던 버그 | 수정됨(PIPESTATUS 를 배열로 1회 캡처). 과거 누락분은 `history.jsonl` 에 수동 보강 가능 |
 | build 가 PR 없이 "성공"으로 기록됨 | claude 가 작업을 백그라운드로 미루고 PR 없이 턴 종료 | (해결됨) build 는 **PR URL 이 없으면 success 로 인정하지 않고 `incomplete`(재시도 대상)** 로 처리. build 프롬프트에 "동기 완료, 미루기 금지, PR 없으면 비정상 종료" 명시 |
 | build 를 여러 번 돌려도 계속 실패(PR·완료 안 됨). 로그 마지막이 "set up a fallback wakeup … Waiting" 또는 "Waiting synchronously … before proceeding to commit/PR" | **긴 테스트/빌드**(예: `./gradlew test` 전체 스위트)가 **Bash 도구 기본 120초 제한을 넘겨 하네스가 자동으로 백그라운드로 전환** → 모델이 `Monitor`/대기 waiter(`run_in_background`)로 "기다렸다가 커밋·PR 하겠다"며 턴 종료. 하지만 `claude -p`(헤드리스 1회)는 턴이 끝나면 프로세스가 즉시 종료되고 백그라운드 작업·waiter 는 재개되지 않아, 변경이 커밋·푸시·PR 되지 못한 채 유실됨(스크립트는 PR 없음 → `incomplete`/`.fail`) | (해결됨) build·rework 프롬프트에 **`run_in_background`·`ScheduleWakeup`·`Monitor`·waiter·백그라운드 프로세스 금지**에 더해, **오래 걸리는 테스트/빌드는 Bash `timeout` 을 넉넉히(최대 600000ms=10분) 지정해 포그라운드로 한 번에 끝내라**(120초 자동 백그라운드 회피)고 명시. 이미 백그라운드로 넘어갔으면 취소 후 더 큰 timeout 으로 재실행, 10분으로도 부족하면 변경 영향 모듈/클래스 단위로 좁혀 포그라운드 검증. 클론은 매 실행 `reset --hard`+`clean -fd` 로 청소되므로 남은 dirty 변경은 재실행 시 자동 정리됨 |
-| PR 에서 "This branch cannot be rebased due to conflicts" · merge/Rebase 버튼 비활성화 | 자동화가 base(main)와 충돌하거나 뒤처졌을 때 **base 를 브랜치로 `git merge` 해서 해소** → 브랜치에 **merge 커밋**이 생김. GitHub 는 merge 커밋이 있는 브랜치를 'Rebase and merge' 할 수 없어 버튼을 막고, 실제 base 충돌 시엔 모든 merge 버튼이 비활성화됨 | (해결됨) **예방**: build·rework 프롬프트에 **"브랜치 위생 — base 를 브랜치로 merge 금지, `git rebase origin/<base>` 만 사용, merge 커밋 만들지 말 것"** 명시(rebase 후 `--force-with-lease` push). **복구**: PR 목록의 `⚠️ base 충돌` PR에 **"⚠️ 충돌 해소 후 재푸시"** 버튼(`resolveConflict` 모드) → 그 PR 브랜치를 base 위로 rebase·충돌 해소·검증 후 force-push 해 선형·병합가능 상태로 되돌림 |
+| PR 에서 "This branch cannot be rebased due to conflicts" · merge/Rebase 버튼 비활성화 | 자동화가 base(main)와 충돌하거나 뒤처졌을 때 **base 를 브랜치로 `git merge` 해서 해소** → 브랜치에 **merge 커밋**이 생김. GitHub 는 merge 커밋이 있는 브랜치를 'Rebase and merge' 할 수 없어 버튼을 막고, 실제 base 충돌 시엔 모든 merge 버튼이 비활성화됨 | (해결됨) **예방**: build·rework 프롬프트에 **"브랜치 위생 — base 를 브랜치로 merge 금지, `git rebase origin/<base>` 만 사용, merge 커밋 만들지 말 것"** 명시(rebase 후 `--force-with-lease` push). **복구**: PR 목록(카드 상세·연속 개발 패널)의 `⚠️ base 충돌` PR에 **"충돌 해소·재푸시"** 버튼 · Slack 알림의 같은 버튼 → 그 PR 브랜치를 base 위로 rebase·충돌 해소·검증 후 force-push 해 선형·병합가능 상태로 되돌리고 **승인 무효화 후 재리뷰**까지 이어간다. 연속 개발은 **자동 충돌 해소**(대기 분 설정)로 사람 없이도 되살린다 |
 | 처리 이력 "PR 브랜치" 열이 비어 있음(`–`) | (해결됨) 브랜치 추출이 `feature/` 접두사로 고정돼 `feat/`·`fix/` 등 다른 접두사 브랜치를 못 잡음 | 수정됨: PR URL 로 `gh pr view --json headRefName` 을 조회해 실제 head 브랜치 기록(접두사 무관), merge 경로도 동일. 과거 누락분은 PR URL 로 역산해 `history.jsonl` 백필 가능 |
 | build 후 카드 본문 이미지가 깨짐(Jira·대시보드 모두 안 보임) | (해결됨) 완료 내역을 추가할 때 claude 가 설명을 markdown 으로 읽고 통째로 다시 써넣어, 붙여넣은 이미지 media 노드가 죽은 `external blob:` 참조로 재인코딩됨 | 수정됨: 완료 요약은 `SUMMARY_FILE` 에 저장하고 `append-summary.js` 가 설명 ADF 에 직접 append(기존 이미지/노드 보존). **단, 이미 깨진 blob 이미지는 복구 불가 — 작성자가 카드에 이미지를 다시 첨부해야 함** |
 | 리뷰 승인 루프가 **2회차에서 항상 멈춤** — Slack `⏸ … 2/5회차 — 카드가 이미 처리 중이라 중단`, 직전 로그에 `PR 생성 완료 → 리뷰 승인 루프 시작` + `SKIP: … 리뷰 승인 루프가 이미 실행 중입니다(lock)` | (해결됨) 대시보드가 최상위 build 의 env 에 넣은 `REVIEW_LOOP_AFTER=1` 이 자손 프로세스에 상속돼, 루프가 2회차에 부른 rework(`run-jira-agent.sh build`)가 **반영에 성공한 뒤 승인 루프를 또 띄움** → 중첩 실행이 루프 락에 막혀 `SKIP:` 을 찍고, 부모 루프의 `grep "^SKIP: "` 가 이를 **자기 카드 락 스킵으로 오인**해 중단. 반영은 이미 성공했으므로 재리뷰만 유실됨 | 수정됨: ① 루프가 하위를 부를 때 `REVIEW_LOOP_AFTER`/`REVIEW_AFTER`/`REVIEW_FIRST` 를 비우고 `IN_REVIEW_LOOP=1` 주입 ② `run-jira-agent.sh` 는 `REWORK`/`IN_REVIEW_LOOP` 이면 루프를 띄우지 않음 ③ 스킵 판정을 `SKIP: [KEY] 이미 처리 중(lock)` / `SKIP: awaiting answers` 정확 매칭으로 좁힘. 중단된 카드는 PR 목록의 `🔁 승인까지 루프` 로 이어서 진행 |

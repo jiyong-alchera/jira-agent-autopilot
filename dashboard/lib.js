@@ -528,11 +528,13 @@ function clampAutoMergeMin(v) {
 // "none"(체크 자체가 없는 repo)과 undefined(CI 필드를 안 채우는 옛 호출부)는 통과시킨다.
 const CI_BLOCKING = { fail: "ci-failed", pending: "ci-pending", unknown: "ci-unknown" };
 
-// '병합만 남은' 상태인지 — 열린 PR 이 있고, CI 가 막지 않으며, 전부 리뷰 승인됨.
+// '병합만 남은' 상태인지 — 열린 PR 이 있고, 충돌·CI 가 막지 않으며, 전부 리뷰 승인됨.
 // 대기 시간은 보지 않는다(자동 병합 시점 판정은 shouldAutoMerge 몫).
 function mergeReadyState(openPRs) {
   const prs = openPRs || [];
   if (!prs.length) return "no-open-pr";
+  // base 충돌 PR 은 병합 자체가 불가능하다 — 시도하면 실패하고 에픽이 멈춘다. 먼저 걸러 '충돌 해소' 로 보낸다.
+  if (prs.some(isConflicting)) return "conflicting";
   const blocked = prs.map((p) => CI_BLOCKING[p.ci]).find(Boolean);
   if (blocked) return blocked;
   if (!prs.every((p) => p.approved)) return "not-approved";
@@ -550,6 +552,38 @@ function shouldAutoMerge(opts, waitStartedAt, openPRs, now) {
   const dueMs = start + clampAutoMergeMin(opts.autoMergeAfterMin) * 60000;
   const t = (now instanceof Date ? now.getTime() : Number(now)) || Date.now();
   return t >= dueMs ? { merge: true, reason: "due", dueMs } : { merge: false, reason: "waiting", dueMs };
+}
+
+// ===== 에픽 자동 충돌 해소 =====
+// base 가 움직여 충돌난 PR 은 사람이 볼 때까지 병합도 리뷰도 진행되지 않는다. 지정한 시간이 지나면
+// 러너가 'rebase 해소 → 재푸시 → (승인 무효화) 재리뷰' 를 대신 태워 흐름을 다시 굴린다.
+// 기본 15분, 1분~24시간(1440분) 범위. 기본은 꺼짐(force-push 를 동반하므로 명시적으로 켜야 한다).
+const EPIC_CONFLICT_MIN_DEFAULT = 15;
+const EPIC_CONFLICT_MIN_LIMIT = 1440;
+function clampConflictMin(v) {
+  const n = parseInt(v, 10);
+  if (!Number.isFinite(n) || n <= 0) return EPIC_CONFLICT_MIN_DEFAULT;
+  return Math.min(n, EPIC_CONFLICT_MIN_LIMIT);
+}
+// gh 의 mergeable 은 MERGEABLE | CONFLICTING | UNKNOWN. UNKNOWN(계산 중)은 충돌로 보지 않는다 —
+// 모르는 상태에서 force-push 를 동반하는 rebase 를 걸면 안 된다(다음 폴링에서 다시 본다).
+const isConflicting = (p) => String((p && p.mergeable) || "").toUpperCase() === "CONFLICTING";
+// 승인 마커 무효화 본문 — 남의 코멘트를 지우지 않고 봇이 쓴 자기 코멘트의 마커만 바꿔 무력화한다.
+// (CI 수정·충돌 해소가 같은 방식을 쓰되, 무효 사유는 마커로 구분한다)
+const REVIEW_SUPERSEDED_CI = "CLAUDE-REVIEW-SUPERSEDED-BY-CI-FIX";
+const REVIEW_SUPERSEDED_CONFLICT = "CLAUDE-REVIEW-SUPERSEDED-BY-CONFLICT-FIX";
+function supersededBody(body, marker, why, when) {
+  return `${String(body || "").split(REVIEW_APPROVED_MARKER).join(marker)}\n\n> ⚠️ ${why} 이 승인은 무효화됐습니다(${when}). 재리뷰가 진행됩니다.\n`;
+}
+const conflictingPRs = (openPRs) => (openPRs || []).filter(isConflicting);
+// 자동 충돌 해소 판정 — 켜져 있고, 충돌을 처음 본 시각부터 대기 시간을 넘겼을 때만.
+function shouldAutoResolveConflict(opts, conflictSince, now) {
+  if (!opts || !opts.autoResolveConflict) return { resolve: false, reason: "off" };
+  const start = Date.parse(conflictSince || "");
+  if (!Number.isFinite(start)) return { resolve: false, reason: "no-conflict" };
+  const dueMs = start + clampConflictMin(opts.conflictAfterMin) * 60000;
+  const t = (now instanceof Date ? now.getTime() : Number(now)) || Date.now();
+  return t >= dueMs ? { resolve: true, reason: "due", dueMs } : { resolve: false, reason: "waiting", dueMs };
 }
 
 // ===== 에픽 자동 재시도 =====
@@ -644,6 +678,8 @@ const SLACK_ACTIONS = {
   "merge":       { label: "🔀 병합",        style: "primary", api: (a) => `/api/cards/${a.key}/merge`,            body: (a) => (a.owner && a.number ? { owner: a.owner, number: a.number } : {}) },
   "review-loop": { label: "🔁 재리뷰 루프",  style: undefined, api: (a) => `/api/cards/${a.key}/review-loop`,      body: (a) => ({ owner: a.owner, number: a.number }) },
   "card-run":    { label: "🔁 다시 실행",    style: undefined, api: (a) => `/api/cards/${a.key}/run`,              body: (a) => ({ phase: a.step || "build" }) },
+  // 충돌 해소는 force-push 를 동반하므로 danger — 누른 사람이 무게를 알아보게 한다.
+  "resolve-conflict": { label: "⚠️ 충돌 해소·재푸시", style: "danger", api: (a) => `/api/cards/${a.key}/resolve-conflict`, body: (a) => ({ owner: a.owner, number: a.number, epic: a.epic || "" }) },
   "epic-resume": { label: "▶️ 이어서 진행",  style: "primary", api: (a) => `/api/epics/${a.key}/run/resume`,       body: () => ({}) },
   "epic-skip":   { label: "⏭ 건너뛰기",      style: undefined, api: (a) => `/api/epics/${a.key}/run/resume`,       body: () => ({ skip: true }) },
   "epic-stop":   { label: "⏹ 중지",          style: "danger",  api: (a) => `/api/epics/${a.key}/run/stop`,         body: () => ({}) },
@@ -651,14 +687,17 @@ const SLACK_ACTIONS = {
 const SLACK_ACTION_PREFIX = "jaa:";   // action_id 접두사 — 우리 버튼만 골라낸다
 
 // 버튼 value(Slack 상한 2000자)에는 실행에 필요한 최소 필드만 담는다.
+const ISSUE_KEY_RE = /^[A-Z][A-Z0-9]+-[0-9]+$/;
 function encodeSlackAction(a) {
-  return JSON.stringify({ a: a.id, p: a.project || "", k: a.key || "", o: a.owner || "", n: a.number == null ? "" : String(a.number), s: a.step || "" });
+  return JSON.stringify({ a: a.id, p: a.project || "", k: a.key || "", o: a.owner || "", n: a.number == null ? "" : String(a.number), s: a.step || "", e: a.epic || "" });
 }
 function decodeSlackAction(value) {
   let o; try { o = JSON.parse(value); } catch { return null; }
   if (!o || !Object.prototype.hasOwnProperty.call(SLACK_ACTIONS, o.a)) return null;
-  if (!/^[A-Z][A-Z0-9]+-[0-9]+$/.test(String(o.k || ""))) return null;   // 이슈 키 형식 강제
-  return { id: o.a, project: String(o.p || ""), key: String(o.k), owner: String(o.o || ""), number: String(o.n || ""), step: String(o.s || "") };
+  if (!ISSUE_KEY_RE.test(String(o.k || ""))) return null;   // 이슈 키 형식 강제
+  // 에픽 키는 선택값 — 형식이 틀리면 통째로 거부하지 않고 버린다(그 버튼은 에픽 재개 없이 동작).
+  const epic = ISSUE_KEY_RE.test(String(o.e || "")) ? String(o.e) : "";
+  return { id: o.a, project: String(o.p || ""), key: String(o.k), owner: String(o.o || ""), number: String(o.n || ""), step: String(o.s || ""), epic };
 }
 
 // 알림 1건 → Slack payload. actions 는 [{ id, project, key, owner, number, step }] 또는 { url, label } 링크.
@@ -706,6 +745,8 @@ module.exports = {
   EPIC_STEPS, epicChildrenJql, epicTaskStep, nextEpicTask, nextEpicStep, buildAdoptedAnswerBody, prBelongsToCard,
   EPIC_HIERARCHY_LEVEL, EPIC_LABEL_FALLBACK, topLevelIssueTypes, epicSearchJql, epicTypeLabel,
   EPIC_AUTO_MERGE_MIN_DEFAULT, EPIC_AUTO_MERGE_MIN_LIMIT, clampAutoMergeMin, shouldAutoMerge, mergeReadyState, isMergeReady,
+  EPIC_CONFLICT_MIN_DEFAULT, EPIC_CONFLICT_MIN_LIMIT, clampConflictMin, isConflicting, conflictingPRs, shouldAutoResolveConflict,
+  REVIEW_SUPERSEDED_CI, REVIEW_SUPERSEDED_CONFLICT, supersededBody,
   EPIC_RETRY_MAX_DEFAULT, EPIC_RETRY_MAX_LIMIT, EPIC_RETRY_BACKOFF_MIN, clampRetryMax,
   parseUsageLimitReset, classifyPause, planRetry,
   SLACK_ACTIONS, SLACK_ACTION_PREFIX, encodeSlackAction, decodeSlackAction, slackMessage, slackActorAllowed,

@@ -143,6 +143,55 @@ test("shouldAutoMerge: 열린 PR 이 없거나 시작 시각이 없으면 병합
 // ===== 중단 시 자동 재시도 =====
 // 실측 사례: 04:06 에 "resets 1:40pm" → 9시간 34분 뒤. 고정 백오프(최대 4시간)로는 닿지 않아
 // 해제 시각 파싱이 필수다.
+// ----- base 충돌 자동 해소 -----
+const CONFLICT_PR = { approved: true, ci: "pass", mergeable: "CONFLICTING" };
+
+test("clampConflictMin: 기본 15분, 1~1440 범위", () => {
+  assert.equal(lib.clampConflictMin(undefined), 15);
+  assert.equal(lib.clampConflictMin("0"), 15);
+  assert.equal(lib.clampConflictMin("abc"), 15);
+  assert.equal(lib.clampConflictMin(30), 30);
+  assert.equal(lib.clampConflictMin(99999), 1440);
+});
+
+test("isConflicting: CONFLICTING 만 충돌 — UNKNOWN(계산 중)에 force-push 를 걸지 않는다", () => {
+  assert.equal(lib.isConflicting({ mergeable: "CONFLICTING" }), true);
+  assert.equal(lib.isConflicting({ mergeable: "UNKNOWN" }), false);
+  assert.equal(lib.isConflicting({ mergeable: "MERGEABLE" }), false);
+  assert.equal(lib.isConflicting({}), false);
+  assert.deepEqual(lib.conflictingPRs([{ number: 1, mergeable: "CONFLICTING" }, { number: 2 }]).map((p) => p.number), [1]);
+});
+
+test("mergeReadyState: 충돌 PR 은 승인·CI 와 무관하게 병합 대상이 아니다", () => {
+  assert.equal(lib.mergeReadyState([CONFLICT_PR]), "conflicting");
+  const r = lib.shouldAutoMerge({ autoMerge: true, autoMergeAfterMin: 1 }, "2026-01-01T00:00:00Z", [CONFLICT_PR], Date.parse("2026-01-01T10:00:00Z"));
+  assert.equal(r.merge, false);
+  assert.equal(r.reason, "conflicting");
+});
+
+test("shouldAutoResolveConflict: 꺼져 있거나 충돌 시각이 없으면 해소하지 않는다", () => {
+  assert.equal(lib.shouldAutoResolveConflict({ autoResolveConflict: false }, "2026-01-01T00:00:00Z", Date.now()).resolve, false);
+  assert.equal(lib.shouldAutoResolveConflict({ autoResolveConflict: true }, "", Date.now()).reason, "no-conflict");
+});
+
+test("shouldAutoResolveConflict: 충돌 감지 후 대기 시간을 넘겨야 해소한다", () => {
+  const opts = { autoResolveConflict: true, conflictAfterMin: 15 };
+  const since = "2026-01-01T00:00:00Z";
+  const before = lib.shouldAutoResolveConflict(opts, since, Date.parse("2026-01-01T00:14:00Z"));
+  assert.equal(before.resolve, false);
+  assert.equal(before.reason, "waiting");
+  assert.equal(before.dueMs, Date.parse("2026-01-01T00:15:00Z"));
+  assert.equal(lib.shouldAutoResolveConflict(opts, since, Date.parse("2026-01-01T00:15:00Z")).resolve, true);
+});
+
+test("supersededBody: 승인 마커를 치환하고 무효 사유를 덧붙인다", () => {
+  const body = `리뷰 통과\n${lib.REVIEW_APPROVED_MARKER}`;
+  const out = lib.supersededBody(body, lib.REVIEW_SUPERSEDED_CONFLICT, "base 충돌을 해소해", "2026-01-01T00:00:00Z");
+  assert.ok(!out.includes(lib.REVIEW_APPROVED_MARKER));
+  assert.ok(out.includes(lib.REVIEW_SUPERSEDED_CONFLICT));
+  assert.match(out, /base 충돌을 해소해 이 승인은 무효화됐습니다/);
+});
+
 test("parseUsageLimitReset: 실제 메시지에서 해제 시각을 읽는다", () => {
   const now = new Date("2026-09-02T04:06:11+09:00");
   const at = lib.parseUsageLimitReset("You've hit your session limit · resets 1:40pm (Asia/Seoul)", now);

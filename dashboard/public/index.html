@@ -590,9 +590,9 @@ function ProjectCard({ proj, onDeleted, flash, jumpTo }) {
   };
   // base 충돌을 rebase 로 해소하고 그 PR 브랜치를 force-push(--force-with-lease)로 갱신
   const resolveConflictPr = async (key, pr) => {
-    if (!window.confirm(`#${pr.number} 의 base(${pr.base || "base"}) 충돌을 rebase 로 해소한 뒤 force-push 로 갱신합니다.\n\n히스토리가 재작성되고 기존 인라인 리뷰 스레드가 일부 끊길 수 있습니다. 진행할까요?`)) return;
-    const r = await api.post(`/api/cards/${key}/run`, { phase: "build", resolveConflict: true, reworkOwner: pr.owner, reworkNumber: pr.number, project: PID });
-    flash(r.ok ? `#${pr.number} 충돌 해소 실행 — 엔진 실행 로그(build) 확인` : (r.message || "실패"));
+    if (!window.confirm(`#${pr.number} 의 base(${pr.base || "base"}) 충돌을 rebase 로 해소한 뒤 force-push 로 갱신하고, 이어서 재리뷰를 진행합니다.\n\n· 히스토리가 재작성되고 기존 인라인 리뷰 스레드가 일부 끊길 수 있습니다.\n· 해소 커밋은 아무도 보지 않은 코드라 기존 리뷰 승인은 무효화됩니다.\n\n진행할까요?`)) return;
+    const r = await api.post(`/api/cards/${key}/resolve-conflict`, { owner: pr.owner, number: pr.number, project: PID });
+    flash(r.ok ? `#${pr.number} 충돌 해소·재푸시 실행 — 엔진 실행 로그(build) 확인` : (r.message || "실패"));
     if (r.ok) showClaudeLog(key, "build");
   };
   const showClaudeLog = async (key, phase) => { setClaudeLog({ key, phase, text: "불러오는 중…" }); const r = await api.get(withP(`/api/claude-log/${key}/${phase}?lines=600`)); setClaudeLog((p) => (p && p.key === key && p.phase === phase) ? { ...p, text: r.ok ? r.log : (r.message || "조회 실패") } : p); };
@@ -1132,7 +1132,7 @@ function ProjectCard({ proj, onDeleted, flash, jumpTo }) {
                                                     title={lp ? `이 카드에서 ${lp.owner}#${lp.number} 루프가 실행 중입니다.` : "리뷰가 승인될 때까지 '반영 → 재리뷰' 를 반복합니다(최대 5회). 회차마다 Slack 알림."}
                                                     className={`text-[11px] px-2 py-0.5 rounded border transition ${lp ? "border-slate-700 text-slate-600 cursor-not-allowed" : "border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/10"}`}>🔁 승인까지 루프</button>;
                                                 })()}
-                                                {c.assignedToMe && pr.state === "OPEN" && pr.mergeable === "CONFLICTING" && <button onClick={() => resolveConflictPr(c.key, pr)} className="text-[11px] px-2 py-0.5 rounded border border-rose-500/50 text-rose-300 hover:bg-rose-500/10 transition" title="base 충돌을 rebase 로 해소하고 force-push 로 이 PR 을 갱신합니다(검증 후 푸시).">⚠️ 충돌 해소 후 재푸시</button>}
+                                                {c.assignedToMe && pr.state === "OPEN" && pr.mergeable === "CONFLICTING" && <button onClick={() => resolveConflictPr(c.key, pr)} className="text-[11px] px-2 py-0.5 rounded border border-rose-500/50 text-rose-300 hover:bg-rose-500/10 transition" title="base 충돌을 rebase 로 해소하고 force-push 로 이 PR 을 갱신한 뒤, 기존 승인을 무효화하고 재리뷰까지 진행합니다.">⚠️ 충돌 해소 후 재푸시</button>}
                                                 {c.assignedToMe && pr.state === "OPEN" && <button onClick={() => mergeOnePr(c.key, pr)} className="text-[11px] px-2 py-0.5 rounded border border-teal-500/40 text-teal-300 hover:bg-teal-500/10 transition">이 PR 병합</button>}
                                                 <a href={pr.url} target="_blank" rel="noreferrer" className="text-[11px] px-2 py-0.5 rounded border border-slate-600 text-slate-300 hover:bg-slate-600/20 transition">열기</a>
                                               </div>
@@ -1274,7 +1274,7 @@ function EpicLogs({ pid, cardKey, step, reviewLoop }) {
 // 에픽 현재 태스크의 PR 목록 + 병합 조작.
 // 이 카드의 PR 을 모두 병합해야 다음 태스크로 넘어가므로(await-merge), repo 마다 하나씩 생기는
 // 여러 PR 을 한 자리에서 보고 개별/일괄로 병합할 수 있게 한다.
-function EpicPrs({ pid, cardKey, step, flash, onMerged }) {
+function EpicPrs({ pid, cardKey, epicKey, step, flash, onMerged }) {
   const [prs, setPrs] = useState(null);
   const [botLogin, setBotLogin] = useState("");
   const [busy, setBusy] = useState("");
@@ -1302,6 +1302,23 @@ function EpicPrs({ pid, cardKey, step, flash, onMerged }) {
   const blocked = open.filter((p) => p.mergeable === "CONFLICTING");
 
   const afterMerge = async (msg) => { flash(msg); await load(); if (onMerged) onMerged(); };
+  // base 충돌 해소 → 재푸시 → (승인 무효화) 재리뷰. 연속 개발이 '병합 대기' 중이면 러너가 직접 처리하고,
+  // 멈춰 있으면 해소가 끝난 뒤 그 지점부터 자동으로 이어서 진행한다.
+  const resolveConflict = async (targets) => {
+    if (!targets.length) return;
+    const list = targets.map((p) => `  · ${p.repo} #${p.number}`).join("\n");
+    if (!window.confirm(`base 충돌을 rebase 로 해소하고 force-push 로 갱신한 뒤, 재리뷰까지 진행합니다.\n\n${list}\n\n· 히스토리가 재작성되고 기존 인라인 리뷰 스레드가 일부 끊길 수 있습니다.\n· 해소 커밋은 아무도 보지 않은 코드라 기존 리뷰 승인은 무효화됩니다.\n\n진행할까요?`)) return;
+    setBusy("충돌 해소");
+    try {
+      const msgs = [];
+      for (const p of targets) {
+        const r = await api.post(`/api/cards/${cardKey}/resolve-conflict`, { owner: p.owner, number: p.number, project: pid, epic: epicKey || "" });
+        msgs.push(r.ok ? `#${p.number} ${r.queued ? "러너에 요청됨" : "해소 실행"}` : `#${p.number} 실패(${(r.message || "").slice(0, 60)})`);
+      }
+      flash(msgs.join(" · "));
+      await load(); if (onMerged) onMerged();
+    } finally { setBusy(""); }
+  };
   // 사람이 확인창에서 '그래도 진행'을 고르면 force 로 보낸다 — 자동 병합에는 없는 우회로다(서버가 막는 건 동일).
   const ciWarn = (p) => (p.ci === "fail" ? `⚠️ CI 실패 상태입니다${(p.ciFailed || []).length ? ` (${p.ciFailed.map((f) => f.name).join(", ")})` : ""}.\n`
     : p.ci === "pending" ? "⚠️ CI 가 아직 진행 중입니다.\n" : "");
@@ -1359,8 +1376,13 @@ function EpicPrs({ pid, cardKey, step, flash, onMerged }) {
       </div>
 
       {blocked.length > 0 && (
-        <div className="text-[11px] text-rose-300 mb-2">
-          ⚠️ base 충돌 {blocked.length}건({blocked.map((p) => `${p.repo}#${p.number}`).join(", ")}) — 카드 상세의 <b>‘충돌 해소 후 재푸시’</b> 로 먼저 해소하세요.
+        <div className="flex items-center gap-2 flex-wrap text-[11px] text-rose-300 mb-2">
+          <span>⚠️ base 충돌 {blocked.length}건({blocked.map((p) => `${p.repo}#${p.number}`).join(", ")}) — 해소해야 병합·리뷰가 진행됩니다.</span>
+          <button disabled={!!busy} onClick={() => resolveConflict(blocked)}
+            title="충돌을 rebase 로 해소하고 force-push 로 갱신한 뒤, 승인을 무효화하고 재리뷰까지 진행합니다."
+            className="px-2 py-0.5 rounded border border-rose-500/50 text-rose-300 hover:bg-rose-500/10 disabled:opacity-35 transition">
+            {busy === "충돌 해소" ? "해소 중…" : `충돌 해소·재푸시 (${blocked.length})`}
+          </button>
         </div>
       )}
 
@@ -1385,6 +1407,13 @@ function EpicPrs({ pid, cardKey, step, flash, onMerged }) {
               {p.mergeable === "UNKNOWN" && <Badge cls="bg-slate-600/30 text-slate-400 border-slate-600" title="GitHub 가 계산 중">확인중</Badge>}
               <CiBadge pr={p} />
 
+              {p.mergeable === "CONFLICTING" && (
+                <button disabled={!!busy} onClick={() => resolveConflict([p])}
+                  title="base 충돌을 rebase 로 해소하고 force-push 로 갱신한 뒤, 승인을 무효화하고 재리뷰까지 진행합니다."
+                  className="text-[11px] px-2 py-0.5 rounded border border-rose-500/50 text-rose-300 hover:bg-rose-500/10 disabled:opacity-35 transition shrink-0">
+                  ⚠️ 충돌 해소·재푸시
+                </button>
+              )}
               <button disabled={!!busy} onClick={() => mergeOne(p)}
                 className="text-[11px] px-2 py-0.5 rounded border border-teal-500/40 text-teal-300 hover:bg-teal-500/10 disabled:opacity-35 transition shrink-0">
                 {busy === id ? "병합 중…" : "병합"}
@@ -1434,6 +1463,8 @@ function EpicPanel({ projects, flash }) {
   const [autoMergeMin, setAutoMergeMin] = useState("60");     // 대기(분)
   const [autoRetry, setAutoRetry] = useState(false);          // 중단 시 자동 재시도
   const [autoRetryMax, setAutoRetryMax] = useState("5");
+  const [autoConflict, setAutoConflict] = useState(false);    // base 충돌 자동 해소·재푸시
+  const [conflictMin, setConflictMin] = useState("15");       // 대기(분)
   const proj = projects.find((p) => p.id === pid) || null;
   const repoNames = ((proj && proj.repos) || []).map((r) => r.name).filter(Boolean);
 
@@ -1462,6 +1493,7 @@ function EpicPanel({ projects, flash }) {
     if (st.opts) {
       setAutoMerge(!!st.opts.autoMerge); setAutoMergeMin(String(st.opts.autoMergeAfterMin || 60));
       setAutoRetry(!!st.opts.autoRetry); setAutoRetryMax(String(st.opts.autoRetryMax || 5));
+      setAutoConflict(!!st.opts.autoResolveConflict); setConflictMin(String(st.opts.conflictAfterMin || 15));
     }
     // 승인까지 리뷰 루프는 build 단계 '안에서' 도는 별도 프로세스라 에픽 상태 파일에 안 나온다.
     // 이걸 안 보여주면 build 가 30분 넘게 멈춘 것처럼 보인다(실제로는 리뷰 회차가 진행 중).
@@ -1490,6 +1522,7 @@ function EpicPanel({ projects, flash }) {
     const r = await api.post(`/api/epics/${epicKey}/run?project=${encodeURIComponent(pid)}`, {
       repos, autoMerge, autoMergeAfterMin: parseInt(autoMergeMin, 10) || 60,
       autoRetry, autoRetryMax: parseInt(autoRetryMax, 10) || 5,
+      autoResolveConflict: autoConflict, conflictAfterMin: parseInt(conflictMin, 10) || 15,
     });
     if (r.ok) { setNewRunMode(false); repoTouched.current = false; }
     return r;
@@ -1508,6 +1541,14 @@ function EpicPanel({ projects, flash }) {
     setAutoMerge(body.autoMerge); setAutoMergeMin(String(body.autoMergeAfterMin));
     const r = await api.post(`/api/epics/${epicKey}/run/options?project=${encodeURIComponent(pid)}`, body);
     flash(r.ok ? (r.message || "자동 병합 설정 저장") : (r.message || "설정 저장 실패"));
+    loadRun();
+  };
+  // 실행 중에도 즉시 반영 — 러너가 병합 대기 폴링마다 옵션 파일을 다시 읽는다.
+  const saveAutoConflict = async (next) => {
+    const body = { autoResolveConflict: next.on, conflictAfterMin: parseInt(next.min, 10) || 15 };
+    setAutoConflict(body.autoResolveConflict); setConflictMin(String(body.conflictAfterMin));
+    const r = await api.post(`/api/epics/${epicKey}/run/options?project=${encodeURIComponent(pid)}`, body);
+    flash(r.ok ? (r.message || "자동 충돌 해소 설정 저장") : (r.message || "설정 저장 실패"));
     loadRun();
   };
   const resume = (skip) => act(skip ? "건너뛰기" : "이어서 진행", () => api.post(`/api/epics/${epicKey}/run/resume?project=${encodeURIComponent(pid)}`, { skip }));
@@ -1675,11 +1716,35 @@ function EpicPanel({ projects, flash }) {
                 회
               </label>
             </div>
+
+            {/* 자동 충돌 해소 — base 가 움직여 충돌난 PR 을 rebase 로 되살리고 재리뷰까지 태운다 */}
+            <div className="flex items-center gap-3 flex-wrap mt-2 pt-2 border-t border-slate-700/70">
+              <label className="inline-flex items-center gap-1.5 text-sm text-slate-300">
+                <input type="checkbox" checked={autoConflict}
+                  onChange={(e) => saveAutoConflict({ on: e.target.checked, min: conflictMin })} />
+                base 충돌 시 자동 해소·재푸시
+                <InfoTip title="base 충돌 시 자동 해소·재푸시" text={"병합 대기 중인 PR 이 base 충돌 상태로 지정한 시간을 넘기면, 대신 'rebase 해소 → 검증 → force-push → 재리뷰' 를 진행합니다.\n\n· 대기 시간은 '충돌을 처음 감지한 시점' 부터 셉니다. 사람이 먼저 해소하면 카운트는 사라집니다.\n· 해소 커밋은 아무도 보지 않은 코드이므로 기존 리뷰 승인을 무효화하고 리뷰 승인 루프를 다시 돌립니다(CI 수정과 같은 규칙).\n· 브랜치 히스토리가 재작성됩니다(force-with-lease). 기존 인라인 리뷰 스레드가 일부 끊길 수 있습니다.\n· 안전하게 해소할 수 없으면 푸시하지 않고 실행을 중단해 알립니다.\n· 꺼져 있어도 PR 목록의 [충돌 해소·재푸시] 버튼과 Slack 알림 버튼으로 즉시 실행할 수 있습니다.\n· 병합 대기 단계에서만 자동으로 동작합니다."} />
+              </label>
+              <label className={`inline-flex items-center gap-1.5 text-sm ${autoConflict ? "text-slate-300" : "text-slate-600"}`}>
+                대기
+                <input type="number" min="1" max="1440" value={conflictMin} disabled={!autoConflict}
+                  onChange={(e) => setConflictMin(e.target.value)}
+                  onBlur={() => saveAutoConflict({ on: autoConflict, min: conflictMin })}
+                  className="w-20 bg-slate-800 border border-slate-600 rounded px-2 py-1 text-sm disabled:opacity-40 focus:outline-none focus:border-indigo-400" />
+                분
+              </label>
+              {run.running && run.step === "await-merge" && (run.conflictPRs || []).length > 0 && (
+                <span className="text-xs text-rose-300">
+                  ⚠️ 충돌 {run.conflictPRs.join(", ")}
+                  {autoConflict && run.conflictAt ? ` · 자동 해소 예정: ${new Date(run.conflictAt).toLocaleTimeString()} (약 ${untilText(run.conflictAt)} 후)` : " · 아래 PR 목록에서 해소하세요"}
+                </span>
+              )}
+            </div>
           </div>
 
           {/* 현재 태스크의 PR — 병합해야 다음 태스크로 넘어가므로 여기서 바로 조작 */}
           {(run.running || paused) && cur && cur.key && (
-            <EpicPrs pid={pid} cardKey={cur.key} step={run.step} flash={flash}
+            <EpicPrs pid={pid} cardKey={cur.key} epicKey={epicKey} step={run.step} flash={flash}
               onMerged={() => { loadRun(); loadChildren(epicKey); }} />
           )}
 

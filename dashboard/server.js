@@ -207,7 +207,7 @@ function runOnce(type) {
 // 특정 카드 1건 즉시 실행(프로젝트 env 주입)
 // opts: { reposLines, rework, reviewAfter, reviewLoopAfter, reviewLoopMax, reviewOnly, reworkOnly, resolveConflict }
 function runCard(key, phase, stamp, projectId, opts) {
-  const { reposLines, rework, reviewAfter, reviewLoopAfter, reviewLoopMax, reviewOnly, reworkOnly, resolveConflict } = opts || {};
+  const { reposLines, rework, reviewAfter, reviewLoopAfter, reviewLoopMax, reviewOnly, reworkOnly, resolveConflict, onExit } = opts || {};
   const isReview = phase === "review";   // review 는 run-review.sh(PR 자동 리뷰), 그 외는 run-jira-agent.sh
   const script = path.join(SCRIPTS_DIR, isReview ? "run-review.sh" : "run-jira-agent.sh");
   if (!fs.existsSync(script)) return { ok: false, message: `스크립트를 찾을 수 없습니다: ${script}` };
@@ -235,6 +235,8 @@ function runCard(key, phase, stamp, projectId, opts) {
   const args = isReview ? [script, key] : [script, key, phase];
   const proc = spawn("bash", args, { cwd: SCRIPTS_DIR, env, detached: true, stdio: ["ignore", fd, fd] });
   try { fs.closeSync(fd); } catch {}
+  // detached 라 대시보드를 껐다 켜면 후속 동작은 사라진다(살아 있는 동안만 이어붙인다).
+  if (typeof onExit === "function") proc.on("exit", (code) => { try { onExit(code == null ? 1 : code); } catch {} });
   proc.unref();
   return { ok: true, pid: proc.pid };
 }
@@ -575,6 +577,58 @@ app.post("/api/cards/:key/run", async (req, res) => {
   } catch (e) { fail(res, e); }
 });
 
+// base 충돌 해소 → 재푸시 → 재리뷰. 카드 상세·연속 개발 패널·Slack 버튼이 함께 쓰는 경로.
+// body { owner, number, epic? }
+//  · epic 이 '병합 대기' 중이면 러너에게 요청 파일로 넘긴다 — 밖에서 따로 돌리면 카드 락이 부딪히고,
+//    해소 뒤의 승인 무효화·재리뷰·재병합을 러너가 모른 채 지나간다.
+//  · 그 외에는 여기서 단건 실행하고(REVIEW_LOOP_AFTER=1 로 재리뷰까지 이어짐), 에픽이 멈춰 있으면
+//    실행이 끝난 뒤 그 에픽을 이어서 진행시킨다.
+app.post("/api/cards/:key/resolve-conflict", async (req, res) => {
+  const key = req.params.key;
+  const b = req.body || {};
+  const owner = String(b.owner || "").trim();
+  const number = String(b.number == null ? "" : b.number).trim();
+  const epic = /^[A-Z][A-Z0-9]+-[0-9]+$/.test(String(b.epic || "")) ? String(b.epic) : "";
+  if (!/^[A-Z][A-Z0-9]+-[0-9]+$/.test(key)) return res.status(400).json({ ok: false, message: "이슈 키 형식 오류" });
+  if (!/^[\w.-]+\/[\w.-]+$/.test(owner) || !/^[0-9]+$/.test(number)) return res.status(400).json({ ok: false, message: "owner(OWNER/REPO)·number 를 지정하세요." });
+  try {
+    const { id, cfg, cred } = resolveProject(req);
+    if (epic) {
+      const st = epicRunStatus(cfg, epic);
+      if (st.running && st.step === "await-merge") {
+        writeConflictRequest(cfg, epic, { key, owner, number, requestedAt: new Date().toISOString() });
+        return res.json({ ok: true, queued: true, message: `${owner}#${number} 충돌 해소를 연속 개발 러너에 요청했습니다(병합 대기 폴링에서 바로 처리).` });
+      }
+      if (st.running) {
+        return res.json({ ok: false, message: `연속 개발이 '${st.step || "실행"}' 단계 실행 중입니다. 그 단계가 끝난 뒤(또는 중지 후) 다시 눌러주세요.` });
+      }
+    }
+    // 충돌 상태일 때만 기존 승인을 무효화한다 — rebase 로 코드가 바뀌므로 그 승인은 더 이상 유효하지 않다.
+    // (충돌이 아니면 아무것도 안 바뀔 수 있으니 승인을 건드리지 않는다)
+    let superseded = 0;
+    const view = await gh(["pr", "view", number, "--repo", owner, "--json", "mergeable"], cred);
+    let mergeable = "UNKNOWN";
+    if (view.ok) { try { mergeable = (JSON.parse(view.stdout || "{}") || {}).mergeable || "UNKNOWN"; } catch {} }
+    if (mergeable === "CONFLICTING") superseded = await supersedeApprovalPR(cfg, cred, owner, number, lib.REVIEW_SUPERSEDED_CONFLICT, "base 충돌을 rebase 로 해소해 코드가 바뀌므로");
+    // 대상 PR 의 repo 로만 좁힌다(다른 repo 를 clone·수정하지 않도록)
+    let reposLines = null;
+    try {
+      const repos = normalizeRepos(cfg).filter((r) => ownerRepo(r.url) === owner);
+      if (repos.length) reposLines = reposToLines(cfg, repos, resolveCardEnv(key, cfg));
+    } catch { reposLines = null; }
+    const resumeEpic = !!(epic && ["paused", "stopped"].includes(epicRunStatus(cfg, epic).status));
+    const r = runCard(key, "build", new Date().toISOString(), id, {
+      reposLines, resolveConflict: true, reworkOnly: { owner, number },
+      reviewLoopAfter: true, reviewLoopMax: clampReviewLoopMax(null, cfg),
+      onExit: resumeEpic ? (code) => {
+        const rr = resumeEpicRun(cfg, id, epic);
+        console.log(`[conflict] ${key} ${owner}#${number} 해소 실행 종료(exit ${code}) → ${epic} ${rr.ok ? `이어서 진행 (pid ${rr.pid})` : `재개 못 함: ${rr.message}`}`);
+      } : undefined,
+    });
+    res.json({ ...r, superseded, mergeable, resumeEpic, queued: false });
+  } catch (e) { fail(res, e); }
+});
+
 // 처리 중인 카드의 claude 작업 중지 — 락 PID 의 프로세스 트리(run-jira-agent.sh→claude→도구)를 종료.
 // body.phase 지정 시 그 단계만: 'review' → <KEY>.review.lock, 'plan'/'build' → <KEY>.lock. 없으면 전부.
 // (루프/run-cycle/다른 카드는 건드리지 않음)
@@ -672,6 +726,27 @@ app.post("/api/cards/:key/review-loop/stop", (req, res) => {
   } catch (e) { fail(res, e); }
 });
 
+// PR 의 승인 마커를 무효화한다 — 봇이 쓴 자기 코멘트의 마커 문자열만 바꾸고 사유를 덧붙인다
+// (남의 코멘트는 건드리지 않는다). 실패해도 흐름을 막지 않는다: 무효화 못 한 승인은 사람이 볼 수 있다.
+async function supersedeApprovalPR(cfg, cred, owner, number, marker, why) {
+  const list = await gh(["api", `repos/${owner}/issues/${number}/comments?per_page=100`, "--jq", "[.[] | {id, body}]"], cred);
+  if (!list.ok) return 0;
+  let comments = []; try { comments = JSON.parse(list.stdout || "[]") || []; } catch { return 0; }
+  const file = path.join(stateDirOf(cfg), `supersede-${owner.replace(/\//g, "_")}-${number}.md`);
+  let n = 0;
+  for (const c of comments) {
+    if (!String(c.body || "").includes(REVIEW_APPROVED_MARKER)) continue;
+    try {
+      fs.mkdirSync(stateDirOf(cfg), { recursive: true });
+      fs.writeFileSync(file, lib.supersededBody(c.body, marker, why, new Date().toISOString().replace(/\.\d{3}Z$/, "Z")));
+      const r = await gh(["api", "-X", "PATCH", `repos/${owner}/issues/comments/${c.id}`, "-F", `body=@${file}`], cred);
+      if (r.ok) n += 1;
+    } catch {}
+  }
+  try { fs.unlinkSync(file); } catch {}
+  return n;
+}
+
 // ================= 에픽 연속 개발 (run-epic-loop.js) =================
 // 에픽 하위 태스크를 생성순으로 하나씩 plan→답변자동채택→build(+승인까지 리뷰 루프)→병합 대기로 처리한다.
 // 진행 상태·중지는 <cloneBase>/.state/<EPIC>.epic.{lock,json,stop} 로 주고받는다(리뷰 승인 루프와 같은 규약).
@@ -683,19 +758,27 @@ function readEpicOpts(cfg, key) {
     return {
       autoMerge: !!o.autoMerge, autoMergeAfterMin: lib.clampAutoMergeMin(o.autoMergeAfterMin),
       autoRetry: !!o.autoRetry, autoRetryMax: lib.clampRetryMax(o.autoRetryMax),
+      autoResolveConflict: !!o.autoResolveConflict, conflictAfterMin: lib.clampConflictMin(o.conflictAfterMin),
     };
-  } catch { return { autoMerge: false, autoMergeAfterMin: lib.EPIC_AUTO_MERGE_MIN_DEFAULT, autoRetry: false, autoRetryMax: lib.EPIC_RETRY_MAX_DEFAULT }; }
+  } catch {
+    return {
+      autoMerge: false, autoMergeAfterMin: lib.EPIC_AUTO_MERGE_MIN_DEFAULT,
+      autoRetry: false, autoRetryMax: lib.EPIC_RETRY_MAX_DEFAULT,
+      autoResolveConflict: false, conflictAfterMin: lib.EPIC_CONFLICT_MIN_DEFAULT,
+    };
+  }
 }
 function writeEpicOpts(cfg, key, next) {
   const o = {
     autoMerge: !!next.autoMerge, autoMergeAfterMin: lib.clampAutoMergeMin(next.autoMergeAfterMin),
     autoRetry: !!next.autoRetry, autoRetryMax: lib.clampRetryMax(next.autoRetryMax),
+    autoResolveConflict: !!next.autoResolveConflict, conflictAfterMin: lib.clampConflictMin(next.conflictAfterMin),
   };
   try { fs.mkdirSync(stateDirOf(cfg), { recursive: true }); fs.writeFileSync(epicOptsPath(cfg, key), JSON.stringify(o, null, 2)); } catch {}
   return o;
 }
 function runEpicLoop(epicKey, projectId, opts) {
-  const { repos, reviewLoopMax, resumeStep, resumeKey, autoMerge, autoMergeAfterMin, epicLabel } = opts || {};
+  const { repos, reviewLoopMax, resumeStep, resumeKey, autoMerge, autoMergeAfterMin, autoResolveConflict, conflictAfterMin, epicLabel } = opts || {};
   const label = epicLabel || lib.EPIC_LABEL_FALLBACK;
   const script = path.join(SCRIPTS_DIR, "run-epic-loop.js");
   if (!fs.existsSync(script)) return { ok: false, message: `스크립트를 찾을 수 없습니다: ${script}` };
@@ -715,12 +798,34 @@ function runEpicLoop(epicKey, projectId, opts) {
   if (resumeKey) env.EPIC_RESUME_KEY = resumeKey;
   env.EPIC_AUTO_MERGE = autoMerge ? "1" : "";
   env.EPIC_AUTO_MERGE_AFTER_MIN = String(lib.clampAutoMergeMin(autoMergeAfterMin));
+  env.EPIC_AUTO_RESOLVE_CONFLICT = autoResolveConflict ? "1" : "";
+  env.EPIC_CONFLICT_AFTER_MIN = String(lib.clampConflictMin(conflictAfterMin));
   env.EPIC_LABEL = label;
   const proc = spawn("node", [script, epicKey], { cwd: SCRIPTS_DIR, env, detached: true, stdio: ["ignore", fd, fd] });
   try { fs.closeSync(fd); } catch {}
   proc.unref();
   return { ok: true, pid: proc.pid };
 }
+// 실행 중인 러너에게 '이 PR 충돌을 지금 해소하라'고 넘기는 요청 파일. 러너가 병합 대기 폴링에서 읽고 지운다.
+// 파일 한 장으로 주고받는 이유는 상태/중지 플래그와 같다 — 러너는 detached 라 직접 부를 방법이 없다.
+function epicConflictPath(cfg, key) { return path.join(stateDirOf(cfg), `${key}.epic.conflict.json`); }
+function writeConflictRequest(cfg, key, req) {
+  try { fs.mkdirSync(stateDirOf(cfg), { recursive: true }); fs.writeFileSync(epicConflictPath(cfg, key), JSON.stringify(req, null, 2)); } catch {}
+  return req;
+}
+// 멈춘 에픽을 '멈춘 그 지점부터' 이어서 진행(라우트 /run/resume 의 자동 실행판 — 충돌 해소 후 후속으로 쓴다)
+function resumeEpicRun(cfg, projectId, key) {
+  const cur = epicRunStatus(cfg, key);
+  if (cur.running) return { ok: false, message: "이미 실행 중입니다." };
+  if (!cur.epic || !["paused", "stopped"].includes(cur.status)) return { ok: false, message: `이어서 진행할 수 있는 상태가 아닙니다(${cur.status}).` };
+  if (!(cur.repos || []).length) return { ok: false, message: "이전 실행의 대상 repo 기록이 없습니다." };
+  const opts = readEpicOpts(cfg, key);
+  return runEpicLoop(key, projectId, {
+    repos: cur.repos, reviewLoopMax: clampReviewLoopMax(null, cfg),
+    resumeStep: cur.step || "", resumeKey: (cur.current && cur.current.key) || "", epicLabel: cur.label, ...opts,
+  });
+}
+
 // 에픽 러너 상태. 락 PID 가 살아 있으면 running, 없으면 상태 파일의 마지막 결과(paused/done/stopped)를 돌려준다.
 function epicRunStatus(cfg, epicKey) {
   const stateDir = stateDirOf(cfg);
@@ -877,7 +982,11 @@ app.post("/api/epics/:key/run", async (req, res) => {
     // 새 시작이므로 이전 실행의 상태 파일은 지운다(재개는 /run/resume).
     try { fs.unlinkSync(path.join(stateDirOf(cfg), `${key}.epic.json`)); } catch {}
     const reviewLoopMax = clampReviewLoopMax(b.reviewLoopMax, cfg);
-    const opts = writeEpicOpts(cfg, key, { autoMerge: b.autoMerge, autoMergeAfterMin: b.autoMergeAfterMin, autoRetry: b.autoRetry, autoRetryMax: b.autoRetryMax });
+    const opts = writeEpicOpts(cfg, key, {
+      autoMerge: b.autoMerge, autoMergeAfterMin: b.autoMergeAfterMin, autoRetry: b.autoRetry, autoRetryMax: b.autoRetryMax,
+      autoResolveConflict: b.autoResolveConflict, conflictAfterMin: b.conflictAfterMin,
+    });
+    try { fs.unlinkSync(epicConflictPath(cfg, key)); } catch {}   // 이전 실행에 남은 충돌 해소 요청은 버린다
     clearEpicRetry(cfg, key);   // 새 실행이므로 재시도 카운터 초기화
     res.json({ ...runEpicLoop(key, id, { repos, reviewLoopMax, epicLabel, ...opts }), repos, reviewLoopMax, opts, label: epicLabel });
   } catch (e) { fail(res, e); }
@@ -919,12 +1028,15 @@ app.post("/api/epics/:key/run/options", (req, res) => {
       autoMergeAfterMin: b.autoMergeAfterMin === undefined ? cur.autoMergeAfterMin : b.autoMergeAfterMin,
       autoRetry: b.autoRetry === undefined ? cur.autoRetry : !!b.autoRetry,
       autoRetryMax: b.autoRetryMax === undefined ? cur.autoRetryMax : b.autoRetryMax,
+      autoResolveConflict: b.autoResolveConflict === undefined ? cur.autoResolveConflict : !!b.autoResolveConflict,
+      conflictAfterMin: b.conflictAfterMin === undefined ? cur.conflictAfterMin : b.conflictAfterMin,
     });
     // 재시도 설정을 바꾸면 예정 시각을 다시 계산하도록 기록을 비운다
     if (b.autoRetry !== undefined || b.autoRetryMax !== undefined) clearEpicRetry(cfg, key);
     const msg = [
       opts.autoMerge ? `자동 병합 켜짐(승인 후 ${opts.autoMergeAfterMin}분)` : "자동 병합 꺼짐",
       opts.autoRetry ? `자동 재시도 켜짐(최대 ${opts.autoRetryMax}회)` : "자동 재시도 꺼짐",
+      opts.autoResolveConflict ? `자동 충돌 해소 켜짐(${opts.conflictAfterMin}분)` : "자동 충돌 해소 꺼짐",
     ].join(" · ");
     res.json({ ok: true, opts, message: msg });
   } catch (e) { fail(res, e); }

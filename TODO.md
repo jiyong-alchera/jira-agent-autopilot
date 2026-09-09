@@ -180,6 +180,22 @@
     검증: `npm test` 125건 통과(신규 5건).
 
 
+- [x] **16. base 충돌 해소·재푸시 버튼(연속 개발·Slack) + 자동 해소 대기 시간**
+  - 내용: 연속 개발 중 PR 이 base 충돌나면 진행이 멈추는데, 해소 버튼이 카드 상세에만 있어 연속 개발 패널에서는
+    손댈 수 없었다. ① 연속 개발 PR 목록과 ② Slack 알림에 **[충돌 해소·재푸시]** 버튼을 붙이고,
+    ③ **자동 해소 대기 시간** 설정을 추가해 사람 없이도 해소 → 재푸시 → 재리뷰로 흐름을 되살린다.
+  - AC: 충돌 PR 에 버튼이 뜨고(개별·일괄), Slack 에서도 같은 동작을 실행할 수 있으며,
+    자동 해소를 켜면 지정 시간 뒤 러너가 해소·재푸시·재리뷰까지 진행한다. 자동 병합은 충돌 PR 을 시도하지 않는다.
+  - 영향: `dashboard/lib.js`, `dashboard/server.js`, `dashboard/slack-socket.js`, `slack-notify.js`,
+    `run-epic-loop.js`, `dashboard/public/index.html`, `dashboard/test/{epic-loop,slack-actions}.test.js`
+  → (완료 2026-09-09) 신규 라우트 `POST /api/cards/:key/resolve-conflict` 로 세 진입점(카드 상세·연속 개발 패널·Slack)을 통일.
+    러너가 **병합 대기 중**이면 요청 파일(`.state/<EPIC>.epic.conflict.json`)로 넘겨 러너가 직접 처리하고(카드 락 충돌 방지),
+    멈춰 있으면 대시보드가 단건 실행 후 그 지점부터 자동 재개한다. 해소 뒤에는 CI 수정과 같은 규칙으로
+    기존 승인을 무효화(`CLAUDE-REVIEW-SUPERSEDED-BY-CONFLICT-FIX`)하고 리뷰 승인 루프를 다시 태운다.
+    자동 해소는 `await-merge` 폴링에서 **충돌을 처음 감지한 시점**부터 대기 시간(기본 15분, 기본 꺼짐)을 세고,
+    `mergeReadyState` 에 `conflicting` 을 추가해 자동 병합이 충돌 PR 을 시도하다 멈추던 것도 함께 막았다.
+    검증: `npm test` 133건 통과(신규 8건).
+
 ---
 
 *완료된 항목은 위 "완료 정의"에 따라 체크 표시 + 문서 동기화 후 마감합니다.*

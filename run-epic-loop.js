@@ -15,6 +15,8 @@
 //   approve      열린 봇 PR 전부에 승인 마커(CLAUDE-REVIEW-APPROVED)가 있는지 확인
 //   await-merge  사용자가 그 카드의 PR 을 모두 병합할 때까지 대기(카드가 완료되면 통과)
 //                자동 병합은 승인 + CI 초록일 때만 — 대기 중 base 가 움직여 깨진 회귀를 여기서 다시 막는다
+//                base 충돌이 나면 대기 시간 뒤 'rebase 해소 → 재푸시 → 승인 무효화 → 재리뷰' 를 대신 태운다
+//                (대시보드·Slack 버튼으로 즉시 요청할 수도 있다 — <EPIC>.epic.conflict.json)
 // 모든 태스크가 끝나면 에픽 완료.
 //
 // 어느 단계든 실패하면 상태를 'paused' 로 남기고 알림 후 종료한다. 대시보드의
@@ -25,6 +27,7 @@
 //   <EPIC>.epic.lock(+.pid/.phase)  실행 중 락(에픽당 1개)
 //   <EPIC>.epic.json                진행 상태(대시보드 폴링)
 //   <EPIC>.epic.stop                중지 요청 플래그
+//   <EPIC>.epic.conflict.json       충돌 즉시 해소 요청(대시보드·Slack 버튼 → 러너)
 //   <EPIC>.epic-design.md           에픽 설명(설계안) — 하위 태스크 프롬프트에 주입
 //
 // env: PROJECT_ID(필수), EPIC_REPOS(쉼표 구분 repo name), REVIEW_LOOP_MAX,
@@ -32,6 +35,7 @@
 //      EPIC_CI_WAIT_MAX_MIN(CI 완료 대기 한도 분, 기본 40),
 //      EPIC_MERGE_POLL(병합 대기 폴링 초, 기본 60), EPIC_RESUME_STEP·EPIC_RESUME_KEY(재개 지점),
 //      EPIC_AUTO_MERGE(1=승인 후 자동 병합)·EPIC_AUTO_MERGE_AFTER_MIN(대기 분, 기본 60),
+//      EPIC_AUTO_RESOLVE_CONFLICT(1=충돌 자동 해소)·EPIC_CONFLICT_AFTER_MIN(대기 분, 기본 15),
 //      EPIC_LABEL(상위 카드 표시 이름, 기본 "에픽" — 로그·Slack·Jira 코멘트 문구에만 쓰임),
 //      DASHBOARD_URL(병합 동기화 가속 + 자동 병합 경로) — 그 외는 하위 스크립트가 쓰는 값 그대로
 // --------------------------------------------------------------------------
@@ -75,15 +79,29 @@ const STATUS_FILE = path.join(STATE_DIR, `${EPIC_KEY}.epic.json`);
 const DESIGN_FILE = path.join(STATE_DIR, `${EPIC_KEY}.epic-design.md`);
 // 실행 중에도 대시보드가 바꿀 수 있는 옵션(자동 병합 on/off·대기 시간). 러너는 폴링할 때마다 다시 읽는다.
 const OPTS_FILE = path.join(STATE_DIR, `${EPIC_KEY}.epic.opts.json`);
+// 대시보드·Slack 버튼이 '지금 이 PR 충돌을 해소하라'고 남기는 요청 — 러너가 병합 대기 폴링에서 읽고 지운다.
+const CONFLICT_REQ_FILE = path.join(STATE_DIR, `${EPIC_KEY}.epic.conflict.json`);
 const DEFAULT_OPTS = {
   autoMerge: process.env.EPIC_AUTO_MERGE === "1",
   autoMergeAfterMin: lib.clampAutoMergeMin(process.env.EPIC_AUTO_MERGE_AFTER_MIN),
+  autoResolveConflict: process.env.EPIC_AUTO_RESOLVE_CONFLICT === "1",
+  conflictAfterMin: lib.clampConflictMin(process.env.EPIC_CONFLICT_AFTER_MIN),
 };
 function readOpts() {
   try {
     const o = JSON.parse(fs.readFileSync(OPTS_FILE, "utf8"));
-    return { autoMerge: !!o.autoMerge, autoMergeAfterMin: lib.clampAutoMergeMin(o.autoMergeAfterMin) };
+    return {
+      autoMerge: !!o.autoMerge, autoMergeAfterMin: lib.clampAutoMergeMin(o.autoMergeAfterMin),
+      autoResolveConflict: !!o.autoResolveConflict, conflictAfterMin: lib.clampConflictMin(o.conflictAfterMin),
+    };
   } catch { return DEFAULT_OPTS; }
+}
+// 요청은 한 번만 쓴다 — 읽는 즉시 지워 재기동/다음 폴링에서 같은 요청이 두 번 실행되지 않게 한다.
+function takeConflictRequest() {
+  let r = null;
+  try { r = JSON.parse(fs.readFileSync(CONFLICT_REQ_FILE, "utf8")); } catch { return null; }
+  try { fs.unlinkSync(CONFLICT_REQ_FILE); } catch {}
+  return r && r.owner && r.number != null ? { key: String(r.key || ""), owner: String(r.owner), number: String(r.number) } : null;
 }
 
 // 대상 repo — 시작 시 사용자가 고른 것. **비어 있으면 전체로 넓히지 않고 실패한다**:
@@ -194,7 +212,7 @@ let cleaned = false;
 function cleanup(keepStatus) {
   if (cleaned) return; cleaned = true;
   try { fs.rmSync(LOCK_DIR, { recursive: true, force: true }); } catch {}
-  for (const f of [`${LOCK_DIR}.phase`, `${LOCK_DIR}.pid`, STOP_FILE]) { try { fs.unlinkSync(f); } catch {} }
+  for (const f of [`${LOCK_DIR}.phase`, `${LOCK_DIR}.pid`, STOP_FILE, CONFLICT_REQ_FILE]) { try { fs.unlinkSync(f); } catch {} }
   if (!keepStatus) { try { fs.unlinkSync(STATUS_FILE); } catch {} }
 }
 // paused/done/stopped 는 상태 파일을 남긴다 — 대시보드가 사유를 보여주고 재개 버튼을 띄운다.
@@ -270,7 +288,7 @@ async function cardOpenPRs(key) {
   for (const r of epicRepos) {
     const or = ownerRepo(r.url);
     const list = await ghJsonStrict(["pr", "list", "--repo", or, "--search", key, "--state", "open",
-      "--json", "number,url,title,headRefName,headRefOid,isDraft,statusCheckRollup"]);
+      "--json", "number,url,title,headRefName,headRefOid,isDraft,statusCheckRollup,mergeable"]);
     for (const p of (list || [])) {
       if (p.isDraft) continue;
       // --search 는 PR 본문까지 훑어 형제 카드의 PR 까지 잡는다 → 브랜치/제목으로 이 카드 것만 남긴다.
@@ -279,6 +297,7 @@ async function cardOpenPRs(key) {
       const approved = (comments || []).some((b) => String(b).includes(APPROVED_MARKER));
       prs.push({
         owner: or, number: p.number, url: p.url, sha: p.headRefOid || "", approved,
+        mergeable: p.mergeable || "UNKNOWN",
         ci: lib.ciStateOf(p.statusCheckRollup), ciFailed: lib.failedChecks(p.statusCheckRollup),
       });
     }
@@ -370,7 +389,7 @@ const CI_WAIT_MAX_MS = Math.max(1, parseInt(process.env.EPIC_CI_WAIT_MAX_MIN || 
 const CI_SETTLE_MS = 20000;        // 푸시·재실행 직후 새 체크가 등록될 때까지의 여유
 const CI_NONE_GRACE_MS = 180000;   // '체크 없음'을 '아직 안 올라옴'으로 보는 구간(3분)
 const CI_PUSHED_MARK = "CI_FIX_PUSHED";   // run-jira-agent.sh 의 CI_PUSHED_MARK 와 같아야 함
-const SUPERSEDED_MARKER = "CLAUDE-REVIEW-SUPERSEDED-BY-CI-FIX";
+const SUPERSEDED_MARKER = lib.REVIEW_SUPERSEDED_CI;
 
 async function prCiState(or, number) {
   const p = await ghJsonStrict(["pr", "view", String(number), "--repo", or, "--json", "state,headRefOid,statusCheckRollup"]);
@@ -395,14 +414,14 @@ async function waitCi(or, number) {
 }
 // CI 수정 커밋이 올라오면 기존 리뷰 승인은 무효다. 승인 마커를 남의 코멘트를 지우지 않고 무력화한다
 // (봇이 쓴 자기 코멘트만 편집 — 마커 문자열을 바꾸고 무효 사유를 덧붙인다).
-async function supersedeApproval(or, number) {
+async function supersedeApproval(or, number, marker, why) {
   const comments = await ghJsonStrict(["api", `repos/${or}/issues/${number}/comments?per_page=100`, "--jq", "[.[] | {id, body}]"]);
   const file = path.join(STATE_DIR, `${EPIC_KEY}.ci-supersede.md`);
   let n = 0;
   for (const c of (comments || [])) {
     const body = String((c && c.body) || "");
     if (!body.includes(APPROVED_MARKER)) continue;
-    fs.writeFileSync(file, `${body.split(APPROVED_MARKER).join(SUPERSEDED_MARKER)}\n\n> ⚠️ CI 수정 커밋이 올라와 이 승인은 무효화됐습니다(${nowIso()}). 재리뷰가 진행됩니다.\n`);
+    fs.writeFileSync(file, lib.supersededBody(body, marker || SUPERSEDED_MARKER, why || "CI 수정 커밋이 올라와", nowIso()));
     await ghJsonStrict(["api", "-X", "PATCH", `repos/${or}/issues/comments/${c.id}`, "-F", `body=@${file}`]);
     n += 1;
   }
@@ -448,7 +467,7 @@ async function ciFixLoop(task, pr, max) {
     log(`${task.key} ${tag} CI 초록 · CI 수정 커밋 재리뷰 (${i}/${max} 회차)`);
     await slack(`🔁 [${EPIC_KEY}] ${task.key} — CI 수정 커밋에 대해 재리뷰합니다 · ${tag}`);
     try {
-      const n = await supersedeApproval(pr.owner, pr.number);
+      const n = await supersedeApproval(pr.owner, pr.number, lib.REVIEW_SUPERSEDED_CI, "CI 수정 커밋이 올라와");
       if (n) log(`${task.key} ${tag} 기존 리뷰 승인 ${n}건 무효화`);
     } catch (e) { return { ok: false, reason: `${tag} 기존 승인 무효화 실패: ${e.message}` }; }
     const re = await taskEnv(task.key);
@@ -477,15 +496,50 @@ async function stepCi(task) {
   return { ok: true, note: notes.join(" · ") };
 }
 
+// ----- base 충돌 해소 -----
+// base 가 움직여 충돌난 PR 은 병합도 리뷰도 더 나아가지 못한다. 'rebase 해소 → 검증 → force-push' 로
+// 되살린 뒤, 그 해소 커밋을 다시 리뷰까지 태운다 — CI 수정과 같은 이유다: 아무도 안 본 코드가 병합되면 안 된다.
+async function resolveConflictAndReview(task, pr, why) {
+  const tag = `${pr.owner}#${pr.number}`;
+  log(`${task.key} ${tag} base 충돌 해소·재푸시 시작 (${why})`);
+  await slack(`⚠️ [${EPIC_KEY}] ${task.key} — base 충돌 해소·재푸시 시작 · ${tag} (${why})`);
+  const e = await taskEnv(task.key);
+  e.RESOLVE_CONFLICT = "1";
+  e.REWORK_ONLY_OWNER = pr.owner;
+  e.REWORK_ONLY_NUM = String(pr.number);
+  // 재리뷰는 아래에서 직접 태운다 — 하위 스크립트가 또 띄우면 카드 락에 막혀 중첩 실행이 된다.
+  e.REVIEW_LOOP_AFTER = ""; e.REVIEW_AFTER = ""; e.REVIEW_FIRST = ""; e.IN_REVIEW_LOOP = "1";
+  const { code, out } = await runScript("run-jira-agent.sh", [task.key, "build"], e);
+  if (stopRequested()) return { ok: false, stop: true };
+  if (code !== 0) {
+    return { ok: false, reason: `${tag} base 충돌 해소 실패 (exit ${code}). PR 을 직접 해소한 뒤 [이어서 진행] 하세요.`, lastError: tailOf(out) };
+  }
+  // 해소 커밋은 리뷰를 안 거친 코드다 → 기존 승인을 무효화하고 리뷰 루프를 다시 태운다.
+  try {
+    const n = await supersedeApproval(pr.owner, pr.number, lib.REVIEW_SUPERSEDED_CONFLICT, "base 충돌을 rebase 로 해소해 코드가 바뀌어");
+    if (n) log(`${task.key} ${tag} 기존 리뷰 승인 ${n}건 무효화`);
+  } catch (err) { return { ok: false, reason: `${tag} 기존 승인 무효화 실패: ${err.message}` }; }
+  const re = await taskEnv(task.key);
+  re.REVIEW_FIRST = "1";   // 방금 해소한 코드라 반영할 리뷰 의견이 아직 없다 → 리뷰부터
+  re.REVIEW_LOOP_MAX = String(lib.clampReviewLoopMax(process.env.REVIEW_LOOP_MAX, cfg));
+  const rl = await runScript("run-review-loop.sh", [task.key, pr.owner, String(pr.number)], re);
+  if (stopRequested()) return { ok: false, stop: true };
+  if (rl.code !== 0) return { ok: false, reason: `${tag} 충돌 해소분 재리뷰 실패 (exit ${rl.code})` };
+  await slack(`✅ [${EPIC_KEY}] ${task.key} — 충돌 해소·재푸시·재리뷰 완료 · ${tag}`);
+  return { ok: true, note: `${tag} 충돌 해소·재리뷰 완료` };
+}
+
 // 사용자가 PR 을 모두 병합할 때까지 대기. 대시보드가 있으면 병합 동기화를 앞당겨 호출한다.
 // 자동 병합이 켜져 있으면, 대기 시간이 지나고 열린 PR 이 '모두 리뷰 승인' 된 경우 대신 병합한다.
 async function stepAwaitMerge(task) {
   const waitStartedAt = STATE.stepStartedAt || nowIso();
   const o0 = readOpts();
   await slack(`⏳ [${EPIC_KEY}] ${task.key} PR 병합 대기 중 — 병합하면 다음 태스크로 넘어갑니다.`
-    + (o0.autoMerge ? ` (승인 상태로 ${o0.autoMergeAfterMin}분 경과 시 자동 병합)` : ""),
+    + (o0.autoMerge ? ` (승인 상태로 ${o0.autoMergeAfterMin}분 경과 시 자동 병합)` : "")
+    + (o0.autoResolveConflict ? ` (base 충돌 시 ${o0.conflictAfterMin}분 뒤 자동 해소·재푸시)` : ""),
     [{ id: "merge", project: project.id, key: task.key }, ...epicBtn("epic-stop")]);
   let autoMergeTried = false, readyNotified = false;
+  let conflictSince = null, conflictNotified = false;   // 충돌을 처음 본 시각(대기 시간의 기준) · 알림 1회 제한
   for (;;) {
     if (stopRequested()) return { ok: false, stop: true };
     const dash = process.env.DASHBOARD_URL;
@@ -499,14 +553,57 @@ async function stepAwaitMerge(task) {
     // 자동 병합 판정 — 옵션은 매 회 다시 읽어 실행 중 on/off 가 바로 반영되게 한다.
     const opts = readOpts();
     let openPRs = [], prsErr = "";
-    // 자동 병합이 꺼져 있어도 '병합만 남음' 을 한 번은 알려야 하므로 그때까지는 PR 을 본다.
-    const needPRs = opts.autoMerge || !readyNotified;
-    if (needPRs) { try { openPRs = await cardOpenPRs(task.key); } catch (e) { prsErr = e.message; } }
+    // 매 회 PR 을 본다 — 자동 병합이 꺼져 있어도 '병합만 남음'·'base 충돌' 은 알려야 한다.
+    try { openPRs = await cardOpenPRs(task.key); } catch (e) { prsErr = e.message; }
+
+    // ----- base 충돌 -----
+    // 충돌이 사라지면(사람이 직접 해소·병합) 기준 시각을 버려, 다시 충돌났을 때 대기 시간을 처음부터 센다.
+    const conflicts = prsErr ? [] : lib.conflictingPRs(openPRs);
+    if (!prsErr) {
+      if (!conflicts.length) { conflictSince = null; conflictNotified = false; }
+      else if (!conflictSince) { conflictSince = nowIso(); conflictNotified = false; }
+    }
+    if (conflicts.length && !conflictNotified) {
+      conflictNotified = true;
+      const c0 = conflicts[0];
+      const tags = conflicts.map((p) => `${p.owner}#${p.number}`).join(", ");
+      log(`${task.key} base 충돌 감지 (${tags})`);
+      await slack(`⚠️ [${EPIC_KEY}] ${task.key} — base 충돌로 병합할 수 없습니다 (${tags}).`
+        + (opts.autoResolveConflict ? ` ${opts.conflictAfterMin}분 뒤 자동으로 해소·재푸시합니다.` : " 아래 버튼으로 해소·재푸시할 수 있습니다."),
+        [{ id: "resolve-conflict", project: project.id, key: task.key, owner: c0.owner, number: String(c0.number), epic: EPIC_KEY },
+         { url: c0.url, label: "🔗 PR 열기" }, ...epicBtn("epic-stop")]);
+    }
+    // 대시보드·Slack 버튼이 남긴 즉시 해소 요청(대기 시간을 건너뛴다)
+    const reqd = takeConflictRequest();
+    if (reqd && reqd.key && reqd.key !== task.key) log(`충돌 해소 요청이 현재 태스크(${task.key})의 것이 아니라 무시합니다: ${reqd.key} ${reqd.owner}#${reqd.number}`);
+    let manual = reqd && (!reqd.key || reqd.key === task.key) ? [{ owner: reqd.owner, number: reqd.number, url: "" }] : [];
+    // 요청이 왔지만 이미 충돌이 없으면 돌리지 않는다 — 해소할 게 없으면 하위 스크립트가 비정상 종료해
+    // 멀쩡한 실행이 '중단' 으로 떨어진다(버튼을 한 번 더 눌렀을 때 벌어지던 일).
+    if (manual.length && !prsErr) {
+      const t = manual[0];
+      const known = openPRs.find((p) => p.owner === t.owner && String(p.number) === String(t.number));
+      if (known && !lib.isConflicting(known)) {
+        log(`${task.key} ${t.owner}#${t.number} 충돌 해소 요청 — 이미 충돌 없음(${known.mergeable}) → 건너뜀`);
+        await slack(`ℹ️ [${EPIC_KEY}] ${task.key} — ${t.owner}#${t.number} 는 이미 충돌이 없어 해소를 건너뜁니다.`);
+        manual = [];
+      }
+    }
+    const cd = prsErr ? { resolve: false, reason: "pr-lookup-failed" } : lib.shouldAutoResolveConflict(opts, conflictSince, Date.now());
+    const targets = manual.length ? manual : (cd.resolve ? conflicts : []);
+    if (targets.length) {
+      for (const pr of targets) {
+        const r = await resolveConflictAndReview(task, pr, manual.length ? "요청" : `충돌 ${opts.conflictAfterMin}분 경과`);
+        if (!r.ok) return r;                    // 해소 실패는 사람이 봐야 한다 → 중단(사유와 함께)
+      }
+      conflictSince = null; conflictNotified = false;
+      readyNotified = false;                    // 재리뷰를 거쳤으니 '병합만 남음' 알림을 다시 보낼 수 있게
+      continue;                                 // 곧바로 다시 판정(해소 결과 반영)
+    }
 
     // 승인 + CI 통과가 되는 순간 병합 버튼을 1회 보낸다. 리뷰 루프의 승인 알림은 승인 시점에
     // 딱 한 번 나가는데 그때는 CI 가 아직 도는 경우가 많아, 그 버튼이 CI 게이트에 막히고
     // 이후 CI 가 초록이 돼도 아무도 알려주지 않던 빈틈을 메운다.
-    if (needPRs && !prsErr && !readyNotified && lib.isMergeReady(openPRs)) {
+    if (!prsErr && !readyNotified && lib.isMergeReady(openPRs)) {
       readyNotified = true;
       const btns = [{ id: "merge", project: project.id, key: task.key }];
       if (openPRs.length === 1) btns.push({ url: openPRs[0].url, label: "🔗 PR 열기" });
@@ -522,6 +619,10 @@ async function stepAwaitMerge(task) {
       waitStartedAt, autoMerge: opts.autoMerge, autoMergeAfterMin: opts.autoMergeAfterMin,
       autoMergeAt: d.dueMs ? new Date(d.dueMs).toISOString().replace(/\.\d{3}Z$/, "Z") : null,
       autoMergeState: d.reason,
+      autoResolveConflict: opts.autoResolveConflict, conflictAfterMin: opts.conflictAfterMin,
+      conflictSince, conflictState: cd.reason,
+      conflictAt: cd.dueMs ? new Date(cd.dueMs).toISOString().replace(/\.\d{3}Z$/, "Z") : null,
+      conflictPRs: conflicts.map((p) => `${p.owner}#${p.number}`),
       current: { ...STATE.current, waitingSince: waitStartedAt },
     });
     if (d.merge && !autoMergeTried) {

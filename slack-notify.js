@@ -6,10 +6,11 @@
 //   액션 형식
 //     merge:<OWNER/REPO>:<PR번호>     PR 병합
 //     review-loop:<OWNER/REPO>:<PR번호>  리뷰 승인 루프 시작
+//     resolve-conflict:<OWNER/REPO>:<PR번호>  base 충돌 rebase 해소 + 재푸시 + 재리뷰
 //     card-run:<phase>                카드 재실행 (plan|build|review)
 //     epic-resume | epic-skip | epic-stop
 //     url:<라벨>:<주소>               링크 버튼(인터랙션 없음)
-//   env: SLACK_WEBHOOK_URL(필수), PROJECT_ID, ISSUE_KEY
+//   env: SLACK_WEBHOOK_URL(필수), PROJECT_ID, ISSUE_KEY, EPIC_KEY(있으면 버튼이 연속 개발까지 재개)
 //
 // 버튼이 없거나 전송에 실패해도 절대 실패로 끝내지 않는다 — 알림은 부수 효과일 뿐이다.
 
@@ -22,7 +23,8 @@ function parseAction(spec, ctx) {
   if (id === "url") return { url: parts.slice(2).join(":"), label: parts[1] || "열기" };
   if (!Object.prototype.hasOwnProperty.call(lib.SLACK_ACTIONS, id)) return null;
   const a = { id, project: ctx.project, key: ctx.key };
-  if (id === "merge" || id === "review-loop") { a.owner = parts[1] || ""; a.number = parts[2] || ""; }
+  if (id === "merge" || id === "review-loop" || id === "resolve-conflict") { a.owner = parts[1] || ""; a.number = parts[2] || ""; }
+  if (ctx.epic) a.epic = ctx.epic;   // 에픽 실행 중이면 버튼이 그 연속 개발까지 재개할 수 있게 함께 실어 보낸다
   if (id === "card-run") a.step = parts[1] || "build";
   return a;
 }
@@ -31,7 +33,7 @@ async function main() {
   const url = process.env.SLACK_WEBHOOK_URL || "";
   const [text, ...specs] = process.argv.slice(2);
   if (!url || !text) return;
-  const ctx = { project: process.env.PROJECT_ID || "", key: process.env.ISSUE_KEY || "" };
+  const ctx = { project: process.env.PROJECT_ID || "", key: process.env.ISSUE_KEY || "", epic: process.env.EPIC_KEY || "" };
   const actions = specs.map((s) => parseAction(s, ctx)).filter(Boolean);
   // 이슈 키가 없으면 실행 버튼은 무의미하므로 링크만 남긴다.
   const usable = ctx.key ? actions : actions.filter((a) => a.url);

@@ -49,6 +49,9 @@ function resultLine(actId, r) {
     case "epic-resume": return `▶️ 이어서 진행${r.resumedAt ? ` — ${r.resumedAt} 부터` : ""}`;
     case "epic-skip":   return `⏭ 건너뛰고 진행${r.resumedAt ? ` — ${r.resumedAt} 부터` : ""}`;
     case "epic-stop":   return "⏹ 중지 요청됨";
+    case "resolve-conflict":
+      return r.queued ? `⚠️ 충돌 해소 요청 접수 — 연속 개발 러너가 병합 대기 중에 처리합니다`
+        : `⚠️ 충돌 해소·재푸시 시작${r.pid ? ` (pid ${r.pid})` : ""}${r.resumeEpic ? " · 완료 후 연속 개발 재개" : ""}`;
     default:            return "✅ 완료";
   }
 }

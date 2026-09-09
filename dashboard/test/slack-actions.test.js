@@ -20,8 +20,27 @@ test("버튼은 action_id 접두사와 value 를 갖는다", () => {
   assert.strictEqual(el.action_id, "jaa:merge");
   assert.strictEqual(el.style, "primary");
   assert.deepStrictEqual(lib.decodeSlackAction(el.value), {
-    id: "merge", project: "ekyb", key: "EKYB-1", owner: "Org/repo", number: "7", step: "",
+    id: "merge", project: "ekyb", key: "EKYB-1", owner: "Org/repo", number: "7", step: "", epic: "",
   });
+});
+
+test("충돌 해소 버튼은 대상 PR·에픽 키를 싣고 해소 라우트를 부른다", () => {
+  const a = act({ id: "resolve-conflict", epic: "EKYB-800" });
+  const el = lib.slackMessage("충돌", [a]).blocks[1].elements[0];
+  assert.strictEqual(el.action_id, "jaa:resolve-conflict");
+  assert.strictEqual(el.style, "danger");
+  const d = lib.decodeSlackAction(el.value);
+  assert.strictEqual(d.epic, "EKYB-800");
+  const def = lib.SLACK_ACTIONS[d.id];
+  assert.strictEqual(def.api(d), "/api/cards/EKYB-1/resolve-conflict");
+  assert.deepStrictEqual(def.body(d), { owner: "Org/repo", number: "7", epic: "EKYB-800" });
+});
+
+test("에픽 키가 이슈 키 형식이 아니면 버튼 전체를 버리지 않고 그 값만 버린다", () => {
+  const el = lib.slackMessage("충돌", [act({ id: "resolve-conflict", epic: "../etc" })]).blocks[1].elements[0];
+  const d = lib.decodeSlackAction(el.value);
+  assert.strictEqual(d.id, "resolve-conflict");
+  assert.strictEqual(d.epic, "");
 });
 
 test("링크 버튼은 url 만 갖고 인터랙션 대상이 아니다", () => {
