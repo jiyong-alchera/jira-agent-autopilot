@@ -21,7 +21,8 @@
 # 하위 스크립트의 Slack 알림은 끄고(SLACK_WEBHOOK_URL 비움) 이 스크립트가 회차를 명시해 보낸다.
 #
 # env: PROJECT_ID, CARD_REPOS, GH_TOKEN, CLONE_BASE, HISTORY_FILE, SLACK_WEBHOOK_URL,
-#      REVIEW_LOOP_MAX(기본 5), REVIEW_FIRST(1이면 1회차 반영 생략)
+#      REVIEW_LOOP_MAX(기본 5), REVIEW_FIRST(1이면 1회차 반영 생략),
+#      REVIEW_APPROVE_CI_WAIT_MIN(승인 알림 전 CI 확정 대기 분, 기본 40 · lib-notify.sh)
 #      — 그 외는 하위 스크립트가 쓰는 값 그대로 상속
 # --------------------------------------------------------------------------
 set -uo pipefail
@@ -60,6 +61,9 @@ notify_slack_btn() {
   ISSUE_KEY="${ISSUE_KEY:-}" PROJECT_ID="${PROJECT_ID:-}" \
     node "${SELF_DIR}/slack-notify.js" "$@" >/dev/null 2>&1 || true
 }
+# 리뷰 승인 알림의 CI 게이트(notify_review_approved) — notify_slack_btn 을 위에서 정의한 뒤 source 한다.
+source "${SELF_DIR}/lib-notify.sh"
+
 record_history() {  # result
   local ts; ts="$(date -u +%FT%TZ)"
   mkdir -p "$(dirname "${HISTORY_FILE}")"
@@ -201,7 +205,9 @@ while (( ITER < REVIEW_LOOP_MAX )); do
   # 3) 판정 — 승인 마커는 GitHub 에서 재확인(신뢰 가능한 판정)
   if is_approved; then
     echo ">> [${ISSUE_KEY}] ${OR}#${PR_NUM} ${ITER}회차에서 리뷰 승인 → 루프 종료"
-    notify_slack_btn "✅ [${ISSUE_KEY}] 리뷰 승인 완료 (루프 ${ITER}/${REVIEW_LOOP_MAX}회차) · ${OR}#${PR_NUM}" "merge:${OR}:${PR_NUM}" "url:🔗 PR 열기:${PR_URL}"
+    # 승인 알림은 'CI 확정 후' 에만 — 승인 시점엔 CI 가 대개 아직 돌고 있고, 그때 보낸
+    # [병합] 버튼은 CI 게이트에 막혀 눌러도 병합되지 않는다(헛클릭 + 중복 알림).
+    notify_review_approved "${OR}" "${PR_NUM}" "${PR_URL}" "[${ISSUE_KEY}] 리뷰 승인 완료 (루프 ${ITER}/${REVIEW_LOOP_MAX}회차) · ${OR}#${PR_NUM}"
     record_history "approved"
     FINAL="approved"; break
   fi

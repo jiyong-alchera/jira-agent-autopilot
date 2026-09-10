@@ -17,7 +17,9 @@
 # MAX_AUTO_REWORK 회를 넘겨도 미승인이면 자동 반영/리뷰를 멈추고 사람 확인을 요청한다.
 #
 # env: PROJECT_ID, CARD_REPOS(name\x1furl\x1f...), GH_TOKEN, JIRA_SITE, ASSIGNEE_NAME,
-#      CLONE_BASE, HISTORY_FILE, PROJECT_KEY, MAX_AUTO_REWORK(기본 3) (+ Atlassian MCP 인증은 claude 쪽)
+#      CLONE_BASE, HISTORY_FILE, PROJECT_KEY, MAX_AUTO_REWORK(기본 3),
+#      REVIEW_APPROVE_CI_WAIT_MIN(승인 알림 전 CI 확정 대기 분, 기본 40 · lib-notify.sh)
+#      (+ Atlassian MCP 인증은 claude 쪽)
 # --------------------------------------------------------------------------
 set -euo pipefail
 
@@ -69,6 +71,8 @@ notify_slack_btn() {
   ISSUE_KEY="${ISSUE_KEY:-}" PROJECT_ID="${PROJECT_ID:-}" \
     node "${SELF_DIR}/slack-notify.js" "$@" >/dev/null 2>&1 || true
 }
+# 리뷰 승인 알림의 CI 게이트(notify_review_approved) — notify_slack_btn 정의 뒤에 source 한다.
+source "${SELF_DIR}/lib-notify.sh"
 
 # 동시 실행 방지 락(빌드 락과 별개 — review 전용)
 STATE_DIR="${CLONE_BASE}/.state"; mkdir -p "${STATE_DIR}"
@@ -267,7 +271,8 @@ ${LAST_BODY}
     if printf '%s' "${BODIES2}" | grep -q "${APPROVED_MARKER}"; then
       echo ">> [${ISSUE_KEY}] ${OR}#${N} 리뷰 승인(마커 작성)"
       record_history "approved" "${PR_URL}"
-      notify_slack_btn "✅ [${ISSUE_KEY}] PR 리뷰 승인 · ${OR}#${N}" "merge:${OR}:${N}" "url:🔗 PR 열기:${PR_URL}"
+      # 승인 알림은 'CI 확정 후' 에만(lib-notify.sh) — pending 상태에서 보낸 [병합] 버튼은 막힌다.
+      notify_review_approved "${OR}" "${N}" "${PR_URL}" "[${ISSUE_KEY}] PR 리뷰 승인 · ${OR}#${N}"
     else
       echo ">> [${ISSUE_KEY}] ${OR}#${N} 리뷰 코멘트(미승인 — 다음 주기 재리뷰)"
       record_history "reviewed" "${PR_URL}"

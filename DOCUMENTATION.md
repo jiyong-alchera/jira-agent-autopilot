@@ -263,7 +263,7 @@ Jira 카드를 자동으로 탐지해 **Claude가 개발 → PR 생성 → 카�
 - **리뷰 수행**: Claude 에게 **PR diff(코드) · PR 본문(정리 사항) · 기존 리뷰/코멘트(사람이 새로 남긴 것 포함) · 연동 Jira 티켓**(요구사항/수용조건)을 읽혀 코드 리뷰. 결과에 따라 **한 가지만**:
   - 문제 있음 → 구체적 지적을 PR 코멘트로 남김(승인 마커 없음 → 다음 주기 재리뷰).
   - 문제 없음 → **고유 승인 마커 코멘트**를 남김. 자기 자신의 PR 은 GitHub formal approve 가 불가하므로 `gh pr review --approve` 대신 마커 코멘트로 "리뷰 완료(승인)"를 표시한다.
-- 코드/커밋/머지/상태·라벨은 **건드리지 않음**(리뷰 코멘트만). 결과는 이력에 `review/approved` 또는 `review/reviewed` 로 기록하고, **Slack 알림**(`SLACK_WEBHOOK_URL` 설정 시)도 보낸다 — 승인 `✅ PR 리뷰 승인`, 미승인 `📝 PR 리뷰 코멘트(수정 필요)`(각 repo#번호·PR URL 포함).
+- 코드/커밋/머지/상태·라벨은 **건드리지 않음**(리뷰 코멘트만). 결과는 이력에 `review/approved` 또는 `review/reviewed` 로 기록하고, **Slack 알림**(`SLACK_WEBHOOK_URL` 설정 시)도 보낸다 — 승인 `✅ PR 리뷰 승인`, 미승인 `📝 PR 리뷰 코멘트(수정 필요)`(각 repo#번호·PR URL 포함). 승인 알림은 **CI 가 확정된 뒤에만** 나간다([4.3f](#43f-리뷰-승인-알림의-ci-게이트-lib-notifysh)).
 
 #### 4.3c run-review-loop.sh (승인까지 반복 루프 — 대시보드 '승인까지 루프')
 
@@ -285,7 +285,7 @@ Jira 카드를 자동으로 탐지해 **Claude가 개발 → PR 생성 → 카�
 - **중단 조건**: PR 이 OPEN 이 아님(병합·닫힘), 반영 실패(exit≠0), 다른 작업이 **카드 락**을 쥐고 있어 반영이 스킵됨(`SKIP: [KEY] 이미 처리 중(lock)`), 카드가 **질문 답변 대기**(`SKIP: awaiting answers`), **무변경 반영 2회 연속** — 모두 Slack 알림 후 루프를 멈춘다. 스킵 판정은 위 문구를 **정확히 매칭**한다(하위가 찍는 다른 `SKIP:` 줄에 오인 중단되지 않도록).
 - **무변경 반영(`NO_REWORK_NEEDED`)**: 반영할 새 피드백이 없어 rework 가 아무것도 고치지 않은 회차는 **실패가 아니다**. 직전 회차의 반영이 아직 재리뷰되지 않은 상태일 수 있으므로 그대로 **재리뷰로 넘겨 판정**한다. 단 **2회 연속** 무변경이면 더 진전될 게 없으므로 `⏸ 사람 확인 필요` 로 종료한다.
 - **연쇄 플래그 차단**: 회차마다 띄우는 하위 실행에는 `REVIEW_LOOP_AFTER`/`REVIEW_AFTER`/`REVIEW_FIRST` 를 **빈 값으로 덮고 `IN_REVIEW_LOOP=1`** 을 준다. 대시보드가 최상위 build 프로세스 env 에 넣은 `REVIEW_LOOP_AFTER=1` 은 자손 프로세스에 그대로 상속되므로, 끊지 않으면 rework 가 끝난 뒤 이 루프를 **또** 띄운다(→ 중첩 실행이 루프 락에 막혀 `SKIP` 을 찍고, 성공한 반영이 '카드 처리 중'으로 오인돼 2회차에서 루프가 죽는다). `run-jira-agent.sh` 쪽에도 대칭 가드가 있다(4.1).
-- **Slack 알림**(모두 회차 표기): 시작 `🔁 … 루프 시작 (최대 N회)`, **미승인 `📝 … 리뷰 루프 i/N회차 — 수정 필요(미승인)`**, 승인 `✅ … 리뷰 승인 완료 (루프 i/N회차)`, 상한 `⏸`, 중지 `⏹`, 반영 실패 `❌`. 하위 스크립트의 Slack 알림은 **끄고**(`SLACK_WEBHOOK_URL=""` 주입) 루프가 대표해서 보내 중복을 막는다.
+- **Slack 알림**(모두 회차 표기): 시작 `🔁 … 루프 시작 (최대 N회)`, **미승인 `📝 … 리뷰 루프 i/N회차 — 수정 필요(미승인)`**, 승인 `✅ … 리뷰 승인 완료 (루프 i/N회차) · CI 통과`, 상한 `⏸`, 중지 `⏹`, 반영 실패 `❌`. 하위 스크립트의 Slack 알림은 **끄고**(`SLACK_WEBHOOK_URL=""` 주입) 루프가 대표해서 보내 중복을 막는다. **승인 알림만은 CI 가 확정된 뒤에 나간다**([4.3f](#43f-리뷰-승인-알림의-ci-게이트-lib-notifysh)).
 - **진행 상태**: 회차·단계를 `.state/<KEY>.reviewloop.json`(`{iter,max,step,owner,number,…}`)에 기록 → 대시보드가 5초마다 폴링해 버튼 옆에 `🔁 승인 루프 2/5회차 · 리뷰 중` 으로 표시한다. 이력은 회차마다 `review-loop/reviewed`, 종료 시 `approved`/`stopped`/`failed`.
 - 루프 진행 로그는 `loop-review.log`, 엔진 상세 로그는 기존대로 `agent-logs/<KEY>-build.log`·`<KEY>-review.log`(대시보드 '엔진 실행 로그'에서 실시간 확인).
 - **토큰**: 2회차부터 리뷰는 [증분 재리뷰](#43b-run-reviewsh-pr-자동-리뷰), 반영(rework)은 [미반영 피드백만 읽기](#41-run-jira-agentsh-카드-1개-처리)가 적용돼 회차가 쌓여도 입력이 누적되지 않는다.
@@ -450,6 +450,34 @@ Jira 카드를 자동으로 탐지해 **Claude가 개발 → PR 생성 → 카�
   던진다. 조용히 빈 배열을 주면 **미승인 PR 이 승인된 것처럼, CI 실패가 없는 것처럼** 보인다.
   `await-merge` 폴링도 조회가 실패한 회차는 아예 판정하지 않고(`pr-lookup-failed`) 다음 폴링에서 다시 본다.
 
+#### 4.3f 리뷰 승인 알림의 CI 게이트 (lib-notify.sh)
+
+**문제**: 승인 알림은 승인 마커만 보고 `[병합]` 버튼을 붙여 보냈는데, **승인 시점엔 CI 가 대개 아직 돌고 있다.**
+그 버튼을 누르면 병합 라우트의 CI 게이트(`ci-pending`)에 막혀 아무 일도 일어나지 않고,
+CI 가 끝난 뒤 에픽 러너의 '병합만 남음' 알림이 또 와서 그때야 눌렸다 — **헛클릭 + 중복 알림**.
+
+**해결**: 승인 알림은 `lib-notify.sh` 의 `notify_review_approved` 를 거친다(`run-review.sh` · `run-review-loop.sh` 공용).
+
+| CI 상태 | 알림 |
+|---------|------|
+| `pass` · `none`(체크 없는 repo) | `✅ … 리뷰 승인 완료 · CI 통과` + **`[병합]`·`[PR 열기]`** (종전과 동일) |
+| `fail` | `🧪 … 리뷰는 승인됐지만 CI 실패로 병합할 수 없습니다 (실패: <체크명>)` + `[PR 열기]` — **병합 버튼 없음** |
+| `pending`(도는 중) · `none`(방금 푸시) | **보내지 않는다.** 백그라운드에서 CI 확정까지 기다린 뒤 위 규칙으로 1회 발송 |
+| 대기 시간 초과 · `unknown` | `⏳ … CI 가 아직 확정되지 않았습니다` + `[PR 열기]` — 병합 버튼 없음 |
+| PR 이 닫힘 | 보내지 않는다 |
+
+- **판정은 대시보드 병합 게이트와 같은 함수**를 쓴다: `ci-state.js`(CLI) → `dashboard/lib.js` 의 `ciStateOf`/`failedChecks`.
+  기준이 어긋나면 '초록이라 보낸 버튼이 막히는' 같은 부류의 버그가 되살아난다.
+- **'체크 0건'은 기다린다**: `none` 은 'CI 없는 repo' 와 '방금 푸시해 아직 등록 전' 이 구분되지 않는다.
+  후자에서 버튼을 보내면 몇 초 뒤 체크가 `pending` 으로 올라와 같은 문제가 재현되므로 **유예 구간(3분)** 을 기다린 뒤 판정한다
+  (`run-epic-loop.js` 의 `CI_NONE_GRACE_MS` 와 같은 근거).
+- **본류를 붙잡지 않는다**: 즉시 판정이 `pending`/`none` 이면 대기는 **백그라운드 서브셸**로 넘기고 스크립트는 바로 끝난다.
+  그 서브셸의 stdio 는 `/dev/null` 로 끊는다 — 부모의 stdout 파이프를 물고 있으면 호출자(`run-cycle.js`·에픽 러너)가
+  '스크립트가 안 끝난다'로 읽는다(파이프가 닫히지 않아 `close` 이벤트가 늦는다).
+- **연속 개발 중(`EPIC_KEY` 설정)에는 보내지 않는다.** 에픽 러너가 병합 대기에서 '승인 + CI 통과'를 **한 번만** 알리므로
+  (4.3d의 '병합만 남음' 알림) 여기서 또 보내면 중복이고, CI 대기로 러너를 붙잡을 이유도 없다.
+- 상한을 넘긴 루프의 `⏸ 사람 확인 필요` 알림은 종전대로 병합 버튼을 유지한다 — 사람이 PR 을 직접 보고 판단하는 자리다.
+
 ### 4.4 대시보드 백엔드 (dashboard/server.js, Express)
 
 기본 포트 `4317`. 주요 API:
@@ -600,6 +628,8 @@ Jira 카드를 자동으로 탐지해 **Claude가 개발 → PR 생성 → 카�
 | 전체 리뷰 강제 | `REVIEW_FULL` | (없음) | `1` 이면 증분 재리뷰를 끄고 **항상 전체 diff·전체 코멘트**를 읽는다(run-review.sh). 기본은 직전 리뷰 이후만 읽는 증분 모드 |
 | 승인까지 루프 상한 | `REVIEW_LOOP_MAX` (설정 `reviewLoopMax`) | `5` | 대시보드 '🔁 승인까지 루프'(run-review-loop.sh)의 최대 반복 회차. 초과 시 사람 확인 요청 후 종료(요청 body `max` 로 1~20 범위 재정의 가능). build 후 자동 연결(`REVIEW_LOOP_AFTER`)에도 같은 값이 쓰인다 |
 | build 후 승인 루프 연속 | `REVIEW_LOOP_AFTER` | (없음) | `1` 이면 build 성공 후 생성된 PR 마다 승인까지 리뷰 루프를 이어서 실행(run-jira-agent.sh). 대시보드 build 그룹의 **`🔁 승인까지`** 체크박스가 주입하며, 락을 놓은 뒤 순차 실행한다 |
+| 승인 알림 CI 대기(분) | `REVIEW_APPROVE_CI_WAIT_MIN` | `40` | 리뷰 승인 알림을 보내기 전에 CI 가 확정될 때까지 기다릴 최대 시간([4.3f](#43f-리뷰-승인-알림의-ci-게이트-lib-notifysh)). `0` 이면 기다리지 않고 그 순간 상태로 판정한다(미확정이면 병합 버튼 없이 알림) |
+| 승인 알림 CI 폴링(초) | `REVIEW_APPROVE_CI_POLL_SEC` | `30` | 위 대기의 폴링 간격 |
 | 루프 1회차 리뷰부터 | `REVIEW_FIRST` | (없음) | `1` 이면 승인 루프 1회차의 반영을 건너뛰고 리뷰부터 시작(run-review-loop.sh). 반영할 의견이 없는 **새 PR** 용으로, `REVIEW_LOOP_AFTER` 경로에서 자동 주입된다 |
 | 에픽 대상 repo | `EPIC_REPOS` | **(필수)** | 에픽 연속 개발에서 작업할 repo 이름(쉼표 구분). 대시보드 '에픽 연속 개발' 패널의 repo 체크박스가 주입하며, 각 하위 카드에 `repo_<name>` 라벨로 부여된다. **비어 있으면 전체로 넓히지 않고 종료**한다(예전엔 '전체'로 해석했으나, 상태 파일이 낡아 비었을 때 재개가 조용히 전 repo 로 번지는 사고가 있었다) |
 | 에픽 키 | `EPIC_KEY` | (없음) | 상위 에픽 키. `run-jira-agent.sh` 가 `EPIC_CTX` 로 plan/build 프롬프트에 붙여 하위 태스크가 에픽 설계 방향을 따르게 한다(러너가 주입) |
@@ -733,7 +763,7 @@ tail -f loop-plan.log loop-build.log
 
 | 알림 | 버튼 | 호출되는 API |
 |------|------|--------------|
-| `✅ 리뷰 승인 완료` / `✅ PR 리뷰 승인` | `🔀 병합` · `🔗 PR 열기` | `POST /api/cards/:key/merge` |
+| `✅ 리뷰 승인 완료 · CI 통과` / `✅ PR 리뷰 승인 · CI 통과` (**CI 확정 후 발송** — [4.3f](#43f-리뷰-승인-알림의-ci-게이트-lib-notifysh)) | `🔀 병합` · `🔗 PR 열기` | `POST /api/cards/:key/merge` |
 | `⏸ 상한 도달·진전 없음 — 사람 확인 필요` | `🔁 재리뷰 루프` · `🔀 병합` · `🔗 PR` | `POST /api/cards/:key/review-loop` |
 | `⏸ 에픽 중단(paused)` | `▶️ 이어서 진행` · `⏭ 건너뛰기` · `⏹ 중지` | `POST /api/epics/:key/run/resume{,skip}` · `/run/stop` |
 | `⏳ PR 병합 대기 중` | `🔀 병합` · `⏹ 중지` | `POST /api/cards/:key/merge` |
@@ -785,6 +815,8 @@ loop-work/                     # (= 저장소 루트)
 ├─ run-review-loop.sh          # 한 PR 을 승인될 때까지 '반영→재리뷰' 반복 (대시보드 '승인까지 루프')
 ├─ detect-cards.sh             # 대상 카드 탐지 (plan/build/review)
 ├─ lib-engine.sh               # LLM 엔진 추상화(claude/codex/gemini) — 위 3개 스크립트가 source
+├─ lib-notify.sh               # 리뷰 승인 알림의 CI 게이트 — run-review.sh · run-review-loop.sh 가 source
+├─ ci-state.js                 # PR 의 CI 상태 조회/대기 CLI(판정은 dashboard/lib.js 와 공유)
 ├─ loop-plan.sh                # plan 루프
 ├─ loop-build.sh               # build 루프
 ├─ loop-review.sh              # review 루프 (PR 자동 리뷰)
@@ -809,6 +841,7 @@ loop-work/                     # (= 저장소 루트)
    ├─ slack-socket.js          # Slack 버튼 클릭 수신(Socket Mode) → 대시보드 API 실행
    ├─ test/lib.test.js         # 단위 테스트 (node:test) — `npm test`
    ├─ test/review-loop.test.js # run-review-loop.sh 회귀 테스트 (하위 스크립트·gh 스텁, 네트워크 불필요)
+   ├─ test/review-approve-ci-gate.test.js # 승인 알림 CI 게이트 회귀 테스트 (ci-state.js 스텁)
    ├─ test/attachments.test.js # 카드 첨부(이미지·문서) 인식 회귀 테스트 (fetch 스텁, 네트워크 불필요)
    ├─ test/office.test.js      # docx·xlsx·pptx 변환 테스트 (실제 zip 컨테이너를 만들어 검증)
    ├─ test/epic-loop.test.js   # 에픽 연속 개발 순수 로직(단계 판정·다음 태스크·제안 답변 채택) 테스트
@@ -932,6 +965,21 @@ Jira JQL 에서 `issuetype = "워크스트림"` / `issuetype = "에픽"` 은 **�
 해결: `ci` 단계 신설([4.3e](#43e-ci-단계-ci-실패-자동-수정))로 병합 전에 CI 를 초록으로 만들고,
 `shouldAutoMerge` 와 `/api/cards/:key/merge` 양쪽에 CI 게이트를 넣었다.
 사람이 대시보드 확인창에서 CI 상태를 보고 진행을 고를 때만 `force` 로 넘어간다.
+
+### 11.x 리뷰 승인 Slack 알림의 `[병합]` 버튼을 눌러도 병합되지 않는다 / 같은 알림이 두 번 온다
+
+증상: `✅ 리뷰 승인 완료` 알림의 `[병합]` 을 눌렀는데 반영되지 않는다. 잠시 뒤 비슷한 알림이 또 오고,
+그때 누르면 병합된다.
+
+원인: 승인 알림을 **승인 마커만 보고** 보냈다(`run-review-loop.sh` · `run-review.sh`). 리뷰 승인은
+PR 을 올린 직후에 끝나는데 **그 시점엔 CI 가 아직 돌고 있어**, 버튼이 병합 라우트의 CI 게이트
+(`ci-pending`)에 막힌다. 두 번째 알림은 에픽 러너가 병합 대기에서 보내는 '병합만 남음'
+(승인 + CI 통과) 알림이었고, 그건 조건을 다 채운 뒤라 눌렸다.
+
+해결: 승인 알림을 **CI 확정 뒤로 옮겼다**([4.3f](#43f-리뷰-승인-알림의-ci-게이트-lib-notifysh)).
+CI 가 도는 중이면 알림을 보내지 않고 백그라운드에서 확정을 기다린 뒤 1회만 보내며,
+CI 실패·미확정이면 **병합 버튼을 붙이지 않는다**(막히는 버튼은 없는 게 낫다).
+연속 개발 중에는 러너의 '병합만 남음' 알림 하나로 갈음해 중복도 없앴다.
 
 ---
 
