@@ -299,13 +299,13 @@ function jiraAuth(cred) {
   if (!cred.atlassianEmail || !cred.atlassianToken) throw new Error("Atlassian 이메일/토큰이 설정되지 않았습니다.");
   return Buffer.from(`${cred.atlassianEmail}:${cred.atlassianToken}`).toString("base64");
 }
-async function jiraSearch(jql, cfg, cred) {
+async function jiraSearch(jql, cfg, cred, extraFields) {
   const auth = jiraAuth(cred);
   if (!cfg.jiraSite) throw new Error("Jira 사이트가 설정되지 않았습니다.");
   const res = await fetch(`https://${cfg.jiraSite}/rest/api/3/search/jql`, {
     method: "POST",
     headers: { Authorization: `Basic ${auth}`, "Content-Type": "application/json", Accept: "application/json" },
-    body: JSON.stringify({ jql, fields: ["summary", "status", "labels", "assignee", "updated"], maxResults: 50 }),
+    body: JSON.stringify({ jql, fields: ["summary", "status", "labels", "assignee", "updated", ...(extraFields || [])], maxResults: 50 }),
   });
   if (!res.ok) throw new Error(`Jira ${res.status}: ${(await res.text()).slice(0, 300)}`);
   return res.json();
@@ -753,7 +753,7 @@ async function supersedeApprovalPR(cfg, cred, owner, number, marker, why) {
 }
 
 // ================= 에픽 연속 개발 (run-epic-loop.js) =================
-// 에픽 하위 태스크를 생성순으로 하나씩 plan→답변자동채택→build(+승인까지 리뷰 루프)→병합 대기로 처리한다.
+// 에픽 하위 태스크를 Jira 순위순으로 하나씩 plan→답변자동채택→build(+승인까지 리뷰 루프)→병합 대기로 처리한다.
 // 진행 상태·중지는 <cloneBase>/.state/<EPIC>.epic.{lock,json,stop} 로 주고받는다(리뷰 승인 루프와 같은 규약).
 // 실행 중에도 바꿀 수 있는 에픽 옵션(자동 병합) — 러너가 await-merge 폴링마다 다시 읽는다.
 const epicOptsPath = (cfg, key) => path.join(stateDirOf(cfg), `${key}.epic.opts.json`);
@@ -947,24 +947,26 @@ app.get("/api/epics", async (req, res) => {
     res.json({ ok: true, epics, label });
   } catch (e) { fail(res, e); }
 });
-// 에픽의 미완료 하위 태스크(생성순) + 각 카드의 시작 단계
+// 에픽의 미완료 하위 태스크(Jira 순위순) + 각 카드의 시작 단계·선행 대기
 app.get("/api/epics/:key/children", async (req, res) => {
   const key = req.params.key;
   if (!/^[A-Z][A-Z0-9]+-[0-9]+$/.test(key)) return res.status(400).json({ ok: false, message: "이슈 키 형식 오류" });
   try {
     const { cfg, cred } = resolveProject(req);
-    let data;
-    // parent 절이 안 먹는 구형(company-managed) 프로젝트는 'Epic Link' 로 재시도
-    try { data = await jiraSearch(lib.epicChildrenJql(key, cfg, "parent"), cfg, cred); }
-    catch { data = await jiraSearch(lib.epicChildrenJql(key, cfg, "epic-link"), cfg, cred); }
+    // Rank 없음 → 생성순, parent 절 미지원(구형 company-managed) → 'Epic Link' 폴백은 러너와 같은 규칙
+    const { data } = await lib.searchEpicChildren((jql) => jiraSearch(jql, cfg, cred, ["issuelinks"]), key, cfg);
     // assignedToMe: 태스크 상세에서 '답변 등록'(코멘트+라벨)을 열어줄지 가르는 플래그.
     // url 은 상세 화면의 'Jira에서 열기' 링크용.
     const myId = await myAccountId(cfg, cred);
     const children = (data.issues || []).map((i) => {
       const assignee = i.fields.assignee;
-      const t = { key: i.key, summary: i.fields.summary, status: i.fields.status?.name || "", labels: i.fields.labels || [], done: false };
+      const t = {
+        key: i.key, summary: i.fields.summary, status: i.fields.status?.name || "", labels: i.fields.labels || [], done: false,
+        blockedBy: lib.epicBlockers(i.fields.issuelinks, cfg),
+      };
       return {
         ...t, step: lib.epicTaskStep(t, cfg),
+        waitingOn: t.blockedBy.filter((b) => !b.done).map((b) => b.key),
         assignedToMe: !!myId && !!assignee && assignee.accountId === myId,
         assignee: (assignee && assignee.displayName) || null,
         url: `https://${cfg.jiraSite}/browse/${i.key}`,

@@ -368,7 +368,7 @@ function parseSuggestedAnswers(comments) {
 }
 
 // ===== 에픽 연속 개발(run-epic-loop.js) 순수 로직 =====
-// 한 에픽의 하위 태스크를 생성순으로 하나씩: prepare→plan→adopt→build(+리뷰 승인 루프)→await-merge.
+// 한 에픽의 하위 태스크를 Jira 순위순으로 하나씩: prepare→plan→adopt→build(+리뷰 승인 루프)→await-merge.
 // 러너는 상태를 <CLONE_BASE>/.state/<EPIC>.epic.json 에 쓰고 대시보드가 폴링한다.
 // 연속 개발의 '상위 카드' 는 에픽 계층(hierarchyLevel 1)이면 무엇이든 된다 — 프로젝트마다 이름이
 // 다르다(에픽 · 워크스트림 · Initiative …). 러너는 parent 로만 하위를 찾으므로 타입 이름과 무관하게 돈다.
@@ -395,14 +395,43 @@ function epicTypeLabel(types) {
 // ci 는 build(+리뷰 승인 루프) 와 approve 사이에 있다. CI 를 고치면 코드가 바뀌므로 그 자리에서
 // 리뷰 루프를 다시 태우고, 뒤따르는 approve 가 '최종 승인 마커' 를 확인하는 순서가 된다.
 const EPIC_STEPS = ["prepare", "plan", "adopt", "build", "ci", "approve", "await-merge"];
-// 하위 태스크 조회 JQL — 미완료(완료 상태·Done 카테고리 제외) 전부, 생성순.
+// 하위 태스크 조회 JQL — 미완료(완료 상태·Done 카테고리 제외) 전부, Jira 순위(Rank)순.
+// 처리 순서는 사람이 Jira 백로그에서 끌어다 놓은 순서를 그대로 따른다.
 // link: "parent"(기본) 또는 "epic-link" — 구형 company-managed 프로젝트는 'Epic Link' 만 먹는다.
-function epicChildrenJql(epicKey, cfg, link) {
+// order: "rank"(기본) 또는 "created" — Rank 필드가 없는 프로젝트(비즈니스 템플릿 등) 폴백.
+function epicChildrenJql(epicKey, cfg, link, order) {
   const done = effectiveDoneStatuses(cfg || {});
   const excl = done.length ? ` AND status NOT IN (${done.map((s) => `"${s}"`).join(", ")})` : "";
   const clause = link === "epic-link" ? `"Epic Link" = "${epicKey}"` : `parent = "${epicKey}"`;
-  return `${clause} AND statusCategory != Done${excl} ORDER BY created ASC`;
+  return `${clause} AND statusCategory != Done${excl} ORDER BY ${order === "created" ? "created" : "Rank"} ASC`;
 }
+// 하위 조회를 (link, order) 조합 순서대로 시도한다. 성공한 조합부터 다시 시작하도록 돌려준다.
+// search: jql => Promise<data>. 폴백은 JQL 오류(HTTP 400)일 때만 — 네트워크 오류로 폴백하면
+// 그 실행 내내 생성순으로 굳어 버린다. 그 외 오류나 모든 조합 실패는 그대로 던진다.
+const EPIC_CHILD_QUERIES = [["parent", "rank"], ["parent", "created"], ["epic-link", "rank"], ["epic-link", "created"]];
+const isJqlError = (e) => /(→ |Jira )400\b/.test(String((e && e.message) || e));
+async function searchEpicChildren(search, epicKey, cfg, startAt) {
+  let err;
+  for (let i = Math.max(0, startAt || 0); i < EPIC_CHILD_QUERIES.length; i++) {
+    const [link, order] = EPIC_CHILD_QUERIES[i];
+    try { return { data: await search(epicChildrenJql(epicKey, cfg, link, order)), queryIndex: i }; }
+    catch (e) { err = e; if (!isJqlError(e)) throw e; }
+  }
+  throw err;
+}
+// 이 카드를 막는 선행 카드 — Jira 기본 'Blocks' 링크의 inwardIssue('is blocked by' 쪽).
+// 에픽 밖 카드도 선행으로 인정한다. 완료 판정은 epicTaskStep 의 done 과 같은 기준.
+function epicBlockers(issuelinks, cfg) {
+  const doneNames = effectiveDoneStatuses(cfg || {});
+  return (issuelinks || [])
+    .filter((l) => l && l.type && l.type.name === "Blocks" && l.inwardIssue)
+    .map((l) => {
+      const st = (l.inwardIssue.fields && l.inwardIssue.fields.status) || {};
+      const done = (st.statusCategory && st.statusCategory.key === "done") || doneNames.includes(st.name);
+      return { key: l.inwardIssue.key, status: st.name || "", done: !!done };
+    });
+}
+const pendingBlockers = (t) => ((t && t.blockedBy) || []).filter((b) => !b.done);
 // 태스크의 남은 단계 판정 — 라벨/상태로 '어디부터 하면 되는지'를 정한다(중단 후 재개·중복 실행 방지).
 function epicTaskStep(task, cfg) {
   const c = cfg || {};
@@ -416,10 +445,30 @@ function epicTaskStep(task, cfg) {
   if (!labels.includes(c.answeredLabel || "claude-answered")) return "adopt";
   return "build";
 }
-// 다음에 처리할 태스크(생성순으로 처리할 게 남은 첫 카드). 없으면 null → 에픽 완료.
+// 다음에 처리할 태스크(순위순으로 처리할 게 남은 첫 카드, 선행이 덜 끝난 카드는 건너뜀).
+// null 이면 에픽 완료이거나 남은 카드가 전부 선행 대기 — epicBlockedReason 으로 구분한다.
 function nextEpicTask(tasks, cfg) {
-  for (const t of tasks || []) { const step = epicTaskStep(t, cfg); if (step) return { ...t, step }; }
+  for (const t of tasks || []) {
+    if (pendingBlockers(t).length) continue;
+    const step = epicTaskStep(t, cfg);
+    if (step) return { ...t, step };
+  }
   return null;
+}
+// 대시보드·상태 파일용 카드별 상태. waitingOn: 아직 안 끝난 선행 카드 키.
+function epicTaskStates(tasks, next) {
+  return (tasks || []).map((t) => {
+    const waitingOn = pendingBlockers(t).map((b) => b.key);
+    const state = next && t.key === next.key ? "current" : waitingOn.length ? "blocked" : "pending";
+    return { key: t.key, summary: t.summary, status: t.status, state, waitingOn };
+  });
+}
+// 처리할 카드가 남았는데 전부 선행 대기면 그 사유, 아니면 "".
+// 에픽 안의 선행은 순서상 먼저 끝나므로, 여기 걸리는 건 에픽 밖 선행이거나 순환 링크다.
+function epicBlockedReason(tasks, cfg) {
+  const stuck = (tasks || []).filter((t) => epicTaskStep(t, cfg) && pendingBlockers(t).length);
+  if (!stuck.length || nextEpicTask(tasks, cfg)) return "";
+  return "선행 대기: " + stuck.map((t) => `${t.key} ← ${pendingBlockers(t).map((b) => `${b.key}(${b.status})`).join(", ")}`).join(" · ");
 }
 // 이번 단계 다음 단계(마지막이면 null)
 function nextEpicStep(step) {
@@ -645,6 +694,10 @@ function classifyPause(reason, lastError) {
   if (/제안 답변이 없|리뷰 승인이 남았|자동 병합 실패|CI 수정 반복/.test(t)) {
     return { retryable: false, kind: "needs-human", label: "사람 확인 필요" };
   }
+  // 에픽 밖 선행 카드가 끝나면 풀린다 — 백오프로 다시 확인한다
+  if (/선행 대기/.test(t)) {
+    return { retryable: true, kind: "blocked", label: "선행 카드 대기" };
+  }
   if (/답변 대기|awaiting answers/i.test(t)) {
     return { retryable: false, kind: "awaiting-answer", label: "카드 질문 답변 대기" };
   }
@@ -742,7 +795,7 @@ module.exports = {
   ciCheckState, ciStateOf, failedChecks, runIdFromCheckUrl,
   CI_LOOP_MAX_DEFAULT, CI_LOOP_MAX_LIMIT, clampCiLoopMax,
   SUGGEST_MARK, parseSuggestedAnswers,
-  EPIC_STEPS, epicChildrenJql, epicTaskStep, nextEpicTask, nextEpicStep, buildAdoptedAnswerBody, prBelongsToCard,
+  EPIC_STEPS, epicChildrenJql, searchEpicChildren, epicBlockers, epicTaskStep, nextEpicTask, epicTaskStates, epicBlockedReason, nextEpicStep, buildAdoptedAnswerBody, prBelongsToCard,
   EPIC_HIERARCHY_LEVEL, EPIC_LABEL_FALLBACK, topLevelIssueTypes, epicSearchJql, epicTypeLabel,
   EPIC_AUTO_MERGE_MIN_DEFAULT, EPIC_AUTO_MERGE_MIN_LIMIT, clampAutoMergeMin, shouldAutoMerge, mergeReadyState, isMergeReady,
   EPIC_CONFLICT_MIN_DEFAULT, EPIC_CONFLICT_MIN_LIMIT, clampConflictMin, isConflicting, conflictingPRs, shouldAutoResolveConflict,

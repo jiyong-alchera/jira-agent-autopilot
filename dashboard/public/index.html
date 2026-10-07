@@ -1460,7 +1460,7 @@ function EpicPrs({ pid, cardKey, epicKey, step, flash, onMerged }) {
   );
 }
 
-// 연속 개발 패널 — 상위 카드(에픽 계층: 에픽·워크스트림 …) 하위 태스크를 생성순으로 하나씩
+// 연속 개발 패널 — 상위 카드(에픽 계층: 에픽·워크스트림 …) 하위 태스크를 Jira 순위순으로 하나씩(선행 대기 카드는 건너뜀)
 // 개발→PR→리뷰 승인→병합 대기로 이어간다. 화면 용어는 프로젝트 이슈 타입 이름을 그대로 쓴다.
 // 진행 상태는 <EPIC>.epic.json 을 5초 폴링. 중단(paused)되면 사유와 [이어서 진행]/[건너뛰기] 를 띄운다.
 const EPIC_STEP_LABEL = {
@@ -1599,7 +1599,7 @@ function EpicPanel({ projects, flash }) {
 
   return (
     <Section title={`${epicLabel} 연속 개발`} collapsible defaultOpen={false}
-      right={<span className="text-xs text-slate-500">하위 태스크를 생성순으로 하나씩 · 개발 → PR → 리뷰 승인 → 병합하면 다음</span>}>
+      right={<span className="text-xs text-slate-500">하위 태스크를 Jira 순위순으로 하나씩(선행 카드가 남은 카드는 건너뜀) · 개발 → PR → 리뷰 승인 → 병합하면 다음</span>}>
       <div className="grid grid-cols-2 gap-4 mb-3">
         <label className="block">
           <span className="text-sm text-slate-400">프로젝트</span>
@@ -1807,7 +1807,12 @@ function EpicPanel({ projects, flash }) {
                         </td>
                         <td className="px-3 py-2 truncate" title={t.summary}>{t.summary}</td>
                         <td className="px-3 py-2 text-xs text-slate-400 truncate" title={t.status}>{t.status}</td>
-                        <td className="px-3 py-2 text-xs text-slate-400">{isCur ? <span className="text-indigo-300">▶ {EPIC_STEP_LABEL[run.step] || run.step}</span> : (EPIC_STEP_LABEL[t.step] || t.step || "-")}</td>
+                        <td className="px-3 py-2 text-xs text-slate-400">
+                          {isCur ? <span className="text-indigo-300">▶ {EPIC_STEP_LABEL[run.step] || run.step}</span>
+                            : (t.waitingOn || []).length ? <span className="text-[10px] px-1.5 py-0.5 rounded-full border bg-amber-500/15 text-amber-300 border-amber-500/40"
+                                title={`Jira 'is blocked by' 링크의 선행 카드가 완료될 때까지 건너뜁니다: ${t.waitingOn.join(", ")}`}>⛔ 선행 대기: {t.waitingOn.join(", ")}</span>
+                            : (EPIC_STEP_LABEL[t.step] || t.step || "-")}
+                        </td>
                       </tr>
                       {open && (
                         <tr className="border-t border-slate-700/70 bg-slate-900/50"><td colSpan="4" className="p-3">

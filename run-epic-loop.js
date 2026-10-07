@@ -2,7 +2,7 @@
 // run-epic-loop.js <EPIC-KEY>
 // --------------------------------------------------------------------------
 // 한 상위 카드(에픽 계층 — 프로젝트에 따라 '에픽' · '워크스트림' 등으로 불린다)의 하위 태스크를
-// '생성순으로 하나씩' 끝까지 개발한다. 하위는 parent 로만 찾으므로 타입 이름과 무관하게 동작한다.
+// 'Jira 순위순으로 하나씩'(선행 카드가 남은 카드는 건너뜀) 끝까지 개발한다. 하위는 parent 로만 찾으므로 타입 이름과 무관하게 동작한다.
 //
 // 태스크 한 건의 단계(lib.EPIC_STEPS):
 //   prepare      claude-work + repo_<name> 라벨 부여(대상 repo 확정)
@@ -131,29 +131,25 @@ async function jira(method, urlPath, body) {
   if (!r.ok) throw new Error(`Jira ${method} ${urlPath} → ${r.status}: ${txt.slice(0, 200)}`);
   return txt ? JSON.parse(txt) : {};
 }
-const jiraSearch = (jql) => jira("POST", "/rest/api/3/search/jql", { jql, maxResults: 100, fields: ["summary", "labels", "status", "created"] });
+const jiraSearch = (jql) => jira("POST", "/rest/api/3/search/jql", { jql, maxResults: 100, fields: ["summary", "labels", "status", "created", "issuelinks"] });
 const addLabels = (key, labels) => jira("PUT", `/rest/api/3/issue/${encodeURIComponent(key)}`, { update: { labels: labels.map((l) => ({ add: l })) } });
 // 한 번의 PUT 으로 추가·제거를 함께 적용(중간 상태가 남지 않게).
 const editLabels = (key, add, remove) => jira("PUT", `/rest/api/3/issue/${encodeURIComponent(key)}`, {
   update: { labels: [...add.map((l) => ({ add: l })), ...remove.map((l) => ({ remove: l }))] },
 });
 
-// 하위 태스크 목록(미완료, 생성순). 태스크 경계마다 다시 조회해 중간에 추가된 카드도 반영한다.
-// parent 절이 안 먹는 구형 프로젝트는 'Epic Link' 로 한 번 더 시도한다.
-let CHILD_LINK = "parent";
+// 하위 태스크 목록(미완료, Jira 순위순). 태스크 경계마다 다시 조회해 중간에 추가된 카드·순서 변경·선행 링크도 반영한다.
+// Rank 가 없거나 parent 절이 안 먹는 프로젝트는 lib.searchEpicChildren 이 생성순·'Epic Link' 로 폴백한다.
+let CHILD_QUERY = 0;
 async function fetchChildren() {
-  let data;
-  try { data = await jiraSearch(lib.epicChildrenJql(EPIC_KEY, cfg, CHILD_LINK)); }
-  catch (e) {
-    if (CHILD_LINK !== "parent") throw e;
-    CHILD_LINK = "epic-link";
-    data = await jiraSearch(lib.epicChildrenJql(EPIC_KEY, cfg, CHILD_LINK));
-  }
+  const { data, queryIndex } = await lib.searchEpicChildren(jiraSearch, EPIC_KEY, cfg, CHILD_QUERY);
+  CHILD_QUERY = queryIndex;
   return (data.issues || []).map((i) => ({
     key: i.key,
     summary: (i.fields && i.fields.summary) || "",
     labels: (i.fields && i.fields.labels) || [],
     status: (i.fields && i.fields.status && i.fields.status.name) || "",
+    blockedBy: lib.epicBlockers(i.fields && i.fields.issuelinks, cfg),
     done: false,
   }));
 }
@@ -676,9 +672,19 @@ const STEP_FN = { prepare: stepPrepare, plan: stepPlan, adopt: stepAdopt, build:
     writeStatus({
       total: doneCount + children.length,
       index: doneCount,
-      tasks: children.map((t) => ({ key: t.key, summary: t.summary, status: t.status, state: next && t.key === next.key ? "current" : "pending" })),
+      tasks: lib.epicTaskStates(children, next),
     });
-    if (!next) break;   // 남은 하위 태스크 없음 → 에픽 완료
+    if (!next) {
+      // 남은 카드가 전부 선행 대기면 완료가 아니다 — 멈추고 알린다(자동 재시도가 켜져 있으면 백오프로 다시 확인)
+      const blocked = lib.epicBlockedReason(children, cfg);
+      if (blocked) {
+        log(`중단: ${blocked}`);
+        await slack(`⏸ [${EPIC_KEY}] 남은 태스크가 모두 선행 카드를 기다립니다 — ${blocked}`, epicBtn("epic-resume", "epic-stop"));
+        history(EPIC_KEY, "paused");
+        finish("paused", blocked, 1, { pausedAt: nowIso(), current: null, step: "" });
+      }
+      break;   // 남은 하위 태스크 없음 → 에픽 완료
+    }
 
     const useResume = resumeStep && (!resumeKey || resumeKey === next.key);
     let step = useResume ? resumeStep : next.step;

@@ -226,6 +226,20 @@
     검증: `npm test` 144건 통과 + 브라우저에서 에픽(EKYB-783)→태스크(EKYB-801) 펼침·고도화 미리보기 생성,
     프로젝트 카드 상세 회귀(브랜치·PR·단계 버튼) 확인.
 
+- [x] **19. 연속 개발 처리 순서 — Jira 순위(Rank) + 선행 관계(blocks 링크)**
+  - 내용: 하위 태스크를 생성순으로만 처리해, 순서를 바꾸거나 '이 카드는 저 카드 뒤에' 같은 의존을 표현할 방법이 없었다.
+    카드 인덱스(생성) 순서대로 작업할 수 없는 경우 순서를 Jira 에서 정하고, 선행이 안 끝난 카드는 건너뛰게 한다.
+  - AC: Jira 백로그에서 끌어다 놓은 순서대로 처리한다. `is blocked by` 선행 카드가 완료되지 않은 카드는 건너뛰고
+    다음 카드를 먼저 처리하며, 대시보드 태스크 목록에 선행 대기가 표시된다. 남은 카드가 전부 선행 대기면 '완료'가 아니라
+    중단 + 알림. Rank 를 쓸 수 없는 프로젝트는 생성순으로 동작한다.
+  - 영향: `dashboard/lib.js`, `run-epic-loop.js`, `dashboard/server.js`(`/api/epics/:key/children`), `dashboard/public/index.html`,
+    `dashboard/test/epic-loop.test.js`
+  → (완료 2026-10-07) 하위 JQL 을 `ORDER BY Rank ASC` 로 바꾸고, `parent·Rank → parent·생성순 → Epic Link·Rank → Epic Link·생성순`
+    폴백을 `lib.searchEpicChildren` 으로 러너·API 공용화. `issuelinks` 의 `Blocks` inward 를 `lib.epicBlockers` 로 읽어
+    `nextEpicTask` 가 미완료 선행 카드를 건너뛴다. 남은 카드가 전부 선행 대기면 `lib.epicBlockedReason` 사유로 `paused` + Slack,
+    `classifyPause` 는 이를 `blocked`(재시도 대상)로 분류. 상태 파일 `tasks[].state` 에 `blocked`/`waitingOn` 추가,
+    대시보드에 `⛔ 선행 대기` 배지. 검증: `npm test` 151건 통과 + PO-56 실조회에서 Rank 정렬 조합(첫 조합) 성공 확인.
+
 ---
 
 *완료된 항목은 위 "완료 정의"에 따라 체크 표시 + 문서 동기화 후 마감합니다.*

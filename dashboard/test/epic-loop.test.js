@@ -1,7 +1,7 @@
 // 에픽 연속 개발(run-epic-loop.js)의 순수 로직 회귀 테스트.
-// - 하위 태스크 JQL(미완료 + 생성순, parent/Epic Link 두 형태)
+// - 하위 태스크 JQL(미완료 + Rank순·생성순 폴백, parent/Epic Link 두 형태)
 // - 카드 라벨·상태로 '어느 단계부터 하면 되는지' 판정(중단 후 재개·중복 실행 방지의 핵심)
-// - 다음 태스크 선정(생성순으로 처리할 게 남은 첫 카드)
+// - 다음 태스크 선정(순위순으로 처리할 게 남은 첫 카드, 선행(blocks) 미완료는 건너뜀)
 // - plan 제안 답변 → 자동 채택 코멘트 본문
 const test = require("node:test");
 const assert = require("node:assert");
@@ -15,12 +15,102 @@ const CFG = {
   prOpenLabel: "claude-pr",
 };
 
-test("epicChildrenJql: 미완료 하위를 생성순으로 조회", () => {
+test("epicChildrenJql: 미완료 하위를 Jira 순위(Rank)순으로 조회", () => {
   const jql = lib.epicChildrenJql("EKYB-800", CFG);
   assert.match(jql, /^parent = "EKYB-800"/);
   assert.match(jql, /statusCategory != Done/);
   assert.match(jql, /status NOT IN \("DEV COMPLETED"\)/);
-  assert.match(jql, /ORDER BY created ASC$/);
+  assert.match(jql, /ORDER BY Rank ASC$/);
+});
+
+test("epicChildrenJql: Rank 가 없는 프로젝트용 생성순 폴백", () => {
+  assert.match(lib.epicChildrenJql("EKYB-800", CFG, "parent", "created"), /ORDER BY created ASC$/);
+  assert.match(lib.epicChildrenJql("EKYB-800", CFG, "epic-link", "created"), /^"Epic Link" = "EKYB-800".*ORDER BY created ASC$/);
+});
+
+test("searchEpicChildren: 실패하면 Rank→생성순, parent→Epic Link 순으로 폴백하고 성공 조합을 돌려준다", async () => {
+  const tried = [];
+  const search = async (jql) => { tried.push(jql); if (!/^"Epic Link".*Rank/.test(jql)) throw new Error("Jira 400: bad JQL"); return { issues: [] }; };
+  const r = await lib.searchEpicChildren(search, "K-1", CFG);
+  assert.equal(r.queryIndex, 2);
+  assert.equal(tried.length, 3);
+  // 성공한 조합부터 다시 시작한다
+  tried.length = 0;
+  await lib.searchEpicChildren(search, "K-1", CFG, r.queryIndex);
+  assert.equal(tried.length, 1);
+  // JQL 오류가 아니면(네트워크·인증) 폴백하지 않고 바로 던진다 — 순서가 생성순으로 굳지 않게
+  tried.length = 0;
+  await assert.rejects(lib.searchEpicChildren(async (jql) => { tried.push(jql); throw new Error("fetch failed"); }, "K-1", CFG), /fetch failed/);
+  assert.equal(tried.length, 1);
+  // 러너의 jira() 오류 형식(→ 400)도 JQL 오류로 본다
+  const r2 = await lib.searchEpicChildren(async (jql) => { if (/Rank/.test(jql)) throw new Error("Jira POST /rest/api/3/search/jql → 400: x"); return { issues: [] }; }, "K-1", CFG);
+  assert.equal(r2.queryIndex, 1);
+});
+
+// Jira issuelinks: 'Blocks' 타입에서 inwardIssue 가 이 카드를 막는 쪽(is blocked by)
+const blockLink = (key, statusName, category) => ({
+  type: { name: "Blocks", inward: "is blocked by", outward: "blocks" },
+  inwardIssue: { key, fields: { status: { name: statusName, statusCategory: { key: category } } } },
+});
+const blocksOther = (key) => ({
+  type: { name: "Blocks", inward: "is blocked by", outward: "blocks" },
+  outwardIssue: { key, fields: { status: { name: "해야 할 일", statusCategory: { key: "new" } } } },
+});
+
+test("epicBlockers: is blocked by 링크만 선행으로 보고 완료 여부를 판정한다", () => {
+  const links = [
+    blockLink("K-1", "진행 중", "indeterminate"),
+    blockLink("K-2", "DEV COMPLETED", "indeterminate"),   // 설정의 완료 상태
+    blockLink("K-3", "완료", "done"),
+    blocksOther("K-9"),                                   // 이 카드가 막는 쪽 — 선행 아님
+    { type: { name: "Relates" }, inwardIssue: { key: "K-8", fields: { status: { name: "x", statusCategory: { key: "new" } } } } },
+  ];
+  assert.deepEqual(lib.epicBlockers(links, CFG), [
+    { key: "K-1", status: "진행 중", done: false },
+    { key: "K-2", status: "DEV COMPLETED", done: true },
+    { key: "K-3", status: "완료", done: true },
+  ]);
+  assert.deepEqual(lib.epicBlockers(undefined, CFG), []);
+});
+
+test("nextEpicTask: 선행이 덜 끝난 카드는 건너뛰고 순위상 다음 카드를 고른다", () => {
+  const tasks = [
+    { key: "K-1", labels: [], blockedBy: [{ key: "X-1", status: "진행 중", done: false }] },
+    { key: "K-2", labels: [], blockedBy: [{ key: "X-2", status: "완료", done: true }] },
+  ];
+  assert.equal(lib.nextEpicTask(tasks, CFG).key, "K-2");
+});
+
+test("epicTaskStates: 현재·대기·선행 대기를 구분한다", () => {
+  const tasks = [
+    { key: "K-1", labels: [], blockedBy: [{ key: "X-1", status: "진행 중", done: false }] },
+    { key: "K-2", labels: [] },
+    { key: "K-3", labels: [] },
+  ];
+  const next = lib.nextEpicTask(tasks, CFG);
+  assert.deepEqual(lib.epicTaskStates(tasks, next).map((t) => [t.key, t.state, t.waitingOn]), [
+    ["K-1", "blocked", ["X-1"]],
+    ["K-2", "current", []],
+    ["K-3", "pending", []],
+  ]);
+});
+
+test("epicBlockedReason: 남은 카드가 모두 선행 대기면 사유를 만든다", () => {
+  const tasks = [
+    { key: "K-1", labels: [], blockedBy: [{ key: "X-1", status: "진행 중", done: false }] },
+    { key: "K-2", labels: [], blockedBy: [{ key: "K-1", status: "해야 할 일", done: false }, { key: "X-2", status: "완료", done: true }] },
+  ];
+  assert.equal(lib.nextEpicTask(tasks, CFG), null);
+  assert.equal(lib.epicBlockedReason(tasks, CFG), "선행 대기: K-1 ← X-1(진행 중) · K-2 ← K-1(해야 할 일)");
+  // 처리할 카드 자체가 없으면(전부 완료) 선행 대기가 아니다
+  assert.equal(lib.epicBlockedReason([{ key: "K-1", labels: [], done: true }], CFG), "");
+  assert.equal(lib.epicBlockedReason([], CFG), "");
+});
+
+test("classifyPause: 선행 대기는 시간이 지나면 풀릴 수 있어 재시도 대상", () => {
+  const c = lib.classifyPause("선행 대기: K-1 ← X-1(진행 중)", "");
+  assert.equal(c.retryable, true);
+  assert.equal(c.kind, "blocked");
 });
 
 test("epicChildrenJql: 구형 프로젝트는 'Epic Link' 절로 폴백", () => {
@@ -41,7 +131,7 @@ test("epicTaskStep: repo_ 등 다른 라벨은 판정에 영향이 없다", () =
   assert.equal(lib.epicTaskStep({ key: "K-1", labels: ["repo_kyb-api", "claude-work"] }, CFG), "plan");
 });
 
-test("nextEpicTask: 생성순으로 처리할 게 남은 첫 카드", () => {
+test("nextEpicTask: 순위순으로 처리할 게 남은 첫 카드", () => {
   const tasks = [
     { key: "K-1", labels: ["claude-work"], done: true },
     { key: "K-2", labels: ["claude-work", "claude-planned"] },

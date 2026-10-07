@@ -141,7 +141,8 @@ Jira 카드를 자동으로 탐지해 **Claude가 개발 → PR 생성 → 카�
 
 ### 에픽 연속 개발 (선택)
 
-위 흐름을 **한 상위 카드의 하위 태스크에 대해 생성순으로 하나씩** 자동 반복하는 모드입니다
+위 흐름을 **한 상위 카드의 하위 태스크에 대해 Jira 순위(Rank)순으로 하나씩** 자동 반복하는 모드입니다
+(선행 카드가 남은 카드는 건너뜀)
 ([4.3d](#43d-run-epic-loopjs-에픽-연속-개발--하위-태스크-순차-자동화)).
 
 대상은 **에픽 계층(`hierarchyLevel` 1) 카드면 무엇이든** 됩니다. 이 계층의 이름은 프로젝트마다
@@ -292,7 +293,7 @@ Jira 카드를 자동으로 탐지해 **Claude가 개발 → PR 생성 → 카�
 
 #### 4.3d run-epic-loop.js (에픽 연속 개발 — 하위 태스크 순차 자동화)
 
-대시보드 **'에픽(워크스트림) 연속 개발'** 패널이 실행하는 러너. 한 상위 카드의 **미완료 하위 태스크를 생성순으로 하나씩**
+대시보드 **'에픽(워크스트림) 연속 개발'** 패널이 실행하는 러너. 한 상위 카드의 **미완료 하위 태스크를 Jira 순위(Rank)순으로 하나씩**
 개발 → PR → 리뷰 승인 → (사람의) 병합까지 이어가고, 병합되면 **자동으로 다음 태스크**로 넘어간다.
 하위 태스크를 다 채우면 종료한다. 기존 자산(단건 plan/build 실행 · 승인까지 리뷰 루프 ·
 외부 병합 자동 감지 · `repo_<name>` 라벨)을 그대로 오케스트레이션하며, 새로 만드는 것은 순서 제어뿐이다.
@@ -325,6 +326,19 @@ Jira 카드를 자동으로 탐지해 **Claude가 개발 → PR 생성 → 카�
 - **에픽 설계안 주입**: 시작 시 에픽 본문을 `.state/<EPIC>.epic-design.md` 로 저장하고,
   `EPIC_KEY`·`EPIC_SUMMARY`·`EPIC_DESIGN_FILE` 을 `run-jira-agent.sh` 에 넘긴다. 스크립트는 이를
   `EPIC_CTX` 로 만들어 **plan·build 프롬프트 공통**에 붙여, 모든 하위 태스크가 같은 설계 방향으로 구현되게 한다.
+- **처리 순서 = Jira 순위(Rank)**: 하위는 `ORDER BY Rank ASC` 로 조회한다 — Jira 백로그·에픽 화면에서 카드를 끌어다
+  놓은 순서가 곧 처리 순서다(대시보드에 별도 순서를 저장하지 않는다). 태스크 경계마다 다시 조회하므로 **실행 중에 순서를 바꿔도
+  다음 태스크부터 반영**된다. Rank 로 정렬할 수 없는 프로젝트(JQL 오류)는 생성순으로, `parent` 절이 안 먹는 구형 프로젝트는
+  `"Epic Link"` 로 폴백한다(**JQL 오류=HTTP 400 일 때만** — 네트워크 오류로 폴백하면 순서가 굳는다) — 시도 순서 `parent·Rank → parent·생성순 → Epic Link·Rank → Epic Link·생성순`(`lib.searchEpicChildren`,
+  러너·`/api/epics/:key/children` 공용). 성공한 조합은 그 실행 동안 기억한다.
+- **선행 관계(blocks 링크)**: 카드에 Jira 기본 링크 **`is blocked by`**(`Blocks` 타입의 inward 쪽)가 걸려 있으면, 그 선행 카드가
+  **모두 완료**(Done 카테고리 또는 설정의 완료 상태)될 때까지 그 카드를 건너뛰고 **순위상 다음 카드**를 먼저 처리한다
+  (`lib.epicBlockers` · `lib.nextEpicTask`). 에픽 밖 카드도 선행으로 인정한다. 선행 판정 기준이 '병합 완료'인 이유: 아직 병합 안 된
+  PR 위에 다음 작업을 쌓으면 리뷰 반영 때 충돌한다.
+  - 에픽 안의 선행은 순서상 먼저 처리·병합되므로 자연히 풀린다. **남은 카드가 전부 선행 대기**(에픽 밖 선행 미완료·순환 링크)면
+    에픽을 '완료'로 끝내지 않고 **`paused`**(사유 `선행 대기: K-2 ← X-1(진행 중) · …`) + Slack 알림으로 멈춘다(`lib.epicBlockedReason`).
+  - 상태 파일 `tasks[]` 의 `state` 는 `current` / `pending` / **`blocked`**(+`waitingOn: [선행 키]`), 대시보드 태스크 목록에는
+    `⛔ 선행 대기: X-1` 배지가 붙는다.
 - **트리거 라벨은 그 태스크 차례에만 붙인다**: 아직 차례가 아닌 하위 카드는 `claude-work` 가 없으므로
   plan/build 스케줄 루프의 탐지 JQL 에 잡히지 않는다 → 루프가 순서를 앞질러 가져가는 일이 없다.
   (이미 `claude-work` 가 붙어 있던 카드는 루프도 볼 수 있으니, 에픽 실행 중에는 두 루프를 멈춰두는 것을 권장 — UI 에도 안내)
@@ -332,6 +346,7 @@ Jira 카드를 자동으로 탐지해 **Claude가 개발 → PR 생성 → 카�
   - **감시 주체는 백엔드**(60초 주기). 러너는 중단 시 종료되므로 자기 자신을 되살릴 수 없고, 백엔드가 감시하면
     **러너가 크래시로 죽어 상태 파일만 남은 경우**도 같은 경로로 복구된다. 대시보드가 켜져 있어야 동작한다.
   - **재시도 대상**(`lib.classifyPause`): 사용량 한도(토큰) 소진 · rate limit · 429 · overloaded(`usage-limit`),
+    **남은 카드가 모두 선행 대기(`blocked`)** — 에픽 밖 선행 카드가 끝나면 풀린다,
     그 외 실행 실패·타임아웃·네트워크 오류(`transient`).
     **재시도하지 않음**: 제안 답변 없음 · 리뷰 미승인 · 자동 병합 실패(`needs-human`), 카드 답변 대기(`awaiting-answer`)
     — 시간이 지나도 결과가 같아 사람이 봐야 한다.
@@ -498,7 +513,7 @@ CI 가 끝난 뒤 에픽 러너의 '병합만 남음' 알림이 또 와서 그�
 | GET | `/api/cards/:key/review-loop` | 루프 상태 조회(대시보드 5초 폴링) — `{running, pid, owner, number, iter, max, step, stopping, startedAt}`. `.state/<KEY>.reviewloop.json` + 락 PID 생존 확인, 죽은 PID 의 스테일 락·상태파일은 정리 |
 | POST | `/api/cards/:key/review-loop/stop` | **루프 즉시 중지** — `.reviewloop.stop` 플래그를 먼저 쓴 뒤(다음 회차 차단 + 하위 종료를 '실패'로 오인 방지) 루프 프로세스 트리를 SIGTERM→6초 후 SIGKILL·락 정리. 이력에 `review-loop/stopped` 기록 |
 | GET | `/api/epics` | 프로젝트의 **에픽 계층(`hierarchyLevel` 1) 카드 목록**(`{key,summary,status}`) + 그 계층의 표시 이름 `label`(에픽·워크스트림 …) — 연속 개발 시작 폼용. **JQL 은 타입 id 로 조회한다**(아래 주의) |
-| GET | `/api/epics/:key/children` | 상위 카드의 **미완료 하위 태스크(생성순)** + 각 카드의 시작 단계(`step`). `parent` 절 실패 시 `"Epic Link"` 로 폴백. 각 태스크에 **`assignedToMe`**(내 accountId 와 assignee 비교, `/myself` 판별) · `assignee`(표시명) · `url`(Jira 링크)를 함께 반환 — 연속 개발 패널에서 태스크를 펼쳐 카드 상세를 볼 때 '답변 등록' 노출 여부를 가른다 |
+| GET | `/api/epics/:key/children` | 상위 카드의 **미완료 하위 태스크(Jira 순위순)** + 각 카드의 시작 단계(`step`) · **선행 카드 `blockedBy[]`(`{key,status,done}`)와 미완료 선행 키 `waitingOn[]`**. Rank 정렬 실패 시 생성순, `parent` 절 실패 시 `"Epic Link"` 로 폴백(`lib.searchEpicChildren`). 각 태스크에 **`assignedToMe`**(내 accountId 와 assignee 비교, `/myself` 판별) · `assignee`(표시명) · `url`(Jira 링크)를 함께 반환 — 연속 개발 패널에서 태스크를 펼쳐 카드 상세를 볼 때 '답변 등록' 노출 여부를 가른다 |
 | GET | `/api/epics/:key/run` | **에픽 연속 개발 상태**(대시보드 5초 폴링) — `{running,pid,status,reason,step,index,total,current,tasks,repos}`. 락 PID 생존 확인 + 스테일 락 정리, 락 없이 `running` 인 상태 파일은 `paused` 로 정규화(크래시 복구). 중단 상태면 `retry`(`{attempt,max,willRetry,at,kind,label,why,source}`)로 **자동 재시도 예정/미실행 사유**를 함께 준다 |
 | POST | `/api/epics/:key/run` | **에픽 연속 개발 시작** — body `{repos:[name], reviewLoopMax?, autoMerge?, autoMergeAfterMin?, autoRetry?, autoRetryMax?, autoResolveConflict?, conflictAfterMin?}`. `run-epic-loop.js` 를 detached 로 띄워 하위 태스크를 생성순으로 처리([4.3d](#43d-run-epic-loopjs-에픽-연속-개발--하위-태스크-순차-자동화)). 에픽당 1개만 실행. repo 미선택이면 거부 |
 | POST | `/api/epics/:key/run/resume` | **멈춘 지점부터 이어서 진행** — body `{skip?}`. `skip:true` 면 멈춘 단계를 건너뛰고 다음 단계부터. `paused`/`stopped` 상태에서만 수용하며, 재개 단계는 멈췄던 그 카드에만 적용. **대상 repo 는 상태 파일에 기록된 시작 시점 값**을 그대로 쓴다(요청 body 로 못 바꾼다). 기록이 비어 있으면 **전체로 넓히지 않고 거부**한다 |
@@ -827,7 +842,7 @@ loop-work/                     # (= 저장소 루트)
 ├─ repos/                      # 카드별 clone (gitignore)
 ├─ loop-*.log                  # 루프 로그 (plan/build/review/epic) (gitignore)
 ├─ run-cycle.js                # 한 사이클: 모든 프로젝트 순회 detect→실행 (루프가 호출)
-├─ run-epic-loop.js            # 에픽 연속 개발: 하위 태스크를 생성순으로 하나씩 (대시보드 패널)
+├─ run-epic-loop.js            # 에픽 연속 개발: 하위 태스크를 Jira 순위순으로 하나씩 (대시보드 패널)
 ├─ lib-project-env.js          # 프로젝트 설정 → 실행 env 구성 (run-cycle·run-epic-loop 공유)
 ├─ lib-attachments.js          # 카드 첨부(이미지·문서) 다운로드 — run-cycle 는 모듈로, 셸은 CLI 로 사용
 ├─ lib-office.js               # docx·xlsx·pptx → 텍스트 변환(최소 zip 리더 + XML 파싱, 무의존성)
@@ -1007,6 +1022,7 @@ CI 실패·미확정이면 **병합 버튼을 붙이지 않는다**(막히는 �
 - ~~**처리 이력**: 처리 카드/시각/결과/PR URL 기록~~ → ✅ 구현됨: `run-jira-agent.sh` 가 매 실행 결과를 `history.jsonl` 에 기록, `/api/history` + 대시보드 이력 표로 확인 (4.5/4.4 참고).
 - ~~**트리거 정밀도**: `text ~ "claude-work"` 토큰화 오탐~~ → ✅ 구현됨: `TRIGGER_MODE=label`(기본)로 전용 `claude-work` 라벨 트리거, `text` 모드는 레거시 옵션 (1/3/4.2/5/7.3 참고).
 - ~~**LLM 엔진 선택**: Claude 외 다른 CLI 사용~~ → ✅ 구현됨: `lib-engine.sh` 로 `claude`/`codex`/`gemini` 추상화, 프로젝트별 `engine`/`model`(전역 기본값 상속) + 대시보드 드롭다운 (4.1/5/8 참고). **남은 한계**: 상세 실행 로그의 stream-json 렌더링은 Claude 전용이라 codex/gemini 는 평문 로그로만 남고, 프롬프트는 Claude Code 도구 기준으로 최적화돼 있어 다른 엔진에서는 품질이 다를 수 있음.
+- **연속 개발 선행 관계는 Jira 기본 `Blocks` 링크 타입만 인식**: 이름을 바꾼 커스텀 링크 타입(예: `Depends`)은 선행으로 보지 않는다. 선행 판정은 '완료 상태'만 보므로, 선행 카드의 PR 이 병합 전이면 뒤 카드는 계속 대기한다.
 
 ---
 
