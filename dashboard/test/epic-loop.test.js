@@ -551,3 +551,24 @@ test("shouldAutoMerge 는 mergeReadyState 의 사유를 그대로 쓴다", () =>
   const r = lib.shouldAutoMerge({ autoMerge: true, autoMergeAfterMin: 10 }, "2026-01-01T00:00:00Z", [{ ci: "pass", approved: true }], t);
   assert.equal(r.merge, false); assert.equal(r.reason, "waiting");
 });
+
+// ----- 체크 등록 지연 · 병합 대기 중 CI 실패 (PHYS-279: 'CI 체크 없음' 으로 통과시킨 뒤 실패를 놓침) -----
+test("ciStateWithRuns: 체크가 없어도 대기·진행 중인 Actions 실행이 있으면 pending", () => {
+  assert.equal(lib.ciStateWithRuns("none", [{ status: "queued" }]), "pending");
+  assert.equal(lib.ciStateWithRuns("none", [{ status: "completed" }, { status: "in_progress" }]), "pending");
+  assert.equal(lib.ciStateWithRuns("none", [{ status: "completed" }]), "none");
+  assert.equal(lib.ciStateWithRuns("none", []), "none");
+  // 조회 실패(null)는 판정을 바꾸지 않는다
+  assert.equal(lib.ciStateWithRuns("none", null), "none");
+  // 체크가 있으면 체크 판정이 우선
+  assert.equal(lib.ciStateWithRuns("fail", [{ status: "queued" }]), "fail");
+  assert.equal(lib.ciStateWithRuns("pass", [{ status: "queued" }]), "pass");
+});
+
+test("ciFixTargets: 병합 대기 중 CI 가 깨진 PR 만 수정 대상, 충돌 PR 은 제외", () => {
+  const broken = { number: 1, ci: "fail", approved: true, mergeable: "MERGEABLE" };
+  assert.deepEqual(lib.ciFixTargets([broken, { number: 2, ci: "pass", approved: true }]).map((p) => p.number), [1]);
+  assert.deepEqual(lib.ciFixTargets([{ ...broken, mergeable: "CONFLICTING" }]), []);
+  assert.deepEqual(lib.ciFixTargets([{ ci: "pending" }, { ci: "none" }]), []);
+  assert.deepEqual(lib.ciFixTargets(null), []);
+});

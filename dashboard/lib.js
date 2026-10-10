@@ -540,6 +540,13 @@ function failedChecks(rollup) {
       url: c.detailsUrl || c.targetUrl || "",
     }));
 }
+// 체크가 하나도 없어도 head 에 대기·진행 중인 Actions 실행이 있으면 CI 는 아직 도는 중이다.
+// 러너 대기열이 밀리면 체크 등록이 수 분씩 늦어, 그 사이의 'none' 을 'CI 없는 repo' 로 읽으면 실패를 놓친다.
+// runs: GET /repos/{o}/{r}/actions/runs?head_sha= 의 workflow_runs([{status}]). 조회 실패면 null → 판정 유지.
+function ciStateWithRuns(state, runs) {
+  if (state !== "none" || !Array.isArray(runs)) return state;
+  return runs.some((r) => r && String(r.status || "").toLowerCase() !== "completed") ? "pending" : "none";
+}
 // 체크 상세 URL 에서 Actions 실행 id 를 뽑는다(…/actions/runs/<id>/job/<jid>) — 'gh run view <id> --log-failed' 용.
 function runIdFromCheckUrl(url) {
   const m = /\/actions\/runs\/(\d+)/.exec(String(url || ""));
@@ -590,6 +597,10 @@ function mergeReadyState(openPRs) {
   return "ready";
 }
 const isMergeReady = (openPRs) => mergeReadyState(openPRs) === "ready";
+// 병합 대기 중 CI 수정을 돌릴 PR — CI 가 깨진 PR 만. 충돌 PR 은 rebase 해소가 먼저다(해소 뒤 CI 가 다시 돈다).
+function ciFixTargets(openPRs) {
+  return (openPRs || []).filter((p) => p.ci === "fail" && !isConflicting(p));
+}
 
 function shouldAutoMerge(opts, waitStartedAt, openPRs, now) {
   if (!opts || !opts.autoMerge) return { merge: false, reason: "off" };
@@ -792,12 +803,12 @@ module.exports = {
   loadOrCreateEnvKey, encryptEnv, decryptEnv,
   ENGINES, DEFAULT_ENGINE, DEFAULT_MODEL, resolveEngine,
   REVIEW_LOOP_MAX_DEFAULT, REVIEW_LOOP_MAX_LIMIT, clampReviewLoopMax,
-  ciCheckState, ciStateOf, failedChecks, runIdFromCheckUrl,
+  ciCheckState, ciStateOf, ciStateWithRuns, failedChecks, runIdFromCheckUrl,
   CI_LOOP_MAX_DEFAULT, CI_LOOP_MAX_LIMIT, clampCiLoopMax,
   SUGGEST_MARK, parseSuggestedAnswers,
   EPIC_STEPS, epicChildrenJql, searchEpicChildren, epicBlockers, epicTaskStep, nextEpicTask, epicTaskStates, epicBlockedReason, nextEpicStep, buildAdoptedAnswerBody, prBelongsToCard,
   EPIC_HIERARCHY_LEVEL, EPIC_LABEL_FALLBACK, topLevelIssueTypes, epicSearchJql, epicTypeLabel,
-  EPIC_AUTO_MERGE_MIN_DEFAULT, EPIC_AUTO_MERGE_MIN_LIMIT, clampAutoMergeMin, shouldAutoMerge, mergeReadyState, isMergeReady,
+  EPIC_AUTO_MERGE_MIN_DEFAULT, EPIC_AUTO_MERGE_MIN_LIMIT, clampAutoMergeMin, shouldAutoMerge, mergeReadyState, isMergeReady, ciFixTargets,
   EPIC_CONFLICT_MIN_DEFAULT, EPIC_CONFLICT_MIN_LIMIT, clampConflictMin, isConflicting, conflictingPRs, shouldAutoResolveConflict,
   REVIEW_SUPERSEDED_CI, REVIEW_SUPERSEDED_CONFLICT, supersededBody,
   EPIC_RETRY_MAX_DEFAULT, EPIC_RETRY_MAX_LIMIT, EPIC_RETRY_BACKOFF_MIN, clampRetryMax,

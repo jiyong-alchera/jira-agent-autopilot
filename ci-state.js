@@ -39,7 +39,7 @@ function isSettled(state, elapsedMs) {
 
 function ghPr(or, num) {
   return new Promise((resolve) => {
-    execFile("gh", ["pr", "view", String(num), "--repo", or, "--json", "state,statusCheckRollup"],
+    execFile("gh", ["pr", "view", String(num), "--repo", or, "--json", "state,headRefOid,statusCheckRollup"],
       { maxBuffer: 20 * 1024 * 1024 }, (err, stdout) => {
         if (err) return resolve(null);
         try { resolve(JSON.parse(stdout || "null")); } catch { resolve(null); }
@@ -54,6 +54,26 @@ function intArg(name, dflt) {
   return Number.isFinite(n) && n >= 0 ? n : dflt;
 }
 
+// head 의 Actions 실행 목록([{status}]) — 조회 실패는 null(판정 유지).
+function ghRuns(or, sha) {
+  return new Promise((resolve) => {
+    if (!sha) return resolve(null);
+    execFile("gh", ["api", `repos/${or}/actions/runs?head_sha=${sha}&per_page=50`, "--jq", "[.workflow_runs[] | {status}]"],
+      { maxBuffer: 20 * 1024 * 1024 }, (err, stdout) => {
+        if (err) return resolve(null);
+        try { resolve(JSON.parse(stdout || "null")); } catch { resolve(null); }
+      });
+  });
+}
+
+// 체크가 아직 없으면 head 의 Actions 실행을 본다 — 대기열에 걸린 실행이 있으면 'none' 이 아니라 'pending'.
+async function currentState(or, num) {
+  const pr = await ghPr(or, num);
+  const r = stateFromPr(pr);
+  if (r.state === "none") r.state = lib.ciStateWithRuns(r.state, await ghRuns(or, pr && pr.headRefOid));
+  return r;
+}
+
 async function main() {
   const [or, num] = process.argv.slice(2);
   const out = (state, failed) => process.stdout.write(`${state}\t${(failed || []).map((f) => f.name).join(", ")}\n`);
@@ -64,7 +84,7 @@ async function main() {
   const until = startedAt + waitMs;
   let unknowns = 0;
   for (;;) {
-    const { state, failed } = stateFromPr(await ghPr(or, num));
+    const { state, failed } = await currentState(or, num);
     unknowns = state === "unknown" ? unknowns + 1 : 0;
     if (isSettled(state, Date.now() - startedAt) || Date.now() >= until || unknowns >= UNKNOWN_GIVEUP) return out(state, failed);
     await sleep(pollMs);

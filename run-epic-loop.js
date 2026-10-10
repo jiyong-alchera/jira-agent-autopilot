@@ -291,10 +291,12 @@ async function cardOpenPRs(key) {
       if (!lib.prBelongsToCard({ branch: p.headRefName, title: p.title }, key)) continue;
       const comments = await ghJsonStrict(["api", `repos/${or}/issues/${p.number}/comments?per_page=100`, "--jq", "[.[].body]"]);
       const approved = (comments || []).some((b) => String(b).includes(APPROVED_MARKER));
+      let ci = lib.ciStateOf(p.statusCheckRollup);
+      if (ci === "none") ci = lib.ciStateWithRuns(ci, await actionRunsOf(or, p.headRefOid));
       prs.push({
         owner: or, number: p.number, url: p.url, sha: p.headRefOid || "", approved,
         mergeable: p.mergeable || "UNKNOWN",
-        ci: lib.ciStateOf(p.statusCheckRollup), ciFailed: lib.failedChecks(p.statusCheckRollup),
+        ci, ciFailed: lib.failedChecks(p.statusCheckRollup),
       });
     }
   }
@@ -387,12 +389,19 @@ const CI_NONE_GRACE_MS = 180000;   // '체크 없음'을 '아직 안 올라옴'�
 const CI_PUSHED_MARK = "CI_FIX_PUSHED";   // run-jira-agent.sh 의 CI_PUSHED_MARK 와 같아야 함
 const SUPERSEDED_MARKER = lib.REVIEW_SUPERSEDED_CI;
 
+// head 의 Actions 실행 목록 — 체크가 아직 안 붙은 'none' 을 판정하는 데만 쓴다. 조회 실패는 null(판정 유지).
+async function actionRunsOf(or, sha) {
+  if (!sha) return null;
+  try {
+    return await ghJsonStrict(["api", `repos/${or}/actions/runs?head_sha=${sha}&per_page=50`, "--jq", "[.workflow_runs[] | {status}]"]);
+  } catch { return null; }
+}
 async function prCiState(or, number) {
   const p = await ghJsonStrict(["pr", "view", String(number), "--repo", or, "--json", "state,headRefOid,statusCheckRollup"]);
-  return {
-    prState: (p && p.state) || "", sha: (p && p.headRefOid) || "",
-    state: lib.ciStateOf(p && p.statusCheckRollup), failed: lib.failedChecks(p && p.statusCheckRollup),
-  };
+  const sha = (p && p.headRefOid) || "";
+  let state = lib.ciStateOf(p && p.statusCheckRollup);
+  if (state === "none") state = lib.ciStateWithRuns(state, await actionRunsOf(or, sha));
+  return { prState: (p && p.state) || "", sha, state, failed: lib.failedChecks(p && p.statusCheckRollup) };
 }
 // CI 가 확정될 때까지(도는 체크가 없어질 때까지) 기다린다.
 async function waitCi(or, number) {
@@ -594,6 +603,20 @@ async function stepAwaitMerge(task) {
       conflictSince = null; conflictNotified = false;
       readyNotified = false;                    // 재리뷰를 거쳤으니 '병합만 남음' 알림을 다시 보낼 수 있게
       continue;                                 // 곧바로 다시 판정(해소 결과 반영)
+    }
+
+    // 대기 중에 CI 가 깨지면(승인 뒤 늦게 붙은 체크가 실패 등) 기다려도 병합될 수 없다 → CI 수정 루프로 되돌린다.
+    // 수정 커밋이 오르면 ciFixLoop 가 기존 승인을 무효화하고 재리뷰까지 태운다.
+    const ciBroken = prsErr ? [] : lib.ciFixTargets(openPRs);
+    if (ciBroken.length) {
+      const max = lib.clampCiLoopMax(process.env.EPIC_CI_LOOP_MAX, cfg);
+      for (const pr of ciBroken) {
+        log(`${task.key} ${pr.owner}#${pr.number} 병합 대기 중 CI 실패 감지 → CI 수정`);
+        const r = await ciFixLoop(task, pr, max);
+        if (!r.ok) return r;
+      }
+      readyNotified = false;                    // CI 가 다시 초록이 되면 '병합만 남음' 을 새로 알린다
+      continue;
     }
 
     // 승인 + CI 통과가 되는 순간 병합 버튼을 1회 보낸다. 리뷰 루프의 승인 알림은 승인 시점에
