@@ -599,13 +599,18 @@ app.post("/api/cards/:key/resolve-conflict", async (req, res) => {
       // 이 구분이 없으면 코드 업데이트 전에 뜬 러너에게 요청을 넘겨놓고 '요청했습니다' 라고 답한 뒤
       // 아무 일도 일어나지 않는다(러너는 그 파일을 영영 읽지 않는다).
       const runnerKnowsConflict = st.conflictState !== undefined;
-      if (st.running && st.step === "await-merge" && runnerKnowsConflict) {
+      // 동시 실행이면 단계는 카드마다 다르다 — 요청한 카드의 단계로 판정한다(예전 상태 파일은 대표 카드 하나).
+      // 러너가 지금 잡고 있지 않은 카드면 아래에서 직접 실행한다(카드 락이 중복 실행을 막는다).
+      const w = (Array.isArray(st.workers) && st.workers.find((x) => x && x.key === key)) || null;
+      const cardStep = w ? w.step : st.step;
+      const runnerOwns = !Array.isArray(st.workers) || !!w;
+      if (st.running && runnerOwns && cardStep === "await-merge" && runnerKnowsConflict) {
         writeConflictRequest(cfg, epic, { key, owner, number, requestedAt: new Date().toISOString() });
         return res.json({ ok: true, queued: true, message: `${owner}#${number} 충돌 해소를 연속 개발 러너에 요청했습니다(병합 대기 폴링에서 바로 처리).` });
       }
       // 구버전 러너가 병합 대기 중이면 여기서 직접 실행한다 — 폴링만 하는 단계라 카드 락이 비어 있다.
-      if (st.running && st.step !== "await-merge") {
-        return res.json({ ok: false, message: `연속 개발이 '${st.step || "실행"}' 단계 실행 중입니다. 그 단계가 끝난 뒤(또는 중지 후) 다시 눌러주세요.` });
+      if (st.running && runnerOwns && cardStep !== "await-merge") {
+        return res.json({ ok: false, message: `연속 개발이 ${w ? `${key} 를 ` : ""}'${cardStep || "실행"}' 단계 실행 중입니다. 그 단계가 끝난 뒤(또는 중지 후) 다시 눌러주세요.` });
       }
     }
     // 충돌 상태일 때만 기존 승인을 무효화한다 — rebase 로 코드가 바뀌므로 그 승인은 더 이상 유효하지 않다.
@@ -764,12 +769,14 @@ function readEpicOpts(cfg, key) {
       autoMerge: !!o.autoMerge, autoMergeAfterMin: lib.clampAutoMergeMin(o.autoMergeAfterMin),
       autoRetry: !!o.autoRetry, autoRetryMax: lib.clampRetryMax(o.autoRetryMax),
       autoResolveConflict: !!o.autoResolveConflict, conflictAfterMin: lib.clampConflictMin(o.conflictAfterMin),
+      parallelExtra: lib.clampParallelExtra(o.parallelExtra),
     };
   } catch {
     return {
       autoMerge: false, autoMergeAfterMin: lib.EPIC_AUTO_MERGE_MIN_DEFAULT,
       autoRetry: false, autoRetryMax: lib.EPIC_RETRY_MAX_DEFAULT,
       autoResolveConflict: false, conflictAfterMin: lib.EPIC_CONFLICT_MIN_DEFAULT,
+      parallelExtra: 0,
     };
   }
 }
@@ -778,12 +785,14 @@ function writeEpicOpts(cfg, key, next) {
     autoMerge: !!next.autoMerge, autoMergeAfterMin: lib.clampAutoMergeMin(next.autoMergeAfterMin),
     autoRetry: !!next.autoRetry, autoRetryMax: lib.clampRetryMax(next.autoRetryMax),
     autoResolveConflict: !!next.autoResolveConflict, conflictAfterMin: lib.clampConflictMin(next.conflictAfterMin),
+    parallelExtra: lib.clampParallelExtra(next.parallelExtra),
   };
   try { fs.mkdirSync(stateDirOf(cfg), { recursive: true }); fs.writeFileSync(epicOptsPath(cfg, key), JSON.stringify(o, null, 2)); } catch {}
   return o;
 }
 function runEpicLoop(epicKey, projectId, opts) {
-  const { repos, reviewLoopMax, resumeStep, resumeKey, autoMerge, autoMergeAfterMin, autoResolveConflict, conflictAfterMin, epicLabel } = opts || {};
+  const { repos, reviewLoopMax, resumePoints, autoMerge, autoMergeAfterMin, autoResolveConflict, conflictAfterMin, parallelExtra, epicLabel } = opts || {};
+  const points = resumePoints || [];
   const label = epicLabel || lib.EPIC_LABEL_FALLBACK;
   const script = path.join(SCRIPTS_DIR, "run-epic-loop.js");
   if (!fs.existsSync(script)) return { ok: false, message: `스크립트를 찾을 수 없습니다: ${script}` };
@@ -793,14 +802,14 @@ function runEpicLoop(epicKey, projectId, opts) {
   let fd;
   try {
     fd = fs.openSync(logPath, "a");
-    fs.writeSync(fd, `[${new Date().toISOString()}] (${label} 연속 개발)${resumeStep ? ` RESUME(${resumeStep})` : " START"}: ${epicKey} [${projectId}] repos=${(repos || []).join(",") || "(전체)"}\n`);
+    fs.writeSync(fd, `[${new Date().toISOString()}] (${label} 연속 개발)${points.length ? ` RESUME(${points.map((p) => `${p.key}:${p.step}`).join(",")})` : " START"}: ${epicKey} [${projectId}] repos=${(repos || []).join(",") || "(전체)"}\n`);
   } catch (e) { return { ok: false, message: String(e.message || e) }; }
   const env = scriptEnv(projectId);
   env.EPIC_REPOS = (repos || []).join(",");
   env.REVIEW_LOOP_MAX = String(reviewLoopMax || clampReviewLoopMax(null, getConfig(projectId)));
   env.EPIC_CI_LOOP_MAX = String(lib.clampCiLoopMax(null, getConfig(projectId)));
-  if (resumeStep) env.EPIC_RESUME_STEP = resumeStep;
-  if (resumeKey) env.EPIC_RESUME_KEY = resumeKey;
+  if (points.length) env.EPIC_RESUME_POINTS = JSON.stringify(points);
+  env.EPIC_PARALLEL_EXTRA = String(lib.clampParallelExtra(parallelExtra));
   env.EPIC_AUTO_MERGE = autoMerge ? "1" : "";
   env.EPIC_AUTO_MERGE_AFTER_MIN = String(lib.clampAutoMergeMin(autoMergeAfterMin));
   env.EPIC_AUTO_RESOLVE_CONFLICT = autoResolveConflict ? "1" : "";
@@ -827,7 +836,7 @@ function resumeEpicRun(cfg, projectId, key) {
   const opts = readEpicOpts(cfg, key);
   return runEpicLoop(key, projectId, {
     repos: cur.repos, reviewLoopMax: clampReviewLoopMax(null, cfg),
-    resumeStep: cur.step || "", resumeKey: (cur.current && cur.current.key) || "", epicLabel: cur.label, ...opts,
+    resumePoints: lib.epicResumePoints(cur), epicLabel: cur.label, ...opts,
   });
 }
 
@@ -872,7 +881,7 @@ function writeEpicRetry(cfg, key, next) {
 }
 function clearEpicRetry(cfg, key) { try { fs.unlinkSync(epicRetryPath(cfg, key)); } catch {} }
 // 진행 지점이 바뀌면(다른 카드·다른 단계) 재시도 카운터를 리셋한다 — 한 지점에서 반복 실패할 때만 상한이 걸린다.
-const retrySignature = (st) => `${(st.current && st.current.key) || ""}:${st.step || ""}`;
+const retrySignature = (st) => lib.epicResumePoints(st).map((p) => `${p.key}:${p.step}`).join(",");
 
 // 한 에픽의 재시도 판정·실행. 대시보드 감시 루프와 상태 조회에서 공용.
 function epicRetryPlan(cfg, key, st, now) {
@@ -909,24 +918,24 @@ async function retryPausedEpics() {
       }
       if (now < Date.parse(rec.nextRetryAt)) continue;   // 아직 시각 전
       // 재시도 실행 — 멈췄던 그 단계부터
-      const resumeStep = st.step || "";
-      const resumeKey = (st.current && st.current.key) || "";
+      const resumePoints = lib.epicResumePoints(st);
+      const where = resumePoints.map((p) => `${p.key} · ${p.step}`).join(", ") || "현재 단계 재판정";
       const opts2 = readEpicOpts(cfg, key);
       const r = runEpicLoop(key, cfg.id, {
         epicLabel: st.label,
         repos: st.repos || [], reviewLoopMax: clampReviewLoopMax(null, cfg),
-        resumeStep, resumeKey, ...opts2,
+        resumePoints, ...opts2,
       });
       const next = attempt + 1;
       writeEpicRetry(cfg, key, { signature: sig, attempt: next, nextRetryAt: null, kind: plan.kind, label: plan.label, lastRetryAt: new Date().toISOString() });
-      console.log(`[epic-retry] ${key}: 자동 재시도 ${next}/${plan.max} 실행 (${resumeKey} · ${resumeStep}) ${r.ok ? `pid ${r.pid}` : `실패: ${r.message}`}`);
+      console.log(`[epic-retry] ${key}: 자동 재시도 ${next}/${plan.max} 실행 (${where}) ${r.ok ? `pid ${r.pid}` : `실패: ${r.message}`}`);
       out.push({ project: cfg.id, key, attempt: next, ok: !!r.ok });
       try {
         const cred = getProjectCreds(cfg.id);
         if (cred.slackWebhookUrl) {
           await fetch(cred.slackWebhookUrl, {
             method: "POST", headers: { "Content-type": "application/json" },
-            body: JSON.stringify({ text: `🔄 [${key}] 자동 재시도 ${next}/${plan.max} — ${plan.label} 이후 ${resumeKey} · ${resumeStep} 부터 재개` }),
+            body: JSON.stringify({ text: `🔄 [${key}] 자동 재시도 ${next}/${plan.max} — ${plan.label} 이후 ${where} 부터 재개` }),
             signal: AbortSignal.timeout(10000),
           });
         }
@@ -1000,7 +1009,7 @@ app.post("/api/epics/:key/run", async (req, res) => {
     const reviewLoopMax = clampReviewLoopMax(b.reviewLoopMax, cfg);
     const opts = writeEpicOpts(cfg, key, {
       autoMerge: b.autoMerge, autoMergeAfterMin: b.autoMergeAfterMin, autoRetry: b.autoRetry, autoRetryMax: b.autoRetryMax,
-      autoResolveConflict: b.autoResolveConflict, conflictAfterMin: b.conflictAfterMin,
+      autoResolveConflict: b.autoResolveConflict, conflictAfterMin: b.conflictAfterMin, parallelExtra: b.parallelExtra,
     });
     try { fs.unlinkSync(epicConflictPath(cfg, key)); } catch {}   // 이전 실행에 남은 충돌 해소 요청은 버린다
     clearEpicRetry(cfg, key);   // 새 실행이므로 재시도 카운터 초기화
@@ -1021,17 +1030,19 @@ app.post("/api/epics/:key/run/resume", (req, res) => {
       return res.json({ ok: false, message: "이전 실행의 대상 repo 기록이 없어 이어서 진행할 수 없습니다(전체로 넓히지 않습니다). repo 를 골라 새로 시작하세요." });
     }
     const skip = !!(req.body && req.body.skip);
-    const step = skip ? lib.nextEpicStep(cur.step) : cur.step;
-    if (skip && !step) return res.json({ ok: false, message: "마지막 단계라 건너뛸 수 없습니다." });
+    // 재개 단계는 '멈췄던 그 카드' 에만 적용한다(그 사이 사람이 카드를 끝냈으면 다른 카드에 잘못 붙지 않도록).
+    // 동시 실행이면 카드마다 멈춘 단계가 다르다 — [건너뛰기]는 각자 다음 단계로.
+    const resumePoints = lib.epicResumePoints(cur, skip);
+    if (skip && !resumePoints.length) return res.json({ ok: false, message: "마지막 단계라 건너뛸 수 없습니다." });
     const reviewLoopMax = clampReviewLoopMax((req.body || {}).reviewLoopMax, cfg);
-    // 재개 단계는 '멈췄던 그 카드' 에만 적용한다(그 사이 사람이 카드를 끝냈으면 다른 카드에 잘못 붙지 않도록)
-    const resumeKey = (cur.current && cur.current.key) || "";
-    const opts = readEpicOpts(cfg, key);   // 재개는 저장된 자동 병합 설정을 그대로 이어간다
-    res.json({ ...runEpicLoop(key, id, { repos: cur.repos || [], reviewLoopMax, resumeStep: step || "", resumeKey, epicLabel: cur.label, ...opts }), resumedAt: step || "(현재 단계 재판정)", opts });
+    const opts = readEpicOpts(cfg, key);   // 재개는 저장된 자동 병합·동시 실행 설정을 그대로 이어간다
+    const resumedAt = resumePoints.map((p) => `${p.key} · ${p.step}`).join(", ") || "(현재 단계 재판정)";
+    res.json({ ...runEpicLoop(key, id, { repos: cur.repos || [], reviewLoopMax, resumePoints, epicLabel: cur.label, ...opts }), resumedAt, opts });
   } catch (e) { fail(res, e); }
 });
 // 자동 병합 옵션 변경 — 실행 중에도 즉시 반영된다(러너가 await-merge 폴링마다 옵션 파일을 다시 읽음).
-// body { autoMerge:boolean, autoMergeAfterMin:number }
+// body { autoMerge, autoMergeAfterMin, autoRetry, autoRetryMax, autoResolveConflict, conflictAfterMin, parallelExtra } — 준 것만 바꾼다.
+// parallelExtra 는 러너가 빈 슬롯을 채울 때마다 다시 읽는다(줄이면 돌던 카드는 끝까지, 새 카드만 덜 띄운다).
 app.post("/api/epics/:key/run/options", (req, res) => {
   const key = req.params.key;
   if (!/^[A-Z][A-Z0-9]+-[0-9]+$/.test(key)) return res.status(400).json({ ok: false, message: "이슈 키 형식 오류" });
@@ -1046,6 +1057,7 @@ app.post("/api/epics/:key/run/options", (req, res) => {
       autoRetryMax: b.autoRetryMax === undefined ? cur.autoRetryMax : b.autoRetryMax,
       autoResolveConflict: b.autoResolveConflict === undefined ? cur.autoResolveConflict : !!b.autoResolveConflict,
       conflictAfterMin: b.conflictAfterMin === undefined ? cur.conflictAfterMin : b.conflictAfterMin,
+      parallelExtra: b.parallelExtra === undefined ? cur.parallelExtra : b.parallelExtra,
     });
     // 재시도 설정을 바꾸면 예정 시각을 다시 계산하도록 기록을 비운다
     if (b.autoRetry !== undefined || b.autoRetryMax !== undefined) clearEpicRetry(cfg, key);
@@ -1053,6 +1065,7 @@ app.post("/api/epics/:key/run/options", (req, res) => {
       opts.autoMerge ? `자동 병합 켜짐(승인 후 ${opts.autoMergeAfterMin}분)` : "자동 병합 꺼짐",
       opts.autoRetry ? `자동 재시도 켜짐(최대 ${opts.autoRetryMax}회)` : "자동 재시도 꺼짐",
       opts.autoResolveConflict ? `자동 충돌 해소 켜짐(${opts.conflictAfterMin}분)` : "자동 충돌 해소 꺼짐",
+      opts.parallelExtra ? `동시 실행 ${1 + opts.parallelExtra}개` : "순차 실행",
     ].join(" · ");
     res.json({ ok: true, opts, message: msg });
   } catch (e) { fail(res, e); }

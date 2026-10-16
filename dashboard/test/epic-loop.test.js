@@ -95,6 +95,47 @@ test("epicTaskStates: 현재·대기·선행 대기를 구분한다", () => {
   ]);
 });
 
+test("pickEpicTasks: 선행이 없는 카드를 순위순으로 n 건까지, 돌고 있는 카드는 빼고 고른다", () => {
+  const tasks = [
+    { key: "K-1", labels: [] },
+    { key: "K-2", labels: [], blockedBy: [{ key: "K-1", status: "해야 할 일", done: false }] },
+    { key: "K-3", labels: ["claude-work"] },
+    { key: "K-4", labels: [], done: true },
+    { key: "K-5", labels: [] },
+  ];
+  assert.deepEqual(lib.pickEpicTasks(tasks, CFG, 2).map((t) => [t.key, t.step]), [["K-1", "prepare"], ["K-3", "plan"]]);
+  assert.deepEqual(lib.pickEpicTasks(tasks, CFG, 5, ["K-1"]).map((t) => t.key), ["K-3", "K-5"]);
+  assert.deepEqual(lib.pickEpicTasks(tasks, CFG, 0), []);
+});
+
+test("pickEpicTasks: 재개 지점이 남은 카드는 순위가 뒤여도 먼저 고른다", () => {
+  const tasks = [{ key: "K-1", labels: [] }, { key: "K-2", labels: [] }, { key: "K-3", labels: [] }];
+  assert.deepEqual(lib.pickEpicTasks(tasks, CFG, 2, [], ["K-3"]).map((t) => t.key), ["K-3", "K-1"]);
+});
+
+test("epicTaskStates: 동시에 도는 카드는 모두 current", () => {
+  const tasks = [{ key: "K-1", labels: [] }, { key: "K-2", labels: [] }, { key: "K-3", labels: [] }];
+  assert.deepEqual(lib.epicTaskStates(tasks, [{ key: "K-1" }, "K-3"]).map((t) => t.state), ["current", "pending", "current"]);
+  assert.deepEqual(lib.epicTaskStates(tasks, null).map((t) => t.state), ["pending", "pending", "pending"]);
+});
+
+test("clampParallelExtra: 0~4, 잘못된 값은 0(순차)", () => {
+  assert.equal(lib.clampParallelExtra(undefined), 0);
+  assert.equal(lib.clampParallelExtra("abc"), 0);
+  assert.equal(lib.clampParallelExtra(-1), 0);
+  assert.equal(lib.clampParallelExtra("2"), 2);
+  assert.equal(lib.clampParallelExtra(99), lib.EPIC_PARALLEL_EXTRA_MAX);
+});
+
+test("epicResumePoints: 카드별 멈춘 단계, 예전 상태 파일(current/step) 호환, 건너뛰기", () => {
+  const st = { workers: [{ key: "K-1", step: "ci" }, { key: "K-2", step: "await-merge" }, { key: "K-3" }] };
+  assert.deepEqual(lib.epicResumePoints(st), [{ key: "K-1", step: "ci" }, { key: "K-2", step: "await-merge" }]);
+  // 마지막 단계는 건너뛸 곳이 없어 빠진다
+  assert.deepEqual(lib.epicResumePoints(st, true), [{ key: "K-1", step: "approve" }]);
+  assert.deepEqual(lib.epicResumePoints({ current: { key: "K-9" }, step: "build" }), [{ key: "K-9", step: "build" }]);
+  assert.deepEqual(lib.epicResumePoints({}), []);
+});
+
 test("epicBlockedReason: 남은 카드가 모두 선행 대기면 사유를 만든다", () => {
   const tasks = [
     { key: "K-1", labels: [], blockedBy: [{ key: "X-1", status: "진행 중", done: false }] },
@@ -571,4 +612,89 @@ test("ciFixTargets: 병합 대기 중 CI 가 깨진 PR 만 수정 대상, 충돌
   assert.deepEqual(lib.ciFixTargets([{ ...broken, mergeable: "CONFLICTING" }]), []);
   assert.deepEqual(lib.ciFixTargets([{ ci: "pending" }, { ci: "none" }]), []);
   assert.deepEqual(lib.ciFixTargets(null), []);
+});
+
+// ----- 동시 실행 스케줄러(lib.runEpicSlots) — 가짜 카드로 순서·동시성·중단 규칙 -----
+// cards: [{ key, blockers?: [key], fail?: true, ms? }]. runTask 가 ok 로 끝난 카드는 완료 처리돼 목록에서 빠진다.
+function fakeEpic(cards, opts) {
+  const done = new Set();
+  const started = [];
+  let running = 0, peak = 0;
+  const o = opts || {};
+  const h = {
+    cfg: CFG, pollMs: 0,
+    capacity: () => o.cap || 1,
+    stopRequested: () => !!(o.stopAfter && started.length >= o.stopAfter),
+    fetchChildren: async () => {
+      if (o.fetchFail) throw new Error("Jira 503");
+      return cards.filter((c) => !done.has(c.key)).map((c) => ({
+        key: c.key, labels: [],
+        blockedBy: (c.blockers || []).map((b) => ({ key: b, status: done.has(b) ? "완료" : "진행 중", done: done.has(b) })),
+      }));
+    },
+    runTask: async (t) => {
+      started.push(t.key); running += 1; peak = Math.max(peak, running);
+      await new Promise((r) => setTimeout(r, cards.find((c) => c.key === t.key).ms || 5));
+      running -= 1;
+      if (o.stopAfter && started.length >= o.stopAfter) return { stop: true, step: "build" };
+      if (cards.find((c) => c.key === t.key).fail) return { ok: false, step: "ci", reason: "CI 수정 반복 5회 후에도" };
+      done.add(t.key);
+      return { ok: true };
+    },
+  };
+  return { h, started, peak: () => peak };
+}
+
+test("runEpicSlots: 동시 2 — 선행 없는 카드는 함께, 선행 카드가 있으면 그 카드 완료 뒤에", async () => {
+  const f = fakeEpic([
+    { key: "K-1", ms: 20 }, { key: "K-2", ms: 5 }, { key: "K-3", blockers: ["K-1"] }, { key: "K-4" },
+  ], { cap: 2 });
+  const r = await lib.runEpicSlots(f.h);
+  assert.equal(r.outcome, "done");
+  assert.equal(r.doneCount, 4);
+  assert.equal(f.peak(), 2);
+  // K-2 가 먼저 끝나 빈 슬롯은 K-4 가 받는다(K-3 은 K-1 대기). K-1 이 끝난 뒤에야 K-3.
+  assert.deepEqual(f.started, ["K-1", "K-2", "K-4", "K-3"]);
+});
+
+test("runEpicSlots: 동시 1 이면 예전처럼 순차", async () => {
+  const f = fakeEpic([{ key: "K-1" }, { key: "K-2" }, { key: "K-3" }], { cap: 1 });
+  const r = await lib.runEpicSlots(f.h);
+  assert.equal(r.outcome, "done");
+  assert.equal(f.peak(), 1);
+  assert.deepEqual(f.started, ["K-1", "K-2", "K-3"]);
+});
+
+test("runEpicSlots: 한 카드가 실패하면 새 카드는 안 띄우고, 돌던 카드가 끝난 뒤 paused", async () => {
+  const f = fakeEpic([{ key: "K-1", fail: true, ms: 2 }, { key: "K-2", ms: 30 }, { key: "K-3" }], { cap: 2 });
+  const ended = [];
+  f.h.onEnd = (r) => ended.push(`${r.key}:${r.ok ? "ok" : "fail"}`);
+  const r = await lib.runEpicSlots(f.h);
+  assert.equal(r.outcome, "paused");
+  assert.deepEqual(r.failures.map((x) => [x.key, x.step]), [["K-1", "ci"]]);
+  assert.deepEqual(f.started, ["K-1", "K-2"]);        // K-3 은 시작하지 않는다
+  assert.deepEqual(ended, ["K-1:fail", "K-2:ok"]);     // K-2 는 끝까지 간다
+});
+
+test("runEpicSlots: 남은 카드가 전부 선행 대기면 blocked, 조회 실패면 fetch-failed, 중지는 stopped", async () => {
+  const b = await lib.runEpicSlots(fakeEpic([{ key: "K-1", blockers: ["X-9"] }], { cap: 3 }).h);
+  assert.equal(b.outcome, "blocked");
+  assert.match(b.blocked, /K-1 ← X-9/);
+  const ff = await lib.runEpicSlots(fakeEpic([{ key: "K-1" }], { fetchFail: true }).h);
+  assert.equal(ff.outcome, "fetch-failed");
+  const st = fakeEpic([{ key: "K-1" }, { key: "K-2" }, { key: "K-3" }], { cap: 2, stopAfter: 2 });
+  const s = await lib.runEpicSlots(st.h);
+  assert.equal(s.outcome, "stopped");
+  assert.deepEqual(st.started, ["K-1", "K-2"]);
+});
+
+test("runEpicSlots: 재개 지점 카드는 먼저, 그 카드의 멈춘 단계부터", async () => {
+  const f = fakeEpic([{ key: "K-1" }, { key: "K-2" }, { key: "K-3" }], { cap: 1 });
+  const steps = [];
+  const prefer = new Map([["K-3", "ci"]]);
+  f.h.preferKeys = () => [...prefer.keys()];
+  f.h.startStep = (t) => { const s = prefer.get(t.key) || t.step; prefer.delete(t.key); return s; };
+  f.h.onStart = (t, step) => steps.push(`${t.key}:${step}`);
+  await lib.runEpicSlots(f.h);
+  assert.deepEqual(steps, ["K-3:ci", "K-1:prepare", "K-2:prepare"]);
 });

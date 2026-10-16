@@ -2,7 +2,9 @@
 // run-epic-loop.js <EPIC-KEY>
 // --------------------------------------------------------------------------
 // 한 상위 카드(에픽 계층 — 프로젝트에 따라 '에픽' · '워크스트림' 등으로 불린다)의 하위 태스크를
-// 'Jira 순위순으로 하나씩'(선행 카드가 남은 카드는 건너뜀) 끝까지 개발한다. 하위는 parent 로만 찾으므로 타입 이름과 무관하게 동작한다.
+// 'Jira 순위순으로'(선행 카드가 남은 카드는 건너뜀) 끝까지 개발한다. 하위는 parent 로만 찾으므로 타입 이름과 무관하게 동작한다.
+// 동시 실행: 선행이 없는 카드는 '1 + 추가 동시 실행 수(parallelExtra)' 개까지 함께 돈다(0 이면 순차).
+// 병합 대기 중인 카드도 슬롯을 차지한다 — 열린 PR 수가 동시 실행 수로 묶인다.
 //
 // 태스크 한 건의 단계(lib.EPIC_STEPS):
 //   prepare      claude-work + repo_<name> 라벨 부여(대상 repo 확정)
@@ -19,8 +21,9 @@
 //                (대시보드·Slack 버튼으로 즉시 요청할 수도 있다 — <EPIC>.epic.conflict.json)
 // 모든 태스크가 끝나면 에픽 완료.
 //
-// 어느 단계든 실패하면 상태를 'paused' 로 남기고 알림 후 종료한다. 대시보드의
-// [이어서 진행]은 그 태스크의 그 단계부터, [건너뛰기]는 다음 단계부터 재개한다.
+// 어느 단계든 실패하면 새 카드는 더 시작하지 않고, 함께 돌던 카드가 모두 끝나면 상태를 'paused' 로
+// 남기고 종료한다. 대시보드의 [이어서 진행]은 멈춘 카드마다 그 단계부터, [건너뛰기]는 다음 단계부터
+// 재개한다(카드별 재개 지점은 상태 파일의 workers).
 // 상태 파일 기반이라 대시보드/PC 를 재시작해도 멈춘 지점이 보존된다.
 //
 // 상태/제어 파일(<CLONE_BASE>/.state/):
@@ -33,7 +36,8 @@
 // env: PROJECT_ID(필수), EPIC_REPOS(쉼표 구분 repo name), REVIEW_LOOP_MAX,
 //      EPIC_CI_LOOP_MAX(CI 수정 반복 한도, 기본 5), EPIC_CI_POLL(CI 폴링 초, 기본 30),
 //      EPIC_CI_WAIT_MAX_MIN(CI 완료 대기 한도 분, 기본 40),
-//      EPIC_MERGE_POLL(병합 대기 폴링 초, 기본 60), EPIC_RESUME_STEP·EPIC_RESUME_KEY(재개 지점),
+//      EPIC_MERGE_POLL(병합 대기 폴링 초, 기본 60), EPIC_RESUME_POINTS(재개 지점 JSON [{key,step}]),
+//      EPIC_RESUME_STEP·EPIC_RESUME_KEY(예전 단일 재개 지점), EPIC_PARALLEL_EXTRA(추가 동시 실행 수, 0~4),
 //      EPIC_AUTO_MERGE(1=승인 후 자동 병합)·EPIC_AUTO_MERGE_AFTER_MIN(대기 분, 기본 60),
 //      EPIC_AUTO_RESOLVE_CONFLICT(1=충돌 자동 해소)·EPIC_CONFLICT_AFTER_MIN(대기 분, 기본 15),
 //      EPIC_LABEL(상위 카드 표시 이름, 기본 "에픽" — 로그·Slack·Jira 코멘트 문구에만 쓰임),
@@ -86,6 +90,7 @@ const DEFAULT_OPTS = {
   autoMergeAfterMin: lib.clampAutoMergeMin(process.env.EPIC_AUTO_MERGE_AFTER_MIN),
   autoResolveConflict: process.env.EPIC_AUTO_RESOLVE_CONFLICT === "1",
   conflictAfterMin: lib.clampConflictMin(process.env.EPIC_CONFLICT_AFTER_MIN),
+  parallelExtra: lib.clampParallelExtra(process.env.EPIC_PARALLEL_EXTRA),
 };
 function readOpts() {
   try {
@@ -93,13 +98,16 @@ function readOpts() {
     return {
       autoMerge: !!o.autoMerge, autoMergeAfterMin: lib.clampAutoMergeMin(o.autoMergeAfterMin),
       autoResolveConflict: !!o.autoResolveConflict, conflictAfterMin: lib.clampConflictMin(o.conflictAfterMin),
+      parallelExtra: o.parallelExtra === undefined ? DEFAULT_OPTS.parallelExtra : lib.clampParallelExtra(o.parallelExtra),
     };
   } catch { return DEFAULT_OPTS; }
 }
 // 요청은 한 번만 쓴다 — 읽는 즉시 지워 재기동/다음 폴링에서 같은 요청이 두 번 실행되지 않게 한다.
-function takeConflictRequest() {
+// 동시 실행이면 병합 대기 카드가 여럿이라, 다른 카드 앞으로 온 요청은 건드리지 않고 그 카드가 가져가게 둔다.
+function takeConflictRequest(key) {
   let r = null;
   try { r = JSON.parse(fs.readFileSync(CONFLICT_REQ_FILE, "utf8")); } catch { return null; }
+  if (r && r.key && key && String(r.key) !== key && WORKERS.has(String(r.key))) return null;
   try { fs.unlinkSync(CONFLICT_REQ_FILE); } catch {}
   return r && r.owner && r.number != null ? { key: String(r.key || ""), owner: String(r.owner), number: String(r.number) } : null;
 }
@@ -185,12 +193,35 @@ let STATE = {
   epic: EPIC_KEY, label: EPIC_LABEL, project: project.id, repos: epicRepos.map((r) => r.name),
   startedAt: nowIso(), updatedAt: nowIso(), pid: process.pid,
   status: "running", reason: "", step: "", index: 0, total: 0,
-  current: null, tasks: [],
+  current: null, tasks: [], workers: [],
 };
 function writeStatus(patch) {
   STATE = { ...STATE, ...(patch || {}), updatedAt: nowIso() };
   try { fs.writeFileSync(STATUS_FILE, JSON.stringify(STATE, null, 2)); } catch {}
 }
+// 돌고 있는(또는 멈춘) 카드별 상태 — key → { key, summary, step, stepStartedAt, status, reason, 병합 대기 필드… }
+// 끝난 카드는 빠진다. 중단·중지 시 남은 항목이 곧 카드별 재개 지점이다.
+const WORKERS = new Map();
+const AWAIT_FIELDS = ["waitStartedAt", "autoMerge", "autoMergeAfterMin", "autoMergeAt", "autoMergeState",
+  "autoResolveConflict", "conflictAfterMin", "conflictSince", "conflictState", "conflictAt", "conflictPRs"];
+const AWAIT_RESET = Object.fromEntries(AWAIT_FIELDS.map((k) => [k, null]));
+function publishWorkers() {
+  const ws = [...WORKERS.values()];
+  // 예전 단일 실행 필드(current/step/병합 대기 필드)는 대표 카드 하나로 채운다 — 멈춘 카드가 있으면 그 카드.
+  const focus = ws.find((w) => w.status === "failed") || ws[0] || null;
+  const mirror = {};
+  for (const k of AWAIT_FIELDS) mirror[k] = focus && focus[k] !== undefined ? focus[k] : null;
+  writeStatus({
+    ...mirror, workers: ws,
+    current: focus ? { key: focus.key, summary: focus.summary, step: focus.step, waitingSince: focus.waitStartedAt || null } : null,
+    step: focus ? focus.step : "", stepStartedAt: focus ? focus.stepStartedAt : null,
+  });
+}
+function setWorker(key, patch) {
+  WORKERS.set(key, { ...(WORKERS.get(key) || { key }), ...patch });
+  publishWorkers();
+}
+const workerSummary = () => [...WORKERS.values()].map((w) => `${w.key} · ${w.step}`).join(", ");
 // build 처럼 수십 분 걸리는 단계에서도 상태 파일이 갱신되도록 주기적으로 updatedAt 을 찍는다.
 // (이게 없으면 대시보드가 '마지막 갱신 11분 전' 로 보여 멈춘 것처럼 읽힌다)
 const HEARTBEAT_MS = 15000;
@@ -223,9 +254,9 @@ let terminating = false;
 for (const sig of ["SIGTERM", "SIGINT"]) {
   process.on(sig, async () => {
     if (terminating) return; terminating = true;
-    log(`중지 신호 — ${STATE.current ? `${STATE.current.key} ${STATE.step}` : "대기"} 에서 종료`);
-    await slack(`⏹ [${EPIC_KEY}] ${EPIC_LABEL} 연속 개발 중지됨${STATE.current ? ` (${STATE.current.key} · ${STATE.step})` : ""}`);
-    history(STATE.current && STATE.current.key, "stopped");
+    log(`중지 신호 — ${WORKERS.size ? workerSummary() : "대기"} 에서 종료`);
+    await slack(`⏹ [${EPIC_KEY}] ${EPIC_LABEL} 연속 개발 중지됨${WORKERS.size ? ` (${workerSummary()})` : ""}`);
+    if (WORKERS.size) for (const k of WORKERS.keys()) history(k, "stopped"); else history(EPIC_KEY, "stopped");
     finish("stopped", "사용자 중지", 130);
   });
 }
@@ -306,11 +337,11 @@ async function cardOpenPRs(key) {
 // 대시보드를 통해 이 카드의 자동화 PR 을 병합한다.
 // gh 로 직접 머지하지 않는 이유: 대시보드 병합 경로가 '병합 + 카드 완료 전환 + 완료 내역 최종 갱신 +
 // clone 정리' 를 함께 처리하기 때문. 카드가 완료돼야 await-merge 가 통과하므로 이 경로를 써야 한다.
-async function mergeViaDashboard() {
+async function mergeViaDashboard(key) {
   const dash = process.env.DASHBOARD_URL;
   if (!dash) return { ok: false, message: "DASHBOARD_URL 이 없어 자동 병합을 할 수 없습니다(대시보드 필요)." };
   try {
-    const r = await fetch(`${dash}/api/cards/${encodeURIComponent(STATE.current.key)}/merge?project=${encodeURIComponent(project.id)}`, {
+    const r = await fetch(`${dash}/api/cards/${encodeURIComponent(key)}/merge?project=${encodeURIComponent(project.id)}`, {
       method: "POST", headers: { "Content-Type": "application/json" }, body: "{}", signal: AbortSignal.timeout(300000),
     });
     const j = await r.json().catch(() => ({}));
@@ -421,7 +452,8 @@ async function waitCi(or, number) {
 // (봇이 쓴 자기 코멘트만 편집 — 마커 문자열을 바꾸고 무효 사유를 덧붙인다).
 async function supersedeApproval(or, number, marker, why) {
   const comments = await ghJsonStrict(["api", `repos/${or}/issues/${number}/comments?per_page=100`, "--jq", "[.[] | {id, body}]"]);
-  const file = path.join(STATE_DIR, `${EPIC_KEY}.ci-supersede.md`);
+  // 동시 실행 중 다른 카드의 무효화와 임시 파일이 겹치지 않게 PR 별로 둔다
+  const file = path.join(STATE_DIR, `${EPIC_KEY}.${or.replace(/[^\w.-]/g, "_")}-${number}.ci-supersede.md`);
   let n = 0;
   for (const c of (comments || [])) {
     const body = String((c && c.body) || "");
@@ -537,7 +569,7 @@ async function resolveConflictAndReview(task, pr, why) {
 // 사용자가 PR 을 모두 병합할 때까지 대기. 대시보드가 있으면 병합 동기화를 앞당겨 호출한다.
 // 자동 병합이 켜져 있으면, 대기 시간이 지나고 열린 PR 이 '모두 리뷰 승인' 된 경우 대신 병합한다.
 async function stepAwaitMerge(task) {
-  const waitStartedAt = STATE.stepStartedAt || nowIso();
+  const waitStartedAt = (WORKERS.get(task.key) || {}).stepStartedAt || nowIso();
   const o0 = readOpts();
   await slack(`⏳ [${EPIC_KEY}] ${task.key} PR 병합 대기 중 — 병합하면 다음 태스크로 넘어갑니다.`
     + (o0.autoMerge ? ` (승인 상태로 ${o0.autoMergeAfterMin}분 경과 시 자동 병합)` : "")
@@ -579,7 +611,7 @@ async function stepAwaitMerge(task) {
          { url: c0.url, label: "🔗 PR 열기" }, ...epicBtn("epic-stop")]);
     }
     // 대시보드·Slack 버튼이 남긴 즉시 해소 요청(대기 시간을 건너뛴다)
-    const reqd = takeConflictRequest();
+    const reqd = takeConflictRequest(task.key);
     if (reqd && reqd.key && reqd.key !== task.key) log(`충돌 해소 요청이 현재 태스크(${task.key})의 것이 아니라 무시합니다: ${reqd.key} ${reqd.owner}#${reqd.number}`);
     let manual = reqd && (!reqd.key || reqd.key === task.key) ? [{ owner: reqd.owner, number: reqd.number, url: "" }] : [];
     // 요청이 왔지만 이미 충돌이 없으면 돌리지 않는다 — 해소할 게 없으면 하위 스크립트가 비정상 종료해
@@ -634,7 +666,7 @@ async function stepAwaitMerge(task) {
     const d = prsErr ? { merge: false, reason: "pr-lookup-failed" }
       : lib.shouldAutoMerge(opts, waitStartedAt, openPRs, Date.now());
     if (prsErr) log(`PR 상태 조회 실패(다음 폴링에서 재시도): ${prsErr}`);
-    writeStatus({
+    setWorker(task.key, {
       waitStartedAt, autoMerge: opts.autoMerge, autoMergeAfterMin: opts.autoMergeAfterMin,
       autoMergeAt: d.dueMs ? new Date(d.dueMs).toISOString().replace(/\.\d{3}Z$/, "Z") : null,
       autoMergeState: d.reason,
@@ -642,13 +674,12 @@ async function stepAwaitMerge(task) {
       conflictSince, conflictState: cd.reason,
       conflictAt: cd.dueMs ? new Date(cd.dueMs).toISOString().replace(/\.\d{3}Z$/, "Z") : null,
       conflictPRs: conflicts.map((p) => `${p.owner}#${p.number}`),
-      current: { ...STATE.current, waitingSince: waitStartedAt },
     });
     if (d.merge && !autoMergeTried) {
       autoMergeTried = true;   // 한 번만 시도 — 실패하면 사람이 봐야 한다(무한 재시도로 PR 을 계속 두드리지 않는다)
       log(`${task.key} 승인 상태로 ${opts.autoMergeAfterMin}분 경과 → 자동 병합 시도 (PR ${openPRs.length}건)`);
       await slack(`🤖 [${EPIC_KEY}] ${task.key} — 리뷰 승인 후 ${opts.autoMergeAfterMin}분간 병합되지 않아 자동 병합합니다 (PR ${openPRs.length}건).`);
-      const r = await mergeViaDashboard();
+      const r = await mergeViaDashboard(task.key);
       if (r.ok) {
         log(`${task.key} 자동 병합 완료 (${r.merged}건${r.doneStatus ? ` · 카드 ${r.doneStatus}` : ""})`);
         await slack(`✅ [${EPIC_KEY}] ${task.key} 자동 병합 완료 — PR ${r.merged}건${r.doneStatus ? ` · 카드 ${r.doneStatus}` : ""}`);
@@ -678,74 +709,118 @@ const STEP_FN = { prepare: stepPrepare, plan: stepPlan, adopt: stepAdopt, build:
   await slack(`🧭 [${EPIC_KEY}] ${EPIC_LABEL} 연속 개발 시작 — ${epicSummary || ""} · repo ${epicRepos.map((r) => r.name).join(", ")}`);
   history(EPIC_KEY, "started");
 
-  // 재개 시 시작할 단계(대시보드 [이어서 진행]/[건너뛰기] 가 지정).
-  // 멈췄던 그 카드에만 적용한다 — 그 사이 사람이 카드를 끝냈으면 다음 카드는 처음부터 판정한다.
-  let resumeStep = process.env.EPIC_RESUME_STEP || "";
-  const resumeKey = process.env.EPIC_RESUME_KEY || "";
-  let doneCount = 0;
-
-  for (;;) {
-    if (stopRequested()) { await slack(`⏹ [${EPIC_KEY}] ${EPIC_LABEL} 연속 개발 중지됨`); history(EPIC_KEY, "stopped"); finish("stopped", "사용자 중지"); }
-
-    let children;
-    try { children = await fetchChildren(); }
-    catch (e) { await slack(`❌ [${EPIC_KEY}] 하위 태스크 조회 실패 — ${e.message}`); finish("paused", `하위 태스크 조회 실패: ${e.message}`, 1); }
-
-    const next = lib.nextEpicTask(children, cfg);
-    writeStatus({
-      total: doneCount + children.length,
-      index: doneCount,
-      tasks: lib.epicTaskStates(children, next),
-    });
-    if (!next) {
-      // 남은 카드가 전부 선행 대기면 완료가 아니다 — 멈추고 알린다(자동 재시도가 켜져 있으면 백오프로 다시 확인)
-      const blocked = lib.epicBlockedReason(children, cfg);
-      if (blocked) {
-        log(`중단: ${blocked}`);
-        await slack(`⏸ [${EPIC_KEY}] 남은 태스크가 모두 선행 카드를 기다립니다 — ${blocked}`, epicBtn("epic-resume", "epic-stop"));
-        history(EPIC_KEY, "paused");
-        finish("paused", blocked, 1, { pausedAt: nowIso(), current: null, step: "" });
-      }
-      break;   // 남은 하위 태스크 없음 → 에픽 완료
+  // 재개 지점(대시보드 [이어서 진행]/[건너뛰기] 가 지정) — 카드별 { key → step }.
+  // 멈췄던 그 카드에만 적용한다 — 그 사이 사람이 카드를 끝냈으면 그 카드는 목록에서 빠져 쓰이지 않는다.
+  const resumePoints = new Map();
+  try {
+    for (const p of JSON.parse(process.env.EPIC_RESUME_POINTS || "[]")) {
+      if (p && p.key && lib.EPIC_STEPS.includes(p.step)) resumePoints.set(String(p.key), p.step);
     }
+  } catch { log("재개 지점(EPIC_RESUME_POINTS) 파싱 실패 — 카드별로 단계를 다시 판정합니다"); }
+  // 예전 단일 재개 지점. 키가 없으면 첫 카드에 붙인다(예전 동작).
+  let legacyStep = "";
+  if (process.env.EPIC_RESUME_STEP && !resumePoints.size) {
+    if (process.env.EPIC_RESUME_KEY) resumePoints.set(process.env.EPIC_RESUME_KEY, process.env.EPIC_RESUME_STEP);
+    else legacyStep = process.env.EPIC_RESUME_STEP;
+  }
 
-    const useResume = resumeStep && (!resumeKey || resumeKey === next.key);
-    let step = useResume ? resumeStep : next.step;
-    resumeStep = "";
-    log(`태스크 ${next.key} — ${next.summary} (시작 단계: ${step})`);
-    await slack(`▶️ [${EPIC_KEY}] ${next.key} 처리 시작 (${doneCount + 1}/${doneCount + children.length}) · ${next.summary}`);
+  // 카드 콜백에서 보낸 알림 — 스케줄러를 붙잡지 않되, 종료 전에는 다 나가게 기다린다(순서 역전·유실 방지).
+  const sent = new Set();
+  const notify = (text, actions) => { const p = slack(text, actions).finally(() => sent.delete(p)); sent.add(p); };
+  const flush = () => Promise.allSettled([...sent]);
 
-    let task = next;
+  // 카드 한 장을 시작 단계부터 끝(병합)까지. 실패·중지는 결과로 돌려주고 프로세스를 끝내지 않는다 —
+  // 함께 돌던 카드들의 처리는 스케줄러(lib.runEpicSlots)가 정한다.
+  async function runTask(task0, startStep) {
+    let task = task0, step = startStep;
     // 어느 단계에서 시작하든 라벨부터 이번 실행 기준으로 맞춘다(prepare 를 건너뛰는 카드 포함).
     try {
       const sync = await syncTaskLabels(task);
       if (sync.changed) log(`${task.key} · ${sync.note}`);
     } catch (e) { log(`${task.key} · 라벨 동기화 실패(계속 진행): ${e.message}`); }
-
     while (step) {
-      if (stopRequested()) { await slack(`⏹ [${EPIC_KEY}] ${EPIC_LABEL} 연속 개발 중지됨 (${task.key} · ${step})`); history(task.key, "stopped"); finish("stopped", "사용자 중지"); }
-      writeStatus({ step, stepStartedAt: nowIso(), current: { key: task.key, summary: task.summary, step } });
+      if (stopRequested()) return { stop: true, step };
+      setWorker(task.key, { summary: task.summary, step, stepStartedAt: nowIso(), status: "running", reason: "", ...AWAIT_RESET });
       log(`${task.key} · ${step} …`);
       let r;
       try { r = await STEP_FN[step](task); }
       catch (e) { r = { ok: false, reason: `${step} 오류: ${String((e && e.message) || e)}` }; }
-      if (r && r.stop) { await slack(`⏹ [${EPIC_KEY}] ${EPIC_LABEL} 연속 개발 중지됨 (${task.key} · ${step})`); history(task.key, "stopped"); finish("stopped", "사용자 중지"); }
-      if (!r || !r.ok) {
-        const reason = (r && r.reason) || `${step} 실패`;
-        log(`중단: ${reason}`);
-        await slack(`⏸ [${EPIC_KEY}] ${task.key} · ${step} 에서 중단 — ${reason}`, epicBtn("epic-resume", "epic-skip", "epic-stop"));
-        history(task.key, "paused");
-        finish("paused", `${task.key} · ${step}: ${reason}`, 1, { lastError: r.lastError || "", pausedAt: nowIso() });
-      }
+      if (r && r.stop) return { stop: true, step };
+      if (!r || !r.ok) return { ok: false, step, reason: (r && r.reason) || `${step} 실패`, lastError: (r && r.lastError) || "" };
       if (r.note) log(`${task.key} · ${step} ✓ ${r.note}`);
       step = lib.nextEpicStep(step);
       if (step) { try { task = { ...task, ...(await fetchTask(task.key)) }; } catch {} }
     }
+    return { ok: true };
+  }
 
-    doneCount += 1;
-    log(`태스크 ${task.key} 완료 (${doneCount})`);
-    await slack(`✅ [${EPIC_KEY}] ${task.key} 완료 — 다음 태스크로 진행합니다.`);
-    history(task.key, "task-done");
+  const res = await lib.runEpicSlots({
+    cfg,
+    pollMs: 60000,   // 카드가 끝날 때 외에도 주기적으로 본다(선행 해제·카드 추가·동시 실행 수 변경 반영)
+    fetchChildren,
+    capacity: () => 1 + readOpts().parallelExtra,
+    stopRequested,
+    runTask,
+    preferKeys: () => [...resumePoints.keys()],
+    startStep: (t) => {
+      const step = resumePoints.get(t.key) || legacyStep || t.step;
+      resumePoints.delete(t.key); legacyStep = "";
+      return step;
+    },
+    onStart: (t, step, { active, total, cap }) => {
+      const n = active.length + 1;
+      log(`태스크 ${t.key} — ${t.summary} (시작 단계: ${step})${cap > 1 ? ` · 동시 ${n}/${cap}` : ""}`);
+      notify(`▶️ [${EPIC_KEY}] ${t.key} 처리 시작 (${(STATE.index || 0) + n}/${total})${cap > 1 ? ` · 동시 ${n}/${cap}` : ""} · ${t.summary}`);
+      setWorker(t.key, { summary: t.summary, step, stepStartedAt: nowIso(), status: "running", reason: "", ...AWAIT_RESET });
+    },
+    onEnd: (r, { active, doneCount }) => {
+      if (r.stop) { setWorker(r.key, { status: "stopped", step: r.step }); return; }
+      if (!r.ok) {
+        setWorker(r.key, { status: "failed", step: r.step, reason: r.reason });
+        log(`중단: ${r.key} · ${r.step}: ${r.reason}`);
+        history(r.key, "paused");
+        if (active.length) {
+          notify(`⏸ [${EPIC_KEY}] ${r.key} · ${r.step} 에서 중단 — ${r.reason}\n새 태스크는 시작하지 않고, 진행 중인 ${active.length}건(${active.join(", ")})이 끝나면 멈춥니다.`);
+        }
+        return;
+      }
+      WORKERS.delete(r.key); publishWorkers();
+      writeStatus({ index: doneCount });
+      log(`태스크 ${r.key} 완료 (${doneCount})`);
+      notify(`✅ [${EPIC_KEY}] ${r.key} 완료 — 다음 태스크로 진행합니다.`);
+      history(r.key, "task-done");
+    },
+    onFetchError: (e, active) => log(`하위 태스크 조회 실패(진행 중 ${active.length}건은 계속, 다음 폴링에서 재시도): ${e.message}`),
+    onTasks: (children, activeKeys, total) => writeStatus({
+      total, index: STATE.index || 0, parallel: 1 + readOpts().parallelExtra, tasks: lib.epicTaskStates(children, activeKeys),
+    }),
+  });
+  await flush();
+  const doneCount = res.doneCount;
+
+  if (res.outcome === "fetch-failed") {
+    const msg = String((res.error && res.error.message) || res.error);
+    await slack(`❌ [${EPIC_KEY}] 하위 태스크 조회 실패 — ${msg}`);
+    finish("paused", `하위 태스크 조회 실패: ${msg}`, 1);
+  }
+  if (res.outcome === "stopped") {
+    await slack(`⏹ [${EPIC_KEY}] ${EPIC_LABEL} 연속 개발 중지됨${WORKERS.size ? ` (${workerSummary()})` : ""}`);
+    if (WORKERS.size) for (const k of WORKERS.keys()) history(k, "stopped"); else history(EPIC_KEY, "stopped");
+    finish("stopped", "사용자 중지");
+  }
+  if (res.outcome === "paused") {
+    // 실패 카드만 남아 있다(WORKERS) — 각자 멈춘 단계가 재개 지점이다.
+    const fs0 = res.failures;
+    await slack(`⏸ [${EPIC_KEY}] ${fs0.map((f) => `${f.key} · ${f.step}`).join(", ")} 에서 중단 — ${fs0.map((f) => f.reason).join(" / ")}`,
+      epicBtn("epic-resume", "epic-skip", "epic-stop"));
+    finish("paused", fs0.map((f) => `${f.key} · ${f.step}: ${f.reason}`).join(" / "), 1, { lastError: fs0[0].lastError || "", pausedAt: nowIso() });
+  }
+  if (res.outcome === "blocked") {
+    // 남은 카드가 전부 선행 대기면 완료가 아니다 — 멈추고 알린다(자동 재시도가 켜져 있으면 백오프로 다시 확인)
+    log(`중단: ${res.blocked}`);
+    await slack(`⏸ [${EPIC_KEY}] 남은 태스크가 모두 선행 카드를 기다립니다 — ${res.blocked}`, epicBtn("epic-resume", "epic-stop"));
+    history(EPIC_KEY, "paused");
+    finish("paused", res.blocked, 1, { pausedAt: nowIso(), current: null, step: "" });
   }
 
   log(`${EPIC_LABEL} 완료 — 하위 태스크 ${doneCount}건 처리`);

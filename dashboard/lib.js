@@ -445,23 +445,55 @@ function epicTaskStep(task, cfg) {
   if (!labels.includes(c.answeredLabel || "claude-answered")) return "adopt";
   return "build";
 }
+// 빈 슬롯에 넣을 태스크 최대 n 건(순위순, 선행이 덜 끝난 카드·exclude 키는 건너뜀).
+// prefer 키(재개 지점이 남은 카드)는 순위와 무관하게 먼저 고른다 — 동시 실행 수를 줄인 뒤 재개해도
+// 멈췄던 카드가 순위 뒤라는 이유로 밀려나 '재개 지점'이 버려지지 않게 한다.
+function pickEpicTasks(tasks, cfg, n, exclude, prefer) {
+  const skip = new Set(exclude || []);
+  const first = new Set(prefer || []);
+  const ok = [];
+  for (const t of tasks || []) {
+    if (skip.has(t.key) || pendingBlockers(t).length) continue;
+    const step = epicTaskStep(t, cfg);
+    if (step) ok.push({ ...t, step });
+  }
+  ok.sort((a, b) => (first.has(b.key) ? 1 : 0) - (first.has(a.key) ? 1 : 0));
+  return ok.slice(0, Math.max(0, n || 0));
+}
 // 다음에 처리할 태스크(순위순으로 처리할 게 남은 첫 카드, 선행이 덜 끝난 카드는 건너뜀).
 // null 이면 에픽 완료이거나 남은 카드가 전부 선행 대기 — epicBlockedReason 으로 구분한다.
 function nextEpicTask(tasks, cfg) {
-  for (const t of tasks || []) {
-    if (pendingBlockers(t).length) continue;
-    const step = epicTaskStep(t, cfg);
-    if (step) return { ...t, step };
-  }
-  return null;
+  return pickEpicTasks(tasks, cfg, 1)[0] || null;
 }
-// 대시보드·상태 파일용 카드별 상태. waitingOn: 아직 안 끝난 선행 카드 키.
-function epicTaskStates(tasks, next) {
+// 대시보드·상태 파일용 카드별 상태. active: 지금 돌고 있는 태스크(하나 또는 배열). waitingOn: 아직 안 끝난 선행 카드 키.
+function epicTaskStates(tasks, active) {
+  const cur = new Set((Array.isArray(active) ? active : [active]).filter(Boolean).map((t) => (typeof t === "string" ? t : t.key)));
   return (tasks || []).map((t) => {
     const waitingOn = pendingBlockers(t).map((b) => b.key);
-    const state = next && t.key === next.key ? "current" : waitingOn.length ? "blocked" : "pending";
+    const state = cur.has(t.key) ? "current" : waitingOn.length ? "blocked" : "pending";
     return { key: t.key, summary: t.summary, status: t.status, state, waitingOn };
   });
+}
+// 동시 실행 — 선행이 없는 카드는 '1 + 추가 동시 실행 수' 개까지 함께 돈다. 0 이면 예전처럼 순차.
+// 카드마다 clone(<repo>-<KEY>)·락이 따로라 작업 공간은 안 부딪친다. 상한은 사용량 한도·리뷰 부담 때문.
+const EPIC_PARALLEL_EXTRA_MAX = 4;
+function clampParallelExtra(v) {
+  const n = parseInt(v, 10);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return Math.min(n, EPIC_PARALLEL_EXTRA_MAX);
+}
+// 중단·중지된 실행의 재개 지점 [{key, step}]. 동시 실행이면 카드마다 멈춘 단계가 다르다(workers).
+// 예전 상태 파일(current/step 하나)도 그대로 읽는다. skip 이면 각자 다음 단계부터 — 마지막 단계라
+// 건너뛸 곳이 없는 카드는 빠진다(그 카드는 다시 판정해 처음 단계부터 본다).
+function epicResumePoints(st, skip) {
+  const s = st || {};
+  const ws = Array.isArray(s.workers) && s.workers.length
+    ? s.workers.map((w) => ({ key: w && w.key, step: w && w.step }))
+    : [{ key: s.current && s.current.key, step: s.step }];
+  return ws
+    .filter((w) => w.key && w.step)
+    .map((w) => ({ key: String(w.key), step: skip ? nextEpicStep(w.step) : String(w.step) }))
+    .filter((w) => w.step);
 }
 // 처리할 카드가 남았는데 전부 선행 대기면 그 사유, 아니면 "".
 // 에픽 안의 선행은 순서상 먼저 끝나므로, 여기 걸리는 건 에픽 밖 선행이거나 순환 링크다.
@@ -469,6 +501,69 @@ function epicBlockedReason(tasks, cfg) {
   const stuck = (tasks || []).filter((t) => epicTaskStep(t, cfg) && pendingBlockers(t).length);
   if (!stuck.length || nextEpicTask(tasks, cfg)) return "";
   return "선행 대기: " + stuck.map((t) => `${t.key} ← ${pendingBlockers(t).map((b) => `${b.key}(${b.status})`).join(", ")}`).join(" · ");
+}
+// 에픽 슬롯 스케줄러 — 선행이 없는 카드를 capacity() 장까지 함께 돌린다. 부수효과는 전부 훅으로 받는다
+// (러너는 Jira·gh·Slack 을 붙이고, 테스트는 가짜 카드로 순서·동시성·중단 규칙을 검증한다).
+//   h.fetchChildren()        미완료 하위 태스크(순위순). 실패하면 throw
+//   h.capacity()             지금 허용 동시 실행 수(>=1, 매 회 다시 읽음)
+//   h.stopRequested()        중지 요청 여부
+//   h.runTask(task, step)    카드 한 장을 끝까지 → { ok } | { ok:false, step, reason, lastError } | { stop:true, step }
+//   h.startStep(task)        시작 단계(재개 지점 반영). h.preferKeys() 는 먼저 고를 카드 키
+//   h.onStart(task, step, { active, total }) / h.onEnd(r, { active, doneCount }) / h.onFetchError(e, active)
+//   h.onTasks(children, activeKeys, total)   목록·진행 상태 갱신
+// 규칙: 실패가 하나라도 나오면 새 카드는 안 띄우고, 돌던 카드가 다 끝나면 paused. 병합 대기도 슬롯을 차지한다
+// (runTask 가 병합까지 끝나야 돌아오므로).
+// 반환 { outcome: "done"|"blocked"|"paused"|"stopped"|"fetch-failed", doneCount, failures, blocked, error }
+async function runEpicSlots(h) {
+  const active = new Map();
+  const failures = [];
+  let doneCount = 0, stopping = false, wake = null;
+  const pollMs = h.pollMs == null ? 60000 : h.pollMs;
+  const settle = (r) => {
+    active.delete(r.key);
+    if (r.stop) stopping = true;
+    else if (!r.ok) failures.push(r);
+    else doneCount += 1;
+    if (h.onEnd) h.onEnd(r, { active: [...active.keys()], doneCount });
+    if (wake) { const w = wake; wake = null; w(); }
+  };
+  for (;;) {
+    if (h.stopRequested && h.stopRequested()) stopping = true;
+    const cap = Math.max(1, h.capacity ? h.capacity() : 1);
+    if (!stopping && !failures.length && active.size < cap) {
+      let children = null;
+      try { children = await h.fetchChildren(); }
+      catch (e) {
+        if (!active.size) return { outcome: "fetch-failed", doneCount, failures, error: e };
+        if (h.onFetchError) h.onFetchError(e, [...active.keys()]);
+      }
+      if (children) {
+        const total = doneCount + children.length;
+        const picks = pickEpicTasks(children, h.cfg, cap - active.size, [...active.keys()], h.preferKeys ? h.preferKeys() : []);
+        for (const t of picks) {
+          const step = h.startStep ? h.startStep(t) : t.step;
+          if (h.onStart) h.onStart(t, step, { active: [...active.keys()], total, cap });
+          const key = t.key;
+          const p = Promise.resolve()
+            .then(() => h.runTask(t, step))
+            .catch((e) => ({ ok: false, step, reason: `오류: ${String((e && e.message) || e)}` }))
+            .then((r) => settle({ ...(r || { ok: false, step, reason: "결과 없음" }), key }));
+          active.set(key, p);
+        }
+        if (h.onTasks) h.onTasks(children, [...active.keys()], total);
+        if (!active.size) {
+          const blocked = epicBlockedReason(children, h.cfg);
+          return blocked ? { outcome: "blocked", doneCount, failures, blocked } : { outcome: "done", doneCount, failures };
+        }
+      }
+    }
+    if (!active.size) {
+      if (stopping) return { outcome: "stopped", doneCount, failures };
+      if (failures.length) return { outcome: "paused", doneCount, failures };
+      continue;
+    }
+    await new Promise((r) => { wake = r; if (pollMs > 0) setTimeout(() => { if (wake === r) { wake = null; r(); } }, pollMs); });
+  }
 }
 // 이번 단계 다음 단계(마지막이면 null)
 function nextEpicStep(step) {
@@ -806,7 +901,8 @@ module.exports = {
   ciCheckState, ciStateOf, ciStateWithRuns, failedChecks, runIdFromCheckUrl,
   CI_LOOP_MAX_DEFAULT, CI_LOOP_MAX_LIMIT, clampCiLoopMax,
   SUGGEST_MARK, parseSuggestedAnswers,
-  EPIC_STEPS, epicChildrenJql, searchEpicChildren, epicBlockers, epicTaskStep, nextEpicTask, epicTaskStates, epicBlockedReason, nextEpicStep, buildAdoptedAnswerBody, prBelongsToCard,
+  EPIC_STEPS, epicChildrenJql, searchEpicChildren, epicBlockers, epicTaskStep, pickEpicTasks, nextEpicTask, epicTaskStates, epicBlockedReason, nextEpicStep,
+  EPIC_PARALLEL_EXTRA_MAX, clampParallelExtra, epicResumePoints, runEpicSlots, buildAdoptedAnswerBody, prBelongsToCard,
   EPIC_HIERARCHY_LEVEL, EPIC_LABEL_FALLBACK, topLevelIssueTypes, epicSearchJql, epicTypeLabel,
   EPIC_AUTO_MERGE_MIN_DEFAULT, EPIC_AUTO_MERGE_MIN_LIMIT, clampAutoMergeMin, shouldAutoMerge, mergeReadyState, isMergeReady, ciFixTargets,
   EPIC_CONFLICT_MIN_DEFAULT, EPIC_CONFLICT_MIN_LIMIT, clampConflictMin, isConflicting, conflictingPRs, shouldAutoResolveConflict,
