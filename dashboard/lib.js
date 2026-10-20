@@ -395,15 +395,17 @@ function epicTypeLabel(types) {
 // ci 는 build(+리뷰 승인 루프) 와 approve 사이에 있다. CI 를 고치면 코드가 바뀌므로 그 자리에서
 // 리뷰 루프를 다시 태우고, 뒤따르는 approve 가 '최종 승인 마커' 를 확인하는 순서가 된다.
 const EPIC_STEPS = ["prepare", "plan", "adopt", "build", "ci", "approve", "await-merge"];
-// 하위 태스크 조회 JQL — 미완료(완료 상태·Done 카테고리 제외) 전부, Jira 순위(Rank)순.
+// 하위 태스크 조회 JQL — 내게 할당된 미완료(완료 상태·Done 카테고리 제외) 카드, Jira 순위(Rank)순.
 // 처리 순서는 사람이 Jira 백로그에서 끌어다 놓은 순서를 그대로 따른다.
+// 남의 카드·미할당 카드는 목록에서도 빠지고 처리도 안 한다. 선행(is blocked by)으로 걸린 남의 카드는
+// issuelinks 로 계속 보므로, 그 카드가 끝날 때까지는 기다린다.
 // link: "parent"(기본) 또는 "epic-link" — 구형 company-managed 프로젝트는 'Epic Link' 만 먹는다.
 // order: "rank"(기본) 또는 "created" — Rank 필드가 없는 프로젝트(비즈니스 템플릿 등) 폴백.
 function epicChildrenJql(epicKey, cfg, link, order) {
   const done = effectiveDoneStatuses(cfg || {});
   const excl = done.length ? ` AND status NOT IN (${done.map((s) => `"${s}"`).join(", ")})` : "";
   const clause = link === "epic-link" ? `"Epic Link" = "${epicKey}"` : `parent = "${epicKey}"`;
-  return `${clause} AND statusCategory != Done${excl} ORDER BY ${order === "created" ? "created" : "Rank"} ASC`;
+  return `${clause} AND assignee = currentUser() AND statusCategory != Done${excl} ORDER BY ${order === "created" ? "created" : "Rank"} ASC`;
 }
 // 하위 조회를 (link, order) 조합 순서대로 시도한다. 성공한 조합부터 다시 시작하도록 돌려준다.
 // search: jql => Promise<data>. 폴백은 JQL 오류(HTTP 400)일 때만 — 네트워크 오류로 폴백하면

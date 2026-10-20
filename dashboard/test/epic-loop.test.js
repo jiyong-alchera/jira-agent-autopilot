@@ -19,6 +19,7 @@ test("epicChildrenJql: 미완료 하위를 Jira 순위(Rank)순으로 조회", (
   const jql = lib.epicChildrenJql("EKYB-800", CFG);
   assert.match(jql, /^parent = "EKYB-800"/);
   assert.match(jql, /statusCategory != Done/);
+  assert.match(jql, /AND assignee = currentUser\(\) AND/);
   assert.match(jql, /status NOT IN \("DEV COMPLETED"\)/);
   assert.match(jql, /ORDER BY Rank ASC$/);
 });
@@ -26,6 +27,14 @@ test("epicChildrenJql: 미완료 하위를 Jira 순위(Rank)순으로 조회", (
 test("epicChildrenJql: Rank 가 없는 프로젝트용 생성순 폴백", () => {
   assert.match(lib.epicChildrenJql("EKYB-800", CFG, "parent", "created"), /ORDER BY created ASC$/);
   assert.match(lib.epicChildrenJql("EKYB-800", CFG, "epic-link", "created"), /^"Epic Link" = "EKYB-800".*ORDER BY created ASC$/);
+});
+
+test("epicChildrenJql: 내게 할당된 카드만 — 남의 카드·미할당 카드는 조회·처리 대상이 아니다", () => {
+  for (const [link, order] of [["parent", "rank"], ["parent", "created"], ["epic-link", "rank"], ["epic-link", "created"]]) {
+    const jql = lib.epicChildrenJql("EKYB-800", CFG, link, order);
+    assert.match(jql, /assignee = currentUser\(\)/, `${link}/${order}`);
+    assert.doesNotMatch(jql, /assignee IS EMPTY/, `${link}/${order}`);
+  }
 });
 
 test("searchEpicChildren: 실패하면 Rank→생성순, parent→Epic Link 순으로 폴백하고 성공 조합을 돌려준다", async () => {

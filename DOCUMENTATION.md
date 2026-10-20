@@ -299,10 +299,13 @@ Jira 카드를 자동으로 탐지해 **Claude가 개발 → PR 생성 → 카�
 
 #### 4.3d run-epic-loop.js (에픽 연속 개발 — 하위 태스크 순차 자동화)
 
-대시보드 **'에픽(워크스트림) 연속 개발'** 패널이 실행하는 러너. 한 상위 카드의 **미완료 하위 태스크를 Jira 순위(Rank)순으로**
+대시보드 **'에픽(워크스트림) 연속 개발'** 패널이 실행하는 러너. 한 상위 카드의 **내게 할당된 미완료 하위 태스크를 Jira 순위(Rank)순으로**
 (기본 한 건씩, 추가 동시 실행 수만큼 함께) 개발 → PR → 리뷰 승인 → (사람의) 병합까지 이어가고, 병합되면 **자동으로 다음 태스크**로 넘어간다.
 하위 태스크를 다 채우면 종료한다. 기존 자산(단건 plan/build 실행 · 승인까지 리뷰 루프 ·
 외부 병합 자동 감지 · `repo_<name>` 라벨)을 그대로 오케스트레이션하며, 새로 만드는 것은 순서 제어뿐이다.
+하위 태스크 조회 JQL(`lib.epicChildrenJql`)에 `assignee = currentUser()` 가 붙어 있어, **담당자가 남이거나 비어 있는 카드는
+패널 목록에도 안 보이고 처리도 하지 않는다**(Jira 자격증명 계정 = '나'). 단 그런 카드가 내 카드의 선행(`is blocked by`)이면
+선행 판정은 issuelinks 로 계속 하므로, 그 카드가 완료될 때까지 내 카드는 기다린다.
 
 상위 카드가 **에픽인지 워크스트림인지는 러너에 영향이 없다** — 하위는 `parent = <KEY>` 로 찾기 때문.
 표시 이름만 대시보드가 `EPIC_LABEL` 로 넘겨 로그·Slack·자동 채택 코멘트 문구에 쓴다(기본 `에픽`).
@@ -542,7 +545,7 @@ CI 가 끝난 뒤 에픽 러너의 '병합만 남음' 알림이 또 와서 그�
 | GET | `/api/cards/:key/review-loop` | 루프 상태 조회(대시보드 5초 폴링) — `{running, pid, owner, number, iter, max, step, stopping, startedAt}`. `.state/<KEY>.reviewloop.json` + 락 PID 생존 확인, 죽은 PID 의 스테일 락·상태파일은 정리 |
 | POST | `/api/cards/:key/review-loop/stop` | **루프 즉시 중지** — `.reviewloop.stop` 플래그를 먼저 쓴 뒤(다음 회차 차단 + 하위 종료를 '실패'로 오인 방지) 루프 프로세스 트리를 SIGTERM→6초 후 SIGKILL·락 정리. 이력에 `review-loop/stopped` 기록 |
 | GET | `/api/epics` | 프로젝트의 **에픽 계층(`hierarchyLevel` 1) 카드 목록**(`{key,summary,status}`) + 그 계층의 표시 이름 `label`(에픽·워크스트림 …) — 연속 개발 시작 폼용. **JQL 은 타입 id 로 조회한다**(아래 주의) |
-| GET | `/api/epics/:key/children` | 상위 카드의 **미완료 하위 태스크(Jira 순위순)** + 각 카드의 시작 단계(`step`) · **선행 카드 `blockedBy[]`(`{key,status,done}`)와 미완료 선행 키 `waitingOn[]`**. Rank 정렬 실패 시 생성순, `parent` 절 실패 시 `"Epic Link"` 로 폴백(`lib.searchEpicChildren`). 각 태스크에 **`assignedToMe`**(내 accountId 와 assignee 비교, `/myself` 판별) · `assignee`(표시명) · `url`(Jira 링크)를 함께 반환 — 연속 개발 패널에서 태스크를 펼쳐 카드 상세를 볼 때 '답변 등록' 노출 여부를 가른다 |
+| GET | `/api/epics/:key/children` | 상위 카드의 **내게 할당된 미완료 하위 태스크(Jira 순위순, `assignee = currentUser()` — 남의·미할당 카드 제외)** + 각 카드의 시작 단계(`step`) · **선행 카드 `blockedBy[]`(`{key,status,done}`)와 미완료 선행 키 `waitingOn[]`**. Rank 정렬 실패 시 생성순, `parent` 절 실패 시 `"Epic Link"` 로 폴백(`lib.searchEpicChildren`). 각 태스크에 **`assignedToMe`**(내 accountId 와 assignee 비교, `/myself` 판별) · `assignee`(표시명) · `url`(Jira 링크)를 함께 반환 — 연속 개발 패널에서 태스크를 펼쳐 카드 상세를 볼 때 '답변 등록' 노출 여부를 가른다 |
 | GET | `/api/epics/:key/run` | **에픽 연속 개발 상태**(대시보드 5초 폴링) — `{running,pid,status,reason,step,index,total,current,tasks,repos}`. 락 PID 생존 확인 + 스테일 락 정리, 락 없이 `running` 인 상태 파일은 `paused` 로 정규화(크래시 복구). 중단 상태면 `retry`(`{attempt,max,willRetry,at,kind,label,why,source}`)로 **자동 재시도 예정/미실행 사유**를 함께 준다 |
 | POST | `/api/epics/:key/run` | **에픽 연속 개발 시작** — body `{repos:[name], reviewLoopMax?, autoMerge?, autoMergeAfterMin?, autoRetry?, autoRetryMax?, autoResolveConflict?, conflictAfterMin?, parallelExtra?}`. `run-epic-loop.js` 를 detached 로 띄워 하위 태스크를 Jira 순위순으로 처리(`parallelExtra` 0~4 — 선행 없는 카드를 1+N 건까지 함께)([4.3d](#43d-run-epic-loopjs-에픽-연속-개발--하위-태스크-순차-자동화)). 에픽당 1개만 실행. repo 미선택이면 거부 |
 | POST | `/api/epics/:key/run/resume` | **멈춘 지점부터 이어서 진행** — body `{skip?}`. `skip:true` 면 멈춘 단계를 건너뛰고 다음 단계부터(동시 실행이면 멈춘 카드 전부 각자). `paused`/`stopped` 상태에서만 수용하며, 재개 단계는 멈췄던 그 카드에만 적용(카드별 `EPIC_RESUME_POINTS`). 응답 `resumedAt` 은 `K-1 · ci, K-3 · build` 형식. **대상 repo 는 상태 파일에 기록된 시작 시점 값**을 그대로 쓴다(요청 body 로 못 바꾼다). 기록이 비어 있으면 **전체로 넓히지 않고 거부**한다 |

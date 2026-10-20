@@ -12,7 +12,7 @@ plan(질문) → build(개발·PR·완료처리) 두 루프로 처리합니다. 
 | `detect-cards.sh` | JQL 로 plan/build 대상 카드 키 목록을 탐지 (claude + Atlassian MCP) |
 | `loop-plan.sh` | 1시간마다 plan 대상 탐지 → 카드별 병렬 plan 실행 |
 | `loop-build.sh` | 1시간마다 build 대상 탐지 → 카드별 병렬 build 실행 |
-| `run-epic-loop.js` | 상위 카드(에픽·워크스트림) 하나의 미완료 하위 태스크를 **Jira 순위(Rank)순으로**(기본 한 건씩, 설정하면 여러 건 동시에) 끝까지 처리 (대시보드 '연속 개발' 패널) |
+| `run-epic-loop.js` | 상위 카드(에픽·워크스트림) 하나의 **내게 할당된** 미완료 하위 태스크를 **Jira 순위(Rank)순으로**(기본 한 건씩, 설정하면 여러 건 동시에) 끝까지 처리 (대시보드 '연속 개발' 패널) |
 
 ## 상태 머신 (카드가 흐르는 단계)
 
