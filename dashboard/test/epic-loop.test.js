@@ -707,3 +707,14 @@ test("runEpicSlots: 재개 지점 카드는 먼저, 그 카드의 멈춘 단계�
   await lib.runEpicSlots(f.h);
   assert.deepEqual(steps, ["K-3:ci", "K-1:prepare", "K-2:prepare"]);
 });
+
+test("rebaseMergeUnsupported: 병합 '방식' 거절만 merge commit 재시도 대상 — 충돌·권한·CI 는 아니다", () => {
+  assert.ok(lib.rebaseMergeUnsupported("GraphQL: This branch can't be rebased (mergePullRequest)"));
+  assert.ok(lib.rebaseMergeUnsupported("This branch cannot be rebased due to conflicts"));
+  assert.ok(lib.rebaseMergeUnsupported("GraphQL: Rebase merges are not allowed on this repository (mergePullRequest)"));
+  assert.ok(!lib.rebaseMergeUnsupported("GraphQL: Pull Request is not mergeable (mergePullRequest)"));
+  assert.ok(!lib.rebaseMergeUnsupported("GraphQL: Resource not accessible by integration"));
+  assert.ok(!lib.rebaseMergeUnsupported("Required status check \"ci\" is failing"));
+  assert.ok(!lib.rebaseMergeUnsupported(""));
+  assert.ok(!lib.rebaseMergeUnsupported(undefined));
+});

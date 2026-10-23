@@ -893,6 +893,13 @@ function slackActorAllowed(cred, userId) {
   return list.includes(String(userId || ""));
 }
 
+// rebase 병합이 '방식' 때문에 거절됐는지(충돌·권한·CI 가 아니라). 브랜치에 merge 커밋이 있으면
+// GitHub 가 "This branch can't be rebased" 로 거절하고, repo 가 rebase 병합을 꺼 두면
+// "Rebase merges are not allowed" 로 거절한다 — 이때만 merge commit 방식으로 다시 시도한다.
+function rebaseMergeUnsupported(stderr) {
+  return /can(?:'|no)t be rebased|rebase merges? (?:is|are) not allowed/i.test(String(stderr || ""));
+}
+
 module.exports = {
   DEFAULT_CREDS, readJson, writeJson, slugify, triggerClause, detectJql,
   adfToText, adfSegments, toADF, mdInline, mdToADF, buildReplyADF, maskCreds, applyCreds, createStore, doneStatusList, effectiveDoneStatuses,
@@ -912,4 +919,5 @@ module.exports = {
   EPIC_RETRY_MAX_DEFAULT, EPIC_RETRY_MAX_LIMIT, EPIC_RETRY_BACKOFF_MIN, clampRetryMax,
   parseUsageLimitReset, classifyPause, planRetry,
   SLACK_ACTIONS, SLACK_ACTION_PREFIX, encodeSlackAction, decodeSlackAction, slackMessage, slackActorAllowed,
+  rebaseMergeUnsupported,
 };

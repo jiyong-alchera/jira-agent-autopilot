@@ -1271,7 +1271,11 @@ app.post("/api/cards/:key/merge", async (req, res) => {
           : `${pr.repo} #${pr.number}: CI 가 아직 진행 중이라 병합하지 않았습니다`);
         continue;
       }
-      const r = await gh(["pr", "merge", String(pr.number), "--repo", pr.owner, "--rebase", "--delete-branch"], cred);
+      let r = await gh(["pr", "merge", String(pr.number), "--repo", pr.owner, "--rebase", "--delete-branch"], cred);
+      // merge 커밋이 섞인 브랜치는 rebase 병합이 안 된다 — 충돌이 아니므로 merge commit 으로 다시 시도.
+      if (!r.ok && lib.rebaseMergeUnsupported(r.stderr)) {
+        r = await gh(["pr", "merge", String(pr.number), "--repo", pr.owner, "--merge", "--delete-branch"], cred);
+      }
       if (r.ok) { mergedUrls.push(pr.url); branches.push(pr.branch); } else errors.push(`${pr.repo} #${pr.number}: ${(r.stderr || "").trim().slice(0, 160)}`);
     }
     let doneStatus = null, removed = [];
