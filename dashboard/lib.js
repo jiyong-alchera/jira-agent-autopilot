@@ -497,6 +497,38 @@ function epicResumePoints(st, skip) {
     .map((w) => ({ key: String(w.key), step: skip ? nextEpicStep(w.step) : String(w.step) }))
     .filter((w) => w.step);
 }
+// 전 프로젝트 에픽 실행 개요(대시보드 '진행 중인 에픽' 영역). 실행 중·중단·중지만 남기고(완료·idle 제외)
+// 실행 중을 먼저, 그 안에서는 최근 갱신순. 카드별 행은 workers, 없으면 예전 단일 필드(current/step)로 채운다.
+// 프로젝트들이 cloneBase(.state)를 공유하면 같은 상태 파일이 프로젝트마다 잡히므로 에픽 키로 한 번만 —
+// 상태 파일에 적힌 project 와 맞는 쪽을 쓴다.
+const EPIC_RUN_VISIBLE = ["running", "paused", "stopped"];
+function summarizeEpicRuns(entries) {
+  const byEpic = new Map();
+  for (const e of entries || []) {
+    const st = (e && e.run) || {};
+    const k = st.epic || (e && e.key);
+    const prev = byEpic.get(k);
+    if (!prev || (st.project && e.project === st.project && prev.project !== st.project)) byEpic.set(k, e);
+  }
+  const out = [];
+  for (const e of byEpic.values()) {
+    const st = (e && e.run) || {};
+    if (!EPIC_RUN_VISIBLE.includes(st.status)) continue;
+    const ws = Array.isArray(st.workers) && st.workers.length
+      ? st.workers
+      : (st.current && st.current.key ? [{ key: st.current.key, summary: st.current.summary, step: st.step, stepStartedAt: st.stepStartedAt, status: st.status === "running" ? "running" : "failed" }] : []);
+    out.push({
+      project: e.project, projectName: e.projectName || e.project,
+      epic: st.epic || e.key, label: st.label || "", status: st.status, running: !!st.running, stopping: !!st.stopping,
+      reason: st.reason || "", index: st.index || 0, total: st.total || 0, repos: st.repos || [],
+      startedAt: st.startedAt || null, updatedAt: st.updatedAt || null,
+      retry: st.retry ? { willRetry: !!st.retry.willRetry, at: st.retry.at || null, attempt: st.retry.attempt || 0, max: st.retry.max || 0 } : null,
+      workers: ws.map((w) => ({ key: w.key, summary: w.summary || "", step: w.step || "", stepStartedAt: w.stepStartedAt || null, status: w.status || "running", reason: w.reason || "" })),
+    });
+  }
+  const t = (x) => Date.parse(x.updatedAt || "") || 0;
+  return out.sort((a, b) => (b.running - a.running) || (t(b) - t(a)));
+}
 // 처리할 카드가 남았는데 전부 선행 대기면 그 사유, 아니면 "".
 // 에픽 안의 선행은 순서상 먼저 끝나므로, 여기 걸리는 건 에픽 밖 선행이거나 순환 링크다.
 function epicBlockedReason(tasks, cfg) {
@@ -911,7 +943,7 @@ module.exports = {
   CI_LOOP_MAX_DEFAULT, CI_LOOP_MAX_LIMIT, clampCiLoopMax,
   SUGGEST_MARK, parseSuggestedAnswers,
   EPIC_STEPS, epicChildrenJql, searchEpicChildren, epicBlockers, epicTaskStep, pickEpicTasks, nextEpicTask, epicTaskStates, epicBlockedReason, nextEpicStep,
-  EPIC_PARALLEL_EXTRA_MAX, clampParallelExtra, epicResumePoints, runEpicSlots, buildAdoptedAnswerBody, prBelongsToCard,
+  EPIC_PARALLEL_EXTRA_MAX, clampParallelExtra, epicResumePoints, summarizeEpicRuns, runEpicSlots, buildAdoptedAnswerBody, prBelongsToCard,
   EPIC_HIERARCHY_LEVEL, EPIC_LABEL_FALLBACK, topLevelIssueTypes, epicSearchJql, epicTypeLabel,
   EPIC_AUTO_MERGE_MIN_DEFAULT, EPIC_AUTO_MERGE_MIN_LIMIT, clampAutoMergeMin, shouldAutoMerge, mergeReadyState, isMergeReady, ciFixTargets,
   EPIC_CONFLICT_MIN_DEFAULT, EPIC_CONFLICT_MIN_LIMIT, clampConflictMin, isConflicting, conflictingPRs, shouldAutoResolveConflict,

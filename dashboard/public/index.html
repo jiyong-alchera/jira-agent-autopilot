@@ -1467,7 +1467,71 @@ const EPIC_STEP_LABEL = {
   prepare: "라벨 준비", plan: "plan(질문)", adopt: "제안 답변 채택",
   build: "개발·PR·리뷰 승인", ci: "CI 확인·수정", approve: "리뷰 승인 확인", "await-merge": "PR 병합 대기",
 };
-function EpicPanel({ projects, flash }) {
+// 전 프로젝트에서 돌고 있는(또는 멈춘) 에픽 실행을 한눈에 — 에픽을 하나씩 골라 보지 않아도 되게.
+// 상태 파일만 읽는 /api/epics/runs 를 5초 폴링. [열기] 는 아래 연속 개발 패널을 그 에픽으로 전환한다.
+function EpicRunsOverview({ onOpen }) {
+  const [runs, setRuns] = useState(null);
+  const load = useCallback(async () => { const r = await api.get("/api/epics/runs"); if (r.ok) setRuns(r.runs || []); }, []);
+  useEffect(() => { load(); const t = setInterval(load, 5000); return () => clearInterval(t); }, [load]);
+  const list = runs || [];
+  const nRun = list.filter((r) => r.running).length;
+  return (
+    <Section title={`진행 중인 에픽 (전 프로젝트) · 실행 ${nRun}건${list.length > nRun ? ` · 멈춤 ${list.length - nRun}건` : ""}`} collapsible defaultOpen
+      right={<span className="text-xs text-slate-500">5초 자동 갱신 · [열기] 로 아래 연속 개발 패널에서 로그·PR·조작</span>}>
+      {runs === null ? <p className="text-slate-500 text-sm">불러오는 중…</p>
+        : list.length === 0 ? <p className="text-slate-500 text-sm">돌고 있거나 멈춘 연속 개발이 없습니다.</p>
+        : (
+          <div className="space-y-2">
+            {list.map((r) => {
+              const tone = r.running ? "border-indigo-500/40 bg-indigo-500/5" : "border-amber-500/40 bg-amber-500/5";
+              return (
+                <div key={`${r.project}:${r.epic}`} className={`rounded-lg border p-3 ${tone}`}>
+                  <div className="flex items-center justify-between gap-3 flex-wrap">
+                    <div className="text-sm min-w-0">
+                      <span className="text-slate-400 mr-2">{r.projectName}</span>
+                      <b className="font-mono text-indigo-300">{r.epic}</b>
+                      {r.label && <span className="text-slate-500 text-xs ml-1">({r.label})</span>}
+                      <span className="ml-2">
+                        {r.running
+                          ? <span className="text-indigo-200">▶ 진행 중{r.stopping ? " · 중지 요청됨" : ""} · 완료 {r.index}/{r.total || "?"}</span>
+                          : <span className="text-amber-200">⏸ {r.status === "stopped" ? "중지됨" : "중단됨"} — {r.reason || "사유 없음"}</span>}
+                      </span>
+                      {!r.running && r.retry && r.retry.willRetry && (
+                        <span className="ml-2 text-xs text-emerald-300">🔄 자동 재시도 {r.retry.attempt + 1}/{r.retry.max}{r.retry.at ? ` · ${new Date(r.retry.at).toLocaleTimeString()}` : ""}</span>
+                      )}
+                      {r.updatedAt && <span className="ml-2 text-xs text-slate-500">갱신 {sinceText(r.updatedAt)} 전</span>}
+                    </div>
+                    <Btn color="slate" onClick={() => onOpen(r.project, r.epic)}>열기</Btn>
+                  </div>
+                  {r.workers.length > 0 && (
+                    <table className="w-full text-sm table-fixed mt-2">
+                      <tbody>
+                        {r.workers.map((w) => (
+                          <tr key={w.key} className="border-t border-slate-800 hover:bg-slate-800/40 cursor-pointer" onClick={() => onOpen(r.project, r.epic, w.key)}
+                            title={`${w.reason ? `중단 사유: ${w.reason}\n` : ""}클릭하면 연속 개발 패널에서 이 카드의 PR·로그를 엽니다.`}>
+                            <td className="py-1.5 w-8">{w.status === "failed" ? "⏸" : w.status === "stopped" ? "⏹" : "▶"}</td>
+                            <td className="w-28 font-mono text-indigo-400 truncate">{w.key}</td>
+                            <td className="pr-3 truncate" title={w.summary}>{w.summary}</td>
+                            <td className="w-56 text-right whitespace-nowrap">
+                              <span className={`inline-block text-xs px-2 py-0.5 rounded-full border ${w.status === "running" ? "bg-indigo-500/15 text-indigo-200 border-indigo-500/40" : "bg-amber-500/15 text-amber-200 border-amber-500/50"}`}>
+                                {EPIC_STEP_LABEL[w.step] || w.step || "-"}{w.status === "running" && w.stepStartedAt ? ` · ${sinceText(w.stepStartedAt)}째` : ""}
+                              </span>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+    </Section>
+  );
+}
+
+function EpicPanel({ projects, flash, jump }) {
   const [pid, setPid] = useState((projects[0] || {}).id || "");
   const [epics, setEpics] = useState([]);
   const [epicLabel, setEpicLabel] = useState("에픽");   // 이 프로젝트가 에픽 계층을 부르는 이름
@@ -1548,7 +1612,19 @@ function EpicPanel({ projects, flash }) {
     }
   }, [pid, epicKey]);
 
-  useEffect(() => { setEpicKey(""); setChildren(null); setRun({ running: false, status: "idle" }); repoTouched.current = false; setNewRunMode(false); loadEpics(pid); }, [pid]);
+  // 개요 영역의 [열기]: 프로젝트가 다르면 pid 를 바꾸고(아래 effect 가 에픽 선택을 비우므로) 키를 넘겨 둔다.
+  const pendingEpic = React.useRef("");
+  const panelRef = React.useRef(null);
+  const [openSig, setOpenSig] = useState(0);
+  useEffect(() => {
+    if (!jump) return;
+    setOpenSig((n) => n + 1);
+    setFocusKey(jump.card || "");
+    if (jump.projectId !== pid) { pendingEpic.current = jump.key; setPid(jump.projectId); }
+    else setEpicKey(jump.key);
+    requestAnimationFrame(() => { try { panelRef.current && panelRef.current.scrollIntoView({ behavior: "smooth", block: "start" }); } catch {} });
+  }, [jump]);
+  useEffect(() => { setEpicKey(pendingEpic.current); pendingEpic.current = ""; setChildren(null); setRun({ running: false, status: "idle" }); repoTouched.current = false; setNewRunMode(false); loadEpics(pid); }, [pid]);
   useEffect(() => { setRepos(repoNames); }, [pid, (proj && (proj.repos || []).length) || 0]);   // 새 실행의 기본은 전체 선택(loadRun 이 진행 중 실행의 실제 repo 로 덮어씀)
   useEffect(() => { repoTouched.current = false; setNewRunMode(false); setTaskOpen(""); setTaskDetail(null); loadChildren(epicKey); loadRun(); }, [epicKey]);
   useEffect(() => { const t = setInterval(loadRun, 5000); return () => clearInterval(t); }, [loadRun]);
@@ -1613,7 +1689,8 @@ function EpicPanel({ projects, flash }) {
   const idx = run.index || 0;
 
   return (
-    <Section title={`${epicLabel} 연속 개발`} collapsible defaultOpen={false}
+    <div ref={panelRef}>
+    <Section title={`${epicLabel} 연속 개발`} collapsible defaultOpen={false} openSignal={openSig}
       right={<span className="text-xs text-slate-500">하위 태스크를 Jira 순위순으로(선행 카드가 남은 카드는 건너뜀, 동시 실행 수만큼 함께) · 개발 → PR → 리뷰 승인 → 병합하면 다음</span>}>
       <div className="grid grid-cols-2 gap-4 mb-3">
         <label className="block">
@@ -1900,6 +1977,7 @@ function EpicPanel({ projects, flash }) {
         </React.Fragment>
       )}
     </Section>
+    </div>
   );
 }
 
@@ -1944,6 +2022,8 @@ function App() {
   };
   const loadActive = async () => { const r = await api.get("/api/active"); if (r.ok) { setActive(r.issues || []); setActiveErr((r.errors || []).length ? `일부 프로젝트 조회 실패: ${r.errors.map((e) => e.project).join(", ")}` : ""); } else setActiveErr(r.message || "조회 실패"); };
   const jumpToCard = (projectId, key) => { jumpNonce.current += 1; setJumpTo({ projectId, key, nonce: jumpNonce.current }); };
+  const [epicJump, setEpicJump] = useState(null);  // 에픽 개요 → 연속 개발 패널 { projectId, key, card, nonce }
+  const openEpic = (projectId, key, card) => { jumpNonce.current += 1; setEpicJump({ projectId, key, card: card || "", nonce: jumpNonce.current }); };
   const toggleHist = async (rowId, key, project) => {
     if (histExpanded === rowId) { setHistExpanded(""); setHistDetail(null); return; }
     setHistExpanded(rowId); setHistDetail({ key, loading: true, detail: null });
@@ -2016,8 +2096,9 @@ function App() {
         <p className="text-xs text-slate-500 mt-3">한 사이클마다 등록된 모든 프로젝트를 순회합니다(프로젝트별 동시 상한 적용). <b>review</b> 루프는 자동화가 올린 build PR 을 점검해, 문제없으면 승인 마커 코멘트를 남기고 이후 스킵합니다.</p>
       </Section>
 
-      {/* 에픽 연속 개발 (전역) */}
-      {projects.length > 0 && <EpicPanel projects={projects} flash={flash} />}
+      {/* 진행 중인 에픽 개요 + 연속 개발 (전역) */}
+      {projects.length > 0 && <EpicRunsOverview onOpen={openEpic} />}
+      {projects.length > 0 && <EpicPanel projects={projects} flash={flash} jump={epicJump} />}
 
       {/* 프로젝트들 */}
       <div className="flex items-center justify-between mb-3">

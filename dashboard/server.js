@@ -956,6 +956,20 @@ app.get("/api/epics", async (req, res) => {
     res.json({ ok: true, epics, label });
   } catch (e) { fail(res, e); }
 });
+// 전 프로젝트의 에픽 실행 개요 — 상태 파일만 읽는다(Jira 조회 없음, 5초 폴링용).
+app.get("/api/epics/runs", (req, res) => {
+  const entries = [];
+  for (const p of listProjects()) {
+    const cfg = getProject(p.id);
+    let files = [];
+    try { files = fs.readdirSync(stateDirOf(cfg)).filter((f) => f.endsWith(".epic.json")); } catch { continue; }
+    for (const f of files) {
+      const key = f.replace(/\.epic\.json$/, "");
+      try { entries.push({ project: cfg.id, projectName: cfg.name || cfg.id, key, run: epicRunStatus(cfg, key) }); } catch {}
+    }
+  }
+  res.json({ ok: true, runs: lib.summarizeEpicRuns(entries) });
+});
 // 에픽의 미완료 하위 태스크(Jira 순위순) + 각 카드의 시작 단계·선행 대기
 app.get("/api/epics/:key/children", async (req, res) => {
   const key = req.params.key;

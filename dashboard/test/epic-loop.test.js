@@ -718,3 +718,36 @@ test("rebaseMergeUnsupported: 병합 '방식' 거절만 merge commit 재시도 �
   assert.ok(!lib.rebaseMergeUnsupported(""));
   assert.ok(!lib.rebaseMergeUnsupported(undefined));
 });
+
+test("summarizeEpicRuns: 실행 중·중단·중지만, 실행 중 먼저 최근 갱신순", () => {
+  const runs = lib.summarizeEpicRuns([
+    { project: "a", key: "E-1", run: { epic: "E-1", status: "done", updatedAt: "2026-10-27T05:00:00Z" } },
+    { project: "a", key: "E-2", run: { status: "idle" } },
+    { project: "a", key: "E-3", run: { epic: "E-3", status: "paused", reason: "CI 실패", updatedAt: "2026-10-27T04:00:00Z", retry: { willRetry: true, at: "2026-10-27T04:30:00Z", attempt: 1, max: 5 } } },
+    { project: "b", projectName: "B", key: "E-4", run: { epic: "E-4", status: "running", running: true, index: 1, total: 4, updatedAt: "2026-10-27T03:00:00Z",
+      workers: [{ key: "T-1", summary: "하나", step: "build", stepStartedAt: "2026-10-27T02:50:00Z", status: "running" }, { key: "T-2", step: "await-merge", status: "running" }] } },
+    { project: "a", key: "E-5", run: { epic: "E-5", status: "stopped", updatedAt: "2026-10-27T06:00:00Z" } },
+  ]);
+  assert.deepStrictEqual(runs.map((r) => r.epic), ["E-4", "E-5", "E-3"]);
+  assert.strictEqual(runs[0].projectName, "B");
+  assert.deepStrictEqual(runs[0].workers.map((w) => `${w.key}:${w.step}`), ["T-1:build", "T-2:await-merge"]);
+  assert.deepStrictEqual(runs[2].retry, { willRetry: true, at: "2026-10-27T04:30:00Z", attempt: 1, max: 5 });
+  assert.strictEqual(runs[2].projectName, "a");
+});
+
+test("summarizeEpicRuns: workers 없는 예전 상태 파일은 current/step 으로 카드 행을 만든다", () => {
+  const [r] = lib.summarizeEpicRuns([{ project: "a", key: "E-1", run: { epic: "E-1", status: "paused", current: { key: "T-9", summary: "옛" }, step: "ci" } }]);
+  assert.deepStrictEqual(r.workers, [{ key: "T-9", summary: "옛", step: "ci", stepStartedAt: null, status: "failed", reason: "" }]);
+  assert.deepStrictEqual(lib.summarizeEpicRuns([{ project: "a", key: "E-2", run: { epic: "E-2", status: "stopped" } }])[0].workers, []);
+});
+
+test("summarizeEpicRuns: .state 를 공유하는 프로젝트마다 잡힌 같은 에픽은 한 번만, 상태 파일의 project 쪽으로", () => {
+  const run = { epic: "E-1", project: "ekyb", status: "running", running: true };
+  const runs = lib.summarizeEpicRuns([
+    { project: "fs", projectName: "FireScout", key: "E-1", run },
+    { project: "ekyb", projectName: "EKYB", key: "E-1", run },
+    { project: "po", projectName: "PO", key: "E-1", run },
+  ]);
+  assert.strictEqual(runs.length, 1);
+  assert.strictEqual(runs[0].projectName, "EKYB");
+});
