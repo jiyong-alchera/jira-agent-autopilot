@@ -1469,7 +1469,7 @@ const EPIC_STEP_LABEL = {
 };
 // 전 프로젝트에서 돌고 있는(또는 멈춘) 에픽 실행을 한눈에 — 에픽을 하나씩 골라 보지 않아도 되게.
 // 상태 파일만 읽는 /api/epics/runs 를 5초 폴링. [열기] 는 아래 연속 개발 패널을 그 에픽으로 전환한다.
-function EpicRunsOverview({ onOpen }) {
+function EpicRunsOverview({ onOpen, jiraUrlFor }) {
   const [runs, setRuns] = useState(null);
   const load = useCallback(async () => { const r = await api.get("/api/epics/runs"); if (r.ok) setRuns(r.runs || []); }, []);
   useEffect(() => { load(); const t = setInterval(load, 5000); return () => clearInterval(t); }, [load]);
@@ -1489,7 +1489,10 @@ function EpicRunsOverview({ onOpen }) {
                   <div className="flex items-center justify-between gap-3 flex-wrap">
                     <div className="text-sm min-w-0">
                       <span className="text-slate-400 mr-2">{r.projectName}</span>
-                      <b className="font-mono text-indigo-300">{r.epic}</b>
+                      {jiraUrlFor(r.project, r.epic)
+                        ? <a href={jiraUrlFor(r.project, r.epic)} target="_blank" rel="noreferrer" title="Jira 에서 이 에픽 열기"
+                            className="font-mono font-bold text-indigo-300 hover:underline">{r.epic}</a>
+                        : <b className="font-mono text-indigo-300">{r.epic}</b>}
                       {r.label && <span className="text-slate-500 text-xs ml-1">({r.label})</span>}
                       <span className="ml-2">
                         {r.running
@@ -2097,7 +2100,7 @@ function App() {
       </Section>
 
       {/* 진행 중인 에픽 개요 + 연속 개발 (전역) */}
-      {projects.length > 0 && <EpicRunsOverview onOpen={openEpic} />}
+      {projects.length > 0 && <EpicRunsOverview onOpen={openEpic} jiraUrlFor={jiraUrlFor} />}
       {projects.length > 0 && <EpicPanel projects={projects} flash={flash} jump={epicJump} />}
 
       {/* 프로젝트들 */}
