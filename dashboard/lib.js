@@ -498,7 +498,8 @@ function epicResumePoints(st, skip) {
     .filter((w) => w.step);
 }
 // 전 프로젝트 에픽 실행 개요(대시보드 '진행 중인 에픽' 영역). 실행 중·중단·중지만 남기고(완료·idle 제외)
-// 실행 중을 먼저, 그 안에서는 최근 갱신순. 카드별 행은 workers, 없으면 예전 단일 필드(current/step)로 채운다.
+// 프로젝트 이름 → 에픽 키 순으로 고정한다 — 갱신 시각(러너 heartbeat 15초)이나 상태로 정렬하면 폴링마다
+// 행이 자리를 바꿔 읽기 어렵다. 카드별 행은 workers, 없으면 예전 단일 필드(current/step)로 채운다.
 // 프로젝트들이 cloneBase(.state)를 공유하면 같은 상태 파일이 프로젝트마다 잡히므로 에픽 키로 한 번만 —
 // 상태 파일에 적힌 project 와 맞는 쪽을 쓴다.
 const EPIC_RUN_VISIBLE = ["running", "paused", "stopped"];
@@ -526,8 +527,8 @@ function summarizeEpicRuns(entries) {
       workers: ws.map((w) => ({ key: w.key, summary: w.summary || "", step: w.step || "", stepStartedAt: w.stepStartedAt || null, status: w.status || "running", reason: w.reason || "" })),
     });
   }
-  const t = (x) => Date.parse(x.updatedAt || "") || 0;
-  return out.sort((a, b) => (b.running - a.running) || (t(b) - t(a)));
+  const cmp = (a, b) => String(a).localeCompare(String(b), undefined, { numeric: true });
+  return out.sort((a, b) => cmp(a.projectName, b.projectName) || cmp(a.epic, b.epic));
 }
 // 처리할 카드가 남았는데 전부 선행 대기면 그 사유, 아니면 "".
 // 에픽 안의 선행은 순서상 먼저 끝나므로, 여기 걸리는 건 에픽 밖 선행이거나 순환 링크다.

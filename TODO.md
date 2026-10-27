@@ -245,7 +245,7 @@
     에픽과 각 에픽에서 지금 작업 중인 하위 카드·단계를 한 영역에 모아 실시간으로 보여준다.
   - AC: 에픽을 고르지 않아도 실행 중·중단 에픽과 카드별 단계가 보이고 자동 갱신되며, 클릭으로 해당 에픽 패널로 이동한다.
   - 영향: `dashboard/lib.js`, `dashboard/server.js`(`/api/epics/runs`), `dashboard/public/index.html`, `dashboard/test/epic-loop.test.js`
-  → (완료 2026-10-27) `GET /api/epics/runs` + `lib.summarizeEpicRuns`(실행·중단·중지만, 실행 중 먼저 최근 갱신순, 공유 `.state`
+  → (완료 2026-10-27) `GET /api/epics/runs` + `lib.summarizeEpicRuns`(실행·중단·중지만, 프로젝트 이름 → 에픽 키 고정 순서, 공유 `.state`
     중복 제거) 추가. 대시보드 '진행 중인 에픽' 섹션(5초 폴링)에서 [열기]·카드 행 클릭 시 연속 개발 패널을 그 에픽·카드로 전환.
     검증: `npm test` 168건 통과 + 실제 상태 파일 3건(EKYB-951·PHYS-389·PO-33) 집계 확인.
 

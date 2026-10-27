@@ -719,7 +719,7 @@ test("rebaseMergeUnsupported: 병합 '방식' 거절만 merge commit 재시도 �
   assert.ok(!lib.rebaseMergeUnsupported(undefined));
 });
 
-test("summarizeEpicRuns: 실행 중·중단·중지만, 실행 중 먼저 최근 갱신순", () => {
+test("summarizeEpicRuns: 실행 중·중단·중지만, 프로젝트 이름 → 에픽 키 고정 순서", () => {
   const runs = lib.summarizeEpicRuns([
     { project: "a", key: "E-1", run: { epic: "E-1", status: "done", updatedAt: "2026-10-27T05:00:00Z" } },
     { project: "a", key: "E-2", run: { status: "idle" } },
@@ -728,11 +728,20 @@ test("summarizeEpicRuns: 실행 중·중단·중지만, 실행 중 먼저 최근
       workers: [{ key: "T-1", summary: "하나", step: "build", stepStartedAt: "2026-10-27T02:50:00Z", status: "running" }, { key: "T-2", step: "await-merge", status: "running" }] } },
     { project: "a", key: "E-5", run: { epic: "E-5", status: "stopped", updatedAt: "2026-10-27T06:00:00Z" } },
   ]);
-  assert.deepStrictEqual(runs.map((r) => r.epic), ["E-4", "E-5", "E-3"]);
-  assert.strictEqual(runs[0].projectName, "B");
-  assert.deepStrictEqual(runs[0].workers.map((w) => `${w.key}:${w.step}`), ["T-1:build", "T-2:await-merge"]);
-  assert.deepStrictEqual(runs[2].retry, { willRetry: true, at: "2026-10-27T04:30:00Z", attempt: 1, max: 5 });
-  assert.strictEqual(runs[2].projectName, "a");
+  assert.deepStrictEqual(runs.map((r) => r.epic), ["E-3", "E-5", "E-4"]);
+  assert.strictEqual(runs[2].projectName, "B");
+  assert.deepStrictEqual(runs[2].workers.map((w) => `${w.key}:${w.step}`), ["T-1:build", "T-2:await-merge"]);
+  assert.deepStrictEqual(runs[0].retry, { willRetry: true, at: "2026-10-27T04:30:00Z", attempt: 1, max: 5 });
+  assert.strictEqual(runs[0].projectName, "a");
+});
+
+test("summarizeEpicRuns: 갱신 시각·상태가 바뀌어도 순서는 그대로(폴링마다 자리 바뀜 방지)", () => {
+  const mk = (t1, t2, s2) => lib.summarizeEpicRuns([
+    { project: "p", projectName: "P", key: "E-10", run: { epic: "E-10", status: "running", running: true, updatedAt: t1 } },
+    { project: "p", projectName: "P", key: "E-9", run: { epic: "E-9", status: s2, running: s2 === "running", updatedAt: t2 } },
+  ]).map((r) => r.epic);
+  assert.deepStrictEqual(mk("2026-10-27T01:00:00Z", "2026-10-27T02:00:00Z", "running"), ["E-9", "E-10"]);
+  assert.deepStrictEqual(mk("2026-10-27T03:00:00Z", "2026-10-27T02:00:00Z", "paused"), ["E-9", "E-10"]);
 });
 
 test("summarizeEpicRuns: workers 없는 예전 상태 파일은 current/step 으로 카드 행을 만든다", () => {
