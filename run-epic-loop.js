@@ -15,6 +15,7 @@
 //   ci           PR 의 CI 를 확인해 깨졌으면 '원인 파악 → 수정/재실행 → 재검증' 을 초록까지 반복
 //                (CI 수정 커밋이 생기면 기존 승인을 무효화하고 리뷰 루프를 다시 태운다)
 //   approve      열린 봇 PR 전부에 승인 마커(CLAUDE-REVIEW-APPROVED)가 있는지 확인
+//                ([이어서 진행]으로 여기서 재개하면 미승인 PR 에 리뷰 루프를 한 번 다시 태운 뒤 확인)
 //   await-merge  사용자가 그 카드의 PR 을 모두 병합할 때까지 대기(카드가 완료되면 통과)
 //                자동 병합은 승인 + CI 초록일 때만 — 대기 중 base 가 움직여 깨진 회귀를 여기서 다시 막는다
 //                base 충돌이 나면 대기 시간 뒤 'rebase 해소 → 재푸시 → 승인 무효화 → 재리뷰' 를 대신 태운다
@@ -401,8 +402,23 @@ async function stepBuild(task) {
   }
   return { ok: true };
 }
+// [이어서 진행]으로 approve 에서 재개한 카드 — 한 번만 리뷰 루프를 다시 태운다(runTask 시작 시 채움).
+const REVIEW_ON_RESUME = new Set();
 async function stepApprove(task) {
-  const prs = await cardOpenPRs(task.key);
+  let prs = await cardOpenPRs(task.key);
+  if (!prs.length) return { ok: true, note: "열린 PR 없음(이미 병합됨)" };
+  const targets = lib.approveReviewTargets(prs, REVIEW_ON_RESUME.delete(task.key));
+  for (const pr of targets) {
+    const tag = `${pr.owner}#${pr.number}`;
+    log(`${task.key} ${tag} 재개 — 미승인 PR 리뷰 루프(반영 → 재리뷰) 다시 실행`);
+    await slack(`🔁 [${EPIC_KEY}] ${task.key} — 이어서 진행: 미승인 PR 의 리뷰 반영·재리뷰를 다시 돌립니다 · ${tag}`);
+    const re = await taskEnv(task.key);
+    re.REVIEW_LOOP_MAX = String(lib.clampReviewLoopMax(process.env.REVIEW_LOOP_MAX, cfg));
+    const { code } = await runScript("run-review-loop.sh", [task.key, pr.owner, String(pr.number)], re);
+    if (stopRequested()) return { ok: false, stop: true };
+    if (code !== 0) return { ok: false, reason: `${tag} 리뷰 루프 실패 (exit ${code})` };
+  }
+  if (targets.length) prs = await cardOpenPRs(task.key);
   if (!prs.length) return { ok: true, note: "열린 PR 없음(이미 병합됨)" };
   const pending = prs.filter((p) => !p.approved);
   if (pending.length) {
@@ -763,7 +779,9 @@ const STEP_FN = { prepare: stepPrepare, plan: stepPlan, adopt: stepAdopt, build:
     runTask,
     preferKeys: () => [...resumePoints.keys()],
     startStep: (t) => {
-      const step = resumePoints.get(t.key) || legacyStep || t.step;
+      const resumed = resumePoints.get(t.key) || legacyStep;
+      const step = resumed || t.step;
+      if (resumed === "approve") REVIEW_ON_RESUME.add(t.key);
       resumePoints.delete(t.key); legacyStep = "";
       return step;
     },

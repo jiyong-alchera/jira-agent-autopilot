@@ -605,6 +605,13 @@ function nextEpicStep(step) {
   const i = EPIC_STEPS.indexOf(step);
   return (i < 0 || i >= EPIC_STEPS.length - 1) ? null : EPIC_STEPS[i + 1];
 }
+// approve 단계에서 리뷰 루프를 다시 태울 PR. [이어서 진행]으로 approve 에 들어온 카드만 대상이다 —
+// 그 단계는 승인 마커만 보므로, 그대로 두면 미승인 PR 은 반영 없이 즉시 다시 멈춘다.
+// 평소 흐름(build·ci 직후)은 이미 리뷰 루프를 거쳤으니 다시 돌리지 않는다.
+function approveReviewTargets(prs, resumed) {
+  if (!resumed) return [];
+  return (prs || []).filter((p) => p && !p.approved);
+}
 // 제안 답변 → Jira 답변 코멘트 본문. 자동 채택임을 명시해 사람이 나중에 구분할 수 있게 한다.
 function buildAdoptedAnswerBody(suggested, epicKey, label) {
   if (!suggested || !suggested.items || !suggested.items.length) return "";
@@ -943,7 +950,7 @@ module.exports = {
   ciCheckState, ciStateOf, ciStateWithRuns, failedChecks, runIdFromCheckUrl,
   CI_LOOP_MAX_DEFAULT, CI_LOOP_MAX_LIMIT, clampCiLoopMax,
   SUGGEST_MARK, parseSuggestedAnswers,
-  EPIC_STEPS, epicChildrenJql, searchEpicChildren, epicBlockers, epicTaskStep, pickEpicTasks, nextEpicTask, epicTaskStates, epicBlockedReason, nextEpicStep,
+  EPIC_STEPS, epicChildrenJql, searchEpicChildren, epicBlockers, epicTaskStep, pickEpicTasks, nextEpicTask, epicTaskStates, epicBlockedReason, nextEpicStep, approveReviewTargets,
   EPIC_PARALLEL_EXTRA_MAX, clampParallelExtra, epicResumePoints, summarizeEpicRuns, runEpicSlots, buildAdoptedAnswerBody, prBelongsToCard,
   EPIC_HIERARCHY_LEVEL, EPIC_LABEL_FALLBACK, topLevelIssueTypes, epicSearchJql, epicTypeLabel,
   EPIC_AUTO_MERGE_MIN_DEFAULT, EPIC_AUTO_MERGE_MIN_LIMIT, clampAutoMergeMin, shouldAutoMerge, mergeReadyState, isMergeReady, ciFixTargets,

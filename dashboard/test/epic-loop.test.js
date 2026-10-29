@@ -760,3 +760,15 @@ test("summarizeEpicRuns: .state 를 공유하는 프로젝트마다 잡힌 같�
   assert.strictEqual(runs.length, 1);
   assert.strictEqual(runs[0].projectName, "EKYB");
 });
+
+test("approveReviewTargets: [이어서 진행]으로 approve 에 들어온 카드만 미승인 PR 을 리뷰 루프에 다시 태운다", () => {
+  const prs = [
+    { owner: "o/r", number: 1, approved: true },
+    { owner: "o/r", number: 2, approved: false },
+  ];
+  assert.deepEqual(lib.approveReviewTargets(prs, true).map((p) => p.number), [2]);
+  // 평소 흐름(build·ci 직후)은 이미 리뷰 루프를 거쳤다 → 다시 돌리지 않음
+  assert.deepEqual(lib.approveReviewTargets(prs, false), []);
+  assert.deepEqual(lib.approveReviewTargets([{ number: 3, approved: true }], true), []);
+  assert.deepEqual(lib.approveReviewTargets(null, true), []);
+});
