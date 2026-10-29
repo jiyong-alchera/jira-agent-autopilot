@@ -1683,6 +1683,22 @@ app.post("/api/jira/issue/:key/comment", async (req, res) => {
   } catch (e) { fail(res, e); }
 });
 
+// build 가 '이미 base 에 반영됨'(ALREADY_IMPLEMENTED)으로 끝난 카드 — 근거 코멘트 + 완료 전환 + 실패 라벨 제거.
+// run-jira-agent.sh 가 호출한다. PR 이 없으니 병합 경로(/merge)의 완료 처리를 탈 수 없다.
+app.post("/api/cards/:key/already-done", async (req, res) => {
+  const key = req.params.key;
+  if (!/^[A-Z][A-Z0-9]+-[0-9]+$/.test(key)) return res.status(400).json({ ok: false, message: "이슈 키 형식 오류" });
+  try {
+    const { cfg, cred } = resolveProject(req);
+    const doneStatus = await transitionToDone(key, cfg, cred);
+    await jiraReq("POST", `/rest/api/3/issue/${encodeURIComponent(key)}/comment`, { body: toADF(lib.alreadyDoneComment((req.body || {}).evidence, doneStatus)) }, cfg, cred);
+    try {
+      await jiraReq("PUT", `/rest/api/3/issue/${encodeURIComponent(key)}`, { update: { labels: [{ remove: cfg.failedLabel || "claude-failed" }] } }, cfg, cred);
+    } catch {}
+    res.json({ ok: true, doneStatus });
+  } catch (e) { fail(res, e); }
+});
+
 // 카드의 Jira 상태 수동 전환(대시보드에서 직접) — transitionId 는 상세 응답의 transitions[].id
 app.post("/api/jira/issue/:key/transition", async (req, res) => {
   try {

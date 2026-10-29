@@ -51,6 +51,7 @@ PR_OPEN_LABEL="${PR_OPEN_LABEL:-claude-pr}"     # PR 올림(병합 대기) 표�
 TARGET_BRANCH_LABEL="${TARGET_BRANCH_LABEL:-claude-branched}"   # plan 이 타겟(작업) 브랜치를 만들었음을 표시하는 라벨
 TARGET_BRANCH_MARK="🌿 타겟 브랜치:"           # Jira 코멘트에 타겟 브랜치명을 남기는 마커(build 가 이걸로 브랜치 인식)
 NO_REWORK_MARK="NO_REWORK_NEEDED"               # rework 무변경(반영할 새 피드백 없음) 마커 — run-review-loop.sh 와 동일해야 함
+ALREADY_DONE_MARK="ALREADY_IMPLEMENTED"         # build 무변경(요구 변경이 이미 base 에 있음) 마커 — lib.ALREADY_DONE_MARK 와 동일해야 함
 # CI_FIX 모드가 '무엇을 했는지' 알리는 마커 — run-ci-loop.sh 가 이걸로 재리뷰 필요 여부를 정한다.
 CI_RERUN_MARK="CI_RERUN_ONLY"                   # 코드 변경 없이 재실행만(인프라 장애·플레이크) → 재리뷰 불필요
 CI_PUSHED_MARK="CI_FIX_PUSHED"                  # 코드를 고쳐 푸시함 → 재리뷰 필요
@@ -460,6 +461,7 @@ ${REPO_LIST_TEXT}
 
 [브랜치 위생 — 매우 중요] 작업 브랜치에 '절대 merge 커밋을 만들지 마세요'. base(${BASE_BRANCH})의 최신 변경을 반영하거나 base 와의 충돌을 해소할 때 'git merge origin/${BASE_BRANCH}'(= base 를 브랜치로 merge) 를 '절대 쓰지 마세요' — merge 커밋이 생기면 GitHub 의 'Rebase and merge' 가 막혀('This branch cannot be rebased due to conflicts') PR 병합이 어려워집니다. 대신 반드시 'git fetch origin && git rebase origin/${BASE_BRANCH}' 로 rebase 해서 브랜치를 base 위에 선형으로 유지하세요. rebase 중 충돌은 양쪽 의도를 보존해 해소('git add' → 'git rebase --continue')하고, '이미 원격에 push 된 브랜치를 rebase 했다면' 'git push --force-with-lease' 로 갱신하세요(아직 push 전이면 일반 push). base 브랜치 자체에는 절대 push 하지 마세요.
 PR 을 하나도 생성하지 못했다면 절대 완료로 간주하지 말고, 사유를 출력하고 비정상 종료하세요(다음 주기에 재시도됩니다).
+[예외 — 이미 반영됨] 카드가 요구한 변경이 '이미' base(${BASE_BRANCH}) 에 들어가 있어 어느 repo 에도 바꿀 코드가 전혀 없을 때만: 반영한 커밋 SHA 를 찾고, 카드의 확인 기준을 그 코드와 관련 테스트로 직접 확인하세요. 확인되면 커밋·PR 을 만들지 말고 마지막 줄에 정확히 '${ALREADY_DONE_MARK}: <repo>@<커밋 SHA> · <확인한 테스트·결과>' 한 줄을 출력한 뒤 정상 종료하세요(카드 완료 전환은 자동화가 합니다). 일부라도 남은 작업이 있거나 확인이 불확실하면 이 마커를 쓰지 말고 구현하세요.
 
 1. Jira 이슈 ${ISSUE_KEY} 의 설명과 '모든 코멘트'(특히 담당자 ${ASSIGNEE_NAME} 의 답변), 그리고 라벨을 읽으세요.
 2. build 진입 조건은 다음 '둘 다' 충족입니다. 둘 중 하나라도 없으면 어떤 코드 변경/커밋/PR도 하지 말고
@@ -549,6 +551,12 @@ if [[ "${CLAUDE_OK}" -eq 0 ]]; then
     elif grep -qF "${CI_PUSHED_MARK}" "${CLAUDE_OUT}"; then
       echo ">> [${ISSUE_KEY}] CI 실패 원인 수정 후 푸시"
     fi
+  elif [[ "${PHASE}" == "build" && -z "${REWORK:-}" && -z "${PR_URL}" ]] && grep -qE "^[[:space:]*\`]*${ALREADY_DONE_MARK}:" "${CLAUDE_OUT}"; then
+    # 요구 변경이 이미 base 에 있어 PR 이 나올 수 없는 정상 종료 — '미완료'로 몰면 3회 재시도 후 claude-failed 로 끝난다(EKYB-1046).
+    # 줄 머리 고정: 마커를 설명하며 문장 중간에 언급한 경우는 잡지 않는다.
+    RESULT="already-done"
+    ALREADY_DONE_EVIDENCE="$(grep -E "^[[:space:]*\`]*${ALREADY_DONE_MARK}:" "${CLAUDE_OUT}" | tail -n1 | sed -E "s/^[[:space:]*\`]*${ALREADY_DONE_MARK}:[[:space:]]*//; s/[*\`[:space:]]+\$//")"
+    echo ">> [${ISSUE_KEY}] 요구 변경이 이미 base 에 반영됨 → PR 없이 완료 처리: ${ALREADY_DONE_EVIDENCE}"
   elif [[ "${PHASE}" == "build" && -z "${PR_URL}" ]]; then
     # build/rework 인데 PR URL 이 없으면 미완료(예: 작업을 백그라운드로 미루고 종료) → 재시도 대상
     RESULT="incomplete"
@@ -560,7 +568,7 @@ if [[ "${CLAUDE_OK}" -eq 0 ]]; then
   fi
 fi
 
-if [[ "${RESULT}" == "success" || "${RESULT}" == "skip" || "${RESULT}" == "rework" || "${RESULT}" == "noop" || "${RESULT}" == "ci-fix" ]]; then
+if [[ "${RESULT}" == "success" || "${RESULT}" == "skip" || "${RESULT}" == "rework" || "${RESULT}" == "noop" || "${RESULT}" == "ci-fix" || "${RESULT}" == "already-done" ]]; then
   rm -f "${FAIL_FILE}"
   echo ">> [${ISSUE_KEY}] 완료 (phase=${PHASE}, result=${RESULT})"
   record_history_prs "${RESULT}"   # 생성된 PR 을 repo 별로 각각 이력에 기록(멀티 repo)
@@ -588,6 +596,23 @@ if [[ "${RESULT}" == "success" || "${RESULT}" == "skip" || "${RESULT}" == "rewor
         node "${SELF_DIR}/append-summary.js" "${SUMMARY_FILE}" || echo ">> [${ISSUE_KEY}] 완료 내역 설명 append 실패(요약 파일 보존)" >&2
     else
       echo ">> [${ISSUE_KEY}] Jira REST 자격증명 미설정 → 완료 내역 설명 append 생략(요약: ${SUMMARY_FILE})" >&2
+    fi
+  fi
+  # 이미 반영됨: PR 이 없어 병합 경로의 완료 처리를 탈 수 없으니 대시보드가 근거 코멘트 + 완료 전환을 한다.
+  # 실패하면 카드는 그대로 남고, 에픽 러너는 'PR 표시 없음' 으로 멈춰 사람에게 넘긴다.
+  if [[ "${RESULT}" == "already-done" ]]; then
+    DONE_RESP=""
+    if [[ -n "${DASHBOARD_URL:-}" ]] && command -v curl >/dev/null 2>&1 && command -v node >/dev/null 2>&1; then
+      DONE_BODY="$(node -e 'process.stdout.write(JSON.stringify({ evidence: process.argv[1] }))' "${ALREADY_DONE_EVIDENCE}")"
+      DONE_RESP="$(curl -fsS --max-time 60 -X POST -H 'Content-Type: application/json' --data "${DONE_BODY}" \
+        "${DASHBOARD_URL}/api/cards/${ISSUE_KEY}/already-done?project=${PROJECT_ID:-}" 2>&1 || true)"
+    fi
+    if grep -q '"ok":true' <<< "${DONE_RESP}"; then
+      echo ">> [${ISSUE_KEY}] 이미 반영됨 → 근거 코멘트 + 완료 전환"
+      notify_slack "☑️ [${ISSUE_KEY}] 요구 변경이 이미 base 에 반영돼 PR 없이 완료 처리했습니다(근거는 Jira 코멘트)"
+    else
+      echo ">> [${ISSUE_KEY}] 이미 반영됨 — 완료 전환 실패(사람 확인 필요): ${DONE_RESP:-DASHBOARD_URL 미설정}" >&2
+      notify_slack "⚠️ [${ISSUE_KEY}] 요구 변경이 이미 base 에 있다고 판단했지만 완료 전환에 실패했습니다 — 확인 후 직접 완료 처리해 주세요"
     fi
   fi
   if [[ "${RESULT}" == "success" || "${RESULT}" == "rework" ]]; then

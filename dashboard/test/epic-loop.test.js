@@ -772,3 +772,21 @@ test("approveReviewTargets: [이어서 진행]으로 approve 에 들어온 카�
   assert.deepEqual(lib.approveReviewTargets([{ number: 3, approved: true }], true), []);
   assert.deepEqual(lib.approveReviewTargets(null, true), []);
 });
+
+test("alreadyDoneComment: 자동 완료 근거 코멘트 · 셸 마커와 lib 마커 일치 · 줄 머리 마커만 인식", () => {
+  const fs = require("fs");
+  const path = require("path");
+  const { spawnSync } = require("child_process");
+  const body = lib.alreadyDoneComment("kyb-client@d41bef5 · tenantSlug.spec 통과", "DEV COMPLETED");
+  assert.match(body, /'DEV COMPLETED' 로 완료 처리/);
+  assert.match(body, /근거: kyb-client@d41bef5/);
+  assert.match(lib.alreadyDoneComment("", "완료"), /근거 미기재/);
+
+  const sh = fs.readFileSync(path.join(__dirname, "..", "..", "run-jira-agent.sh"), "utf8");
+  assert.ok(sh.includes(`ALREADY_DONE_MARK="${lib.ALREADY_DONE_MARK}"`), "run-jira-agent.sh 마커가 lib.ALREADY_DONE_MARK 와 다릅니다");
+  // run-jira-agent.sh 의 판정 패턴 — 마커를 문장 중간에 언급만 한 출력은 잡으면 안 된다
+  const hit = (out) => spawnSync("bash", ["-c", 'grep -qE "^[[:space:]*\\`]*ALREADY_IMPLEMENTED:" <<< "$1"', "_", out]).status === 0;
+  assert.ok(hit("요약\nALREADY_IMPLEMENTED: kyb-client@d41bef5 · vitest 통과"));
+  assert.ok(hit("**ALREADY_IMPLEMENTED: kyb-client@d41bef5**"));
+  assert.ok(!hit("변경이 없으면 ALREADY_IMPLEMENTED: 마커를 쓰라고 했지만 남은 작업이 있어 쓰지 않았습니다"));
+});
