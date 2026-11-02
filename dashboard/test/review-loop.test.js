@@ -108,3 +108,31 @@ test("review-loop: 무변경 반영이 2회 연속이면 진전 없음으로 중
   assert.equal(calls.filter((l) => l.startsWith("rework|")).length, 2);   // 3회차는 없음
   assert.equal(calls.filter((l) => l.startsWith("review|")).length, 1);   // 1회차 재리뷰만
 });
+
+test("review-loop: 실패 보고 문장 속 NO_REWORK_NEEDED 언급은 무변경으로 보지 않는다", () => {
+  // PHYS-411: 권한 거부로 반영 실패를 알리며 마커 이름을 언급한 출력이 '새 피드백 없음'으로 잡혔다
+  const { stdout } = runLoop(`echo "\\\`NO_REWORK_NEEDED\\\` 대상이 아니라 비정상 종료로 처리합니다"`, { REVIEW_FIRST: "" });
+  assert.doesNotMatch(stdout, /반영할 새 피드백 없음/);
+});
+
+test("review-loop: 줄 전체가 마커(강조 포함)면 무변경으로 본다", () => {
+  const { stdout } = runLoop(`echo "**NO_REWORK_NEEDED**"`, { REVIEW_FIRST: "" });
+  assert.match(stdout, /1회차 반영할 새 피드백 없음 → 재리뷰로 판정/);
+});
+
+test("review-loop: 반영 실패 사유를 중단 메시지에 싣는다", () => {
+  const { stdout, calls } = runLoop(`echo ">> [${KEY}] 리뷰 반영 실패: addCommentToJiraIssue 권한 거부" >&2; exit 1`, { REVIEW_FIRST: "" });
+  assert.match(stdout, /1회차 리뷰 반영 실패\(exit 1\): addCommentToJiraIssue 권한 거부 → 루프 중단/);
+  assert.equal(calls.filter((l) => l.startsWith("review|")).length, 0);
+});
+
+test("run-jira-agent: REWORK_FAILED 는 줄 머리 마커만, 마커 이름은 루프와 같다", () => {
+  const sh = fs.readFileSync(path.join(SCRIPTS_DIR, "run-jira-agent.sh"), "utf8");
+  const loop = fs.readFileSync(path.join(SCRIPTS_DIR, "run-review-loop.sh"), "utf8");
+  assert.ok(sh.includes('REWORK_FAILED_MARK="REWORK_FAILED"'));
+  assert.ok(sh.includes('NO_REWORK_MARK="NO_REWORK_NEEDED"') && loop.includes('NO_REWORK_MARK="NO_REWORK_NEEDED"'));
+  const hit = (out) => spawnSync("bash", ["-c", 'grep -qE "^[[:space:]*\\`]*REWORK_FAILED:" <<< "$1"', "_", out]).status === 0;
+  assert.ok(hit("요약\nREWORK_FAILED: addCommentToJiraIssue 권한 거부"));
+  assert.ok(hit("**REWORK_FAILED: 권한 거부**"));
+  assert.ok(!hit("실패하면 REWORK_FAILED: 마커를 쓰라고 했습니다"));
+});

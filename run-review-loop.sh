@@ -161,8 +161,10 @@ while (( ITER < REVIEW_LOOP_MAX )); do
     cat "${REWORK_OUT}" 2>/dev/null || true
     stop_requested && on_term   # 중지 요청으로 하위가 죽은 경우 — 실패 알림 대신 중지 처리
     if (( RC != 0 )); then
-      echo ">> [${ISSUE_KEY}] ${ITER}회차 리뷰 반영 실패(exit ${RC}) → 루프 중단" >&2
-      notify_slack "❌ [${ISSUE_KEY}] 리뷰 승인 루프 ${ITER}/${REVIEW_LOOP_MAX}회차 — 리뷰 반영 실패로 중단 · ${OR}#${PR_NUM} · ${PR_URL}"
+      # run-jira-agent.sh 가 REWORK_FAILED 마커에서 뽑은 사유(권한 거부 등) — 알림만 보고도 원인을 알게 한다
+      FAIL_WHY="$(grep -oE "리뷰 반영 실패: .*" "${REWORK_OUT}" 2>/dev/null | tail -n1 | sed -E 's/^리뷰 반영 실패: //' | cut -c1-200 || true)"
+      echo ">> [${ISSUE_KEY}] ${ITER}회차 리뷰 반영 실패(exit ${RC})${FAIL_WHY:+: ${FAIL_WHY}} → 루프 중단" >&2
+      notify_slack "❌ [${ISSUE_KEY}] 리뷰 승인 루프 ${ITER}/${REVIEW_LOOP_MAX}회차 — 리뷰 반영 실패로 중단${FAIL_WHY:+ (${FAIL_WHY})} · ${OR}#${PR_NUM} · ${PR_URL}"
       FINAL="failed"; break
     fi
     # 스킵 판정은 '이 카드의 락에 막혔다'는 그 한 줄로만 한다. 하위가 찍는 다른 SKIP(중첩 루프·질문 대기)까지
@@ -179,7 +181,8 @@ while (( ITER < REVIEW_LOOP_MAX )); do
     fi
     # 반영할 새 피드백이 없어 아무것도 안 고친 회차(정상). 직전 리뷰가 이미 반영된 상태일 수 있으므로
     # 재리뷰로 넘겨 판정한다. 다만 두 회차 연속 무변경이면 더 진전될 게 없으므로 사람 확인으로 넘긴다.
-    if grep -qF "${NO_REWORK_MARK}" "${REWORK_OUT}" 2>/dev/null; then
+    # 줄 전체가 마커일 때만 — 실패 보고 문장 속 마커 언급까지 잡으면 실패가 '새 피드백 없음'으로 둔갑한다.
+    if grep -qE "^[[:space:]*\`]*${NO_REWORK_MARK}[[:space:]*\`]*\$" "${REWORK_OUT}" 2>/dev/null; then
       NOOP_STREAK=$(( NOOP_STREAK + 1 ))
       if (( NOOP_STREAK >= 2 )); then
         echo ">> [${ISSUE_KEY}] ${ITER}회차도 반영할 새 피드백 없음(연속 ${NOOP_STREAK}회) → 진전 없음, 루프 중단" >&2

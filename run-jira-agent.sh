@@ -51,6 +51,7 @@ PR_OPEN_LABEL="${PR_OPEN_LABEL:-claude-pr}"     # PR 올림(병합 대기) 표�
 TARGET_BRANCH_LABEL="${TARGET_BRANCH_LABEL:-claude-branched}"   # plan 이 타겟(작업) 브랜치를 만들었음을 표시하는 라벨
 TARGET_BRANCH_MARK="🌿 타겟 브랜치:"           # Jira 코멘트에 타겟 브랜치명을 남기는 마커(build 가 이걸로 브랜치 인식)
 NO_REWORK_MARK="NO_REWORK_NEEDED"               # rework 무변경(반영할 새 피드백 없음) 마커 — run-review-loop.sh 와 동일해야 함
+REWORK_FAILED_MARK="REWORK_FAILED"              # rework 실패(권한 거부 등) 마커 — run-review-loop.sh 와 동일해야 함
 ALREADY_DONE_MARK="ALREADY_IMPLEMENTED"         # build 무변경(요구 변경이 이미 base 에 있음) 마커 — lib.ALREADY_DONE_MARK 와 동일해야 함
 # CI_FIX 모드가 '무엇을 했는지' 알리는 마커 — run-ci-loop.sh 가 이걸로 재리뷰 필요 여부를 정한다.
 CI_RERUN_MARK="CI_RERUN_ONLY"                   # 코드 변경 없이 재실행만(인프라 장애·플레이크) → 재리뷰 불필요
@@ -374,7 +375,7 @@ ${FEEDBACK_INSTR}
 7. 반영 후 Jira 이슈 ${ISSUE_KEY} 에 '리뷰 반영 완료' 코멘트(반영 항목 요약 + 갱신된 PR URL)를 남기세요. 이슈 '상태는 변경하지 마세요'.
 [종료 규칙] 아래 둘을 구분하세요.
  - '반영할 새 피드백이 없음'(지적이 이미 모두 반영돼 고칠 것이 없음): 정상입니다. 확인 근거를 쓴 뒤 마지막 줄에 정확히 '${NO_REWORK_MARK}' 한 줄만 출력하고 '정상 종료'하세요. 커밋·푸시·Jira 코멘트는 하지 마세요(반영 사실이 없는데 '반영 완료'를 남기지 않습니다).
- - '반영할 PR 자체가 없음 / 반영을 시도했으나 실패': 비정상입니다. 사유를 출력하고 비정상 종료하세요.
+ - '반영할 PR 자체가 없음 / 반영을 시도했으나 실패'(도구 권한 거부 등으로 필요한 작업을 못 함): 비정상입니다. 마지막 줄에 '${REWORK_FAILED_MARK}: <사유 한 줄>' 을 출력하고 종료하세요. 이때 '${NO_REWORK_MARK}' 는 출력하지 마세요.
 완료 후 갱신한 PR URL 들을 출력하세요."
 elif [[ -n "${CI_FIX:-}" ]]; then
   echo ">> [${ISSUE_KEY}] [CI-FIX] CI 실패 원인 파악 + 수정${REWORK_ONLY_OWNER:+ · 대상 PR ${REWORK_ONLY_OWNER}#${REWORK_ONLY_NUM:-}}"
@@ -533,7 +534,14 @@ if [[ "${CLAUDE_OK}" -eq 0 ]]; then
   fi
   if grep -q 'SKIP:' "${CLAUDE_OUT}"; then
     RESULT="skip"
-  elif [[ -n "${REWORK:-}" ]] && grep -qF "${NO_REWORK_MARK}" "${CLAUDE_OUT}"; then
+  elif [[ -n "${REWORK:-}" ]] && grep -qE "^[[:space:]*\`]*${REWORK_FAILED_MARK}:" "${CLAUDE_OUT}"; then
+    # 에이전트는 종료코드를 못 바꾸므로 실패를 마커로 받는다. 이게 없으면 '반영 실패'가 무변경(noop)이나
+    # PR URL 언급 때문에 성공(rework)으로 잡혀, 승인 루프가 '새 피드백 없음'으로 오해한다(PHYS-411).
+    RESULT="failed"
+    REWORK_FAIL_REASON="$(grep -E "^[[:space:]*\`]*${REWORK_FAILED_MARK}:" "${CLAUDE_OUT}" | tail -n1 | sed -E "s/^[[:space:]*\`]*${REWORK_FAILED_MARK}:[[:space:]]*//; s/[*\`[:space:]]+\$//")"
+    echo ">> [${ISSUE_KEY}] 리뷰 반영 실패: ${REWORK_FAIL_REASON}" >&2
+  elif [[ -n "${REWORK:-}" ]] && grep -qE "^[[:space:]*\`]*${NO_REWORK_MARK}[[:space:]*\`]*\$" "${CLAUDE_OUT}"; then
+    # 줄 전체가 마커일 때만 — 실패 보고 중에 마커 이름을 언급한 문장은 잡지 않는다.
     # 반영할 새 피드백이 없어 아무것도 고치지 않은 정상 종료. PR 이 갱신되지 않는 게 맞으므로
     # '미완료(재시도 대상)' 로 몰면 안 된다 — 승인 루프가 이걸 반영 실패로 보고 중단했었다.
     RESULT="noop"
