@@ -616,6 +616,12 @@ function alreadyDoneComment(evidence, doneStatus) {
     "판단이 틀렸다면 상태를 되돌리고 담당 코멘트로 남은 작업을 적어 주세요.",
   ].join("\n");
 }
+// 중지 6초 뒤 강제 정리에서 에픽 락을 지워도 되는가. 그 사이 [이어서 진행]으로 뜬 새 러너가 락을 잡았으면
+// 지우면 안 된다 — 지우면 살아 있는 러너가 '중단됨'으로 보이고, 재개를 누를 때마다 복제 러너가 뜬다(EKYB-951).
+function stopLockClearable(lockPid, stoppedPid, isAlive) {
+  if (!lockPid || lockPid === stoppedPid) return true;
+  return !isAlive(lockPid);
+}
 // approve 단계에서 리뷰 루프를 다시 태울 PR. [이어서 진행]으로 approve 에 들어온 카드만 대상이다 —
 // 그 단계는 승인 마커만 보므로, 그대로 두면 미승인 PR 은 반영 없이 즉시 다시 멈춘다.
 // 평소 흐름(build·ci 직후)은 이미 리뷰 루프를 거쳤으니 다시 돌리지 않는다.
@@ -961,7 +967,7 @@ module.exports = {
   ciCheckState, ciStateOf, ciStateWithRuns, failedChecks, runIdFromCheckUrl,
   CI_LOOP_MAX_DEFAULT, CI_LOOP_MAX_LIMIT, clampCiLoopMax,
   SUGGEST_MARK, parseSuggestedAnswers,
-  EPIC_STEPS, epicChildrenJql, searchEpicChildren, epicBlockers, epicTaskStep, pickEpicTasks, nextEpicTask, epicTaskStates, epicBlockedReason, nextEpicStep, approveReviewTargets, ALREADY_DONE_MARK, alreadyDoneComment,
+  EPIC_STEPS, epicChildrenJql, searchEpicChildren, epicBlockers, epicTaskStep, pickEpicTasks, nextEpicTask, epicTaskStates, epicBlockedReason, nextEpicStep, approveReviewTargets, stopLockClearable, ALREADY_DONE_MARK, alreadyDoneComment,
   EPIC_PARALLEL_EXTRA_MAX, clampParallelExtra, epicResumePoints, summarizeEpicRuns, runEpicSlots, buildAdoptedAnswerBody, prBelongsToCard,
   EPIC_HIERARCHY_LEVEL, EPIC_LABEL_FALLBACK, topLevelIssueTypes, epicSearchJql, epicTypeLabel,
   EPIC_AUTO_MERGE_MIN_DEFAULT, EPIC_AUTO_MERGE_MIN_LIMIT, clampAutoMergeMin, shouldAutoMerge, mergeReadyState, isMergeReady, ciFixTargets,

@@ -790,3 +790,12 @@ test("alreadyDoneComment: 자동 완료 근거 코멘트 · 셸 마커와 lib �
   assert.ok(hit("**ALREADY_IMPLEMENTED: kyb-client@d41bef5**"));
   assert.ok(!hit("변경이 없으면 ALREADY_IMPLEMENTED: 마커를 쓰라고 했지만 남은 작업이 있어 쓰지 않았습니다"));
 });
+
+test("stopLockClearable: 중지 직후 재개된 새 러너의 락은 강제 정리에서 지우지 않는다", () => {
+  const alive = new Set([200]);
+  const isAlive = (p) => alive.has(p);
+  assert.equal(lib.stopLockClearable(null, 100, isAlive), true);   // 락 pid 없음
+  assert.equal(lib.stopLockClearable(100, 100, isAlive), true);    // 중지한 그 러너
+  assert.equal(lib.stopLockClearable(300, 100, isAlive), true);    // 다른 pid 지만 죽은 스테일 락
+  assert.equal(lib.stopLockClearable(200, 100, isAlive), false);   // 6초 안에 [이어서 진행]으로 뜬 새 러너
+});

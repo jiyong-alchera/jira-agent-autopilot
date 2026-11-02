@@ -1100,6 +1100,8 @@ app.post("/api/epics/:key/run/stop", (req, res) => {
     setTimeout(() => {   // SIGKILL 은 정리 훅 미실행 → 락을 직접 치운다(상태 파일은 남김)
       for (const p of [st.pid, ...descendantPids(st.pid)].filter(isAlive)) { try { process.kill(p, "SIGKILL"); } catch {} }
       const lockDir = path.join(stateDir, `${key}.epic.lock`);
+      let lockPid = null; try { lockPid = parseInt(fs.readFileSync(`${lockDir}.pid`, "utf8").trim(), 10) || null; } catch {}
+      if (!lib.stopLockClearable(lockPid, st.pid, isAlive)) return;   // 6초 안에 재개된 새 러너의 락
       try { fs.rmSync(lockDir, { recursive: true, force: true }); } catch {}
       for (const f of [`${lockDir}.pid`, `${lockDir}.phase`, path.join(stateDir, `${key}.epic.stop`)]) { try { fs.unlinkSync(f); } catch {} }
     }, 6000);
