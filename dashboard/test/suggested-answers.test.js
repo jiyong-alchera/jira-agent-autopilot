@@ -80,3 +80,15 @@ test("질문 본문에 '제안' 이 들어가도 줄 시작이 아니면 제안�
   assert.strictEqual(r.items[0].question, "이 제안을 반영할까요?");
   assert.strictEqual(r.items[0].suggestion, "반영합니다");
 });
+
+test("planHasNoQuestions: plan 의 「질문 없음」 코멘트를 인식하되 뒤에 제안 질문이 다시 오면 아니다", () => {
+  const noQ = { id: "1", body: "@담당 질문 없음 — 구현 준비 완료\n🌿 타겟 브랜치: feat/PO-145-x" };
+  const sug = { id: "2", body: "1. 기본값은?\n   💡 제안: 비활성" };
+  assert.strictEqual(lib.planHasNoQuestions([noQ]), true);
+  assert.strictEqual(lib.planHasNoQuestions([sug, noQ]), true);    // 재-plan 결과 질문이 사라짐
+  assert.strictEqual(lib.planHasNoQuestions([noQ, sug]), false);   // 재-plan 결과 질문이 생김
+  assert.strictEqual(lib.planHasNoQuestions([sug]), false);
+  assert.strictEqual(lib.planHasNoQuestions([{ id: "3", body: "질문 없음 - 구현 준비 완료" }]), true);
+  assert.strictEqual(lib.planHasNoQuestions([]), false);
+  assert.strictEqual(lib.planHasNoQuestions(undefined), false);
+});

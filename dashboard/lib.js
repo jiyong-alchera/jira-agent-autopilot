@@ -366,6 +366,19 @@ function parseSuggestedAnswers(comments) {
     draft: items.map((it, i) => `${it.n || i + 1}. ${it.suggestion}`).join("\n"),
   };
 }
+// plan 이 질문 없이 「질문 없음 — 구현 준비 완료」 로 끝났는가. 그 뒤에 제안 달린 질문 코멘트가 다시 있으면
+// (재-plan) 질문이 살아 있는 것으로 본다. adopt 는 이 경우 채택할 것 없이 통과해야 한다(PO-145).
+const NO_QUESTION_RE = /질문\s*없음\s*[—–-]+\s*구현\s*준비\s*완료/;
+function planHasNoQuestions(comments) {
+  const list = Array.isArray(comments) ? comments : [];
+  let noQ = -1, sug = -1;
+  list.forEach((c, i) => {
+    const body = String((c && c.body) || "");
+    if (NO_QUESTION_RE.test(body)) noQ = i;
+    if (body.split(/\r?\n/).some((l) => SUGGEST_RE.test(l))) sug = i;
+  });
+  return noQ >= 0 && noQ > sug;
+}
 
 // ===== 에픽 연속 개발(run-epic-loop.js) 순수 로직 =====
 // 한 에픽의 하위 태스크를 Jira 순위순으로 하나씩: prepare→plan→adopt→build(+리뷰 승인 루프)→await-merge.
@@ -966,7 +979,7 @@ module.exports = {
   REVIEW_LOOP_MAX_DEFAULT, REVIEW_LOOP_MAX_LIMIT, clampReviewLoopMax,
   ciCheckState, ciStateOf, ciStateWithRuns, failedChecks, runIdFromCheckUrl,
   CI_LOOP_MAX_DEFAULT, CI_LOOP_MAX_LIMIT, clampCiLoopMax,
-  SUGGEST_MARK, parseSuggestedAnswers,
+  SUGGEST_MARK, parseSuggestedAnswers, planHasNoQuestions,
   EPIC_STEPS, epicChildrenJql, searchEpicChildren, epicBlockers, epicTaskStep, pickEpicTasks, nextEpicTask, epicTaskStates, epicBlockedReason, nextEpicStep, approveReviewTargets, stopLockClearable, ALREADY_DONE_MARK, alreadyDoneComment,
   EPIC_PARALLEL_EXTRA_MAX, clampParallelExtra, epicResumePoints, summarizeEpicRuns, runEpicSlots, buildAdoptedAnswerBody, prBelongsToCard,
   EPIC_HIERARCHY_LEVEL, EPIC_LABEL_FALLBACK, topLevelIssueTypes, epicSearchJql, epicTypeLabel,

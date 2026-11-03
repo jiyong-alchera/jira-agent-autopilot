@@ -380,6 +380,10 @@ async function stepPlan(task) {
 async function stepAdopt(task) {
   const cs = await jira("GET", `/rest/api/3/issue/${encodeURIComponent(task.key)}/comment?maxResults=50`);
   const comments = (cs.comments || []).map((c) => ({ id: c.id, body: lib.adfToText(c.body) }));
+  if (lib.planHasNoQuestions(comments)) {
+    await addLabels(task.key, [cfg.answeredLabel || "claude-answered"]);
+    return { ok: true, note: "plan 질문 없음 — 채택할 답변 없이 진행" };
+  }
   const suggested = lib.parseSuggestedAnswers(comments);
   if (!suggested) {
     return { ok: false, reason: "plan 질문에 '💡 제안:' 답변이 없어 자동 채택할 수 없습니다. 카드에 직접 답변한 뒤 이어서 진행하세요." };
