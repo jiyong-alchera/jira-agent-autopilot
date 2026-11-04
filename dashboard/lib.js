@@ -121,7 +121,7 @@ function effectiveDoneStatuses(cfg) {
 
 function detectJql(mode, cfg) {
   const proj = cfg.projectKey ? ` AND project = "${cfg.projectKey}"` : "";
-  const failed = ` AND (labels != "${cfg.failedLabel}" OR labels IS EMPTY)`;
+  const failed = ` AND (labels != "${cfg.failedLabel}" OR labels IS EMPTY) AND (labels != "${cfg.skipLabel || "claude-skip"}" OR labels IS EMPTY)`;
   // 완료 제외: 상태 카테고리 Done + '완료로 인식'하는 상태들(doneStatus ∪ 매핑 완료). (워크플로마다 완료가
   // 'Done 카테고리'일 수도, 'DEV COMPLETED'/'QA READY' 처럼 카테고리가 다른 커스텀 상태일 수도 있어 둘 다 제외)
   const dones = effectiveDoneStatuses(cfg);
@@ -366,6 +366,11 @@ function parseSuggestedAnswers(comments) {
     draft: items.map((it, i) => `${it.n || i + 1}. ${it.suggestion}`).join("\n"),
   };
 }
+// 하위 스크립트 출력의 마지막 'SKIP:' 줄 사유. plan 이 카드를 스스로 건너뛰었을 때 중단 사유로 보여 준다(PO-148).
+function skipLine(out) {
+  const m = String(out || "").match(/^SKIP:[ \t]*(.+)$/gm);
+  return m ? m[m.length - 1].replace(/^SKIP:[ \t]*/, "").trim() : "";
+}
 // plan 이 질문 없이 「질문 없음 — 구현 준비 완료」 로 끝났는가. 그 뒤에 제안 달린 질문 코멘트가 다시 있으면
 // (재-plan) 질문이 살아 있는 것으로 본다. adopt 는 이 경우 채택할 것 없이 통과해야 한다(PO-145).
 const NO_QUESTION_RE = /질문\s*없음\s*[—–-]+\s*구현\s*준비\s*완료/;
@@ -452,6 +457,7 @@ function epicTaskStep(task, cfg) {
   const c = cfg || {};
   const labels = (task && task.labels) || [];
   if (task && task.done) return null;                                   // 이미 완료된 카드는 건너뜀
+  if (labels.includes(c.skipLabel || "claude-skip")) return null;       // 작업 제외 표시(기록용 카드 등)
   // PR 올림 → ci 부터. ci 는 초록이면 즉시 통과하므로, 재개할 때마다 CI 를 한 번 더 확인하는 값이
   // 비용보다 크다(중단된 사이 base 가 움직여 깨져 있는 경우가 실제로 있다).
   if (labels.includes(c.prOpenLabel || "claude-pr")) return "ci";
@@ -979,7 +985,7 @@ module.exports = {
   REVIEW_LOOP_MAX_DEFAULT, REVIEW_LOOP_MAX_LIMIT, clampReviewLoopMax,
   ciCheckState, ciStateOf, ciStateWithRuns, failedChecks, runIdFromCheckUrl,
   CI_LOOP_MAX_DEFAULT, CI_LOOP_MAX_LIMIT, clampCiLoopMax,
-  SUGGEST_MARK, parseSuggestedAnswers, planHasNoQuestions,
+  SUGGEST_MARK, parseSuggestedAnswers, planHasNoQuestions, skipLine,
   EPIC_STEPS, epicChildrenJql, searchEpicChildren, epicBlockers, epicTaskStep, pickEpicTasks, nextEpicTask, epicTaskStates, epicBlockedReason, nextEpicStep, approveReviewTargets, stopLockClearable, ALREADY_DONE_MARK, alreadyDoneComment,
   EPIC_PARALLEL_EXTRA_MAX, clampParallelExtra, epicResumePoints, summarizeEpicRuns, runEpicSlots, buildAdoptedAnswerBody, prBelongsToCard,
   EPIC_HIERARCHY_LEVEL, EPIC_LABEL_FALLBACK, topLevelIssueTypes, epicSearchJql, epicTypeLabel,

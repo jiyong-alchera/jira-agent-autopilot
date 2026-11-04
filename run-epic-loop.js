@@ -371,6 +371,10 @@ async function stepPrepare(task) {
 async function stepPlan(task) {
   const { code, out } = await runScript("run-jira-agent.sh", [task.key, "plan"], await taskEnv(task.key));
   if (code !== 0) return { ok: false, reason: `plan 실행 실패 (exit ${code})`, lastError: tailOf(out) };
+  const skipped = lib.skipLine(out);
+  if (skipped) {
+    return { ok: false, reason: `plan 이 카드를 건너뜀: ${skipped} — 작업 대상이 아니면 '${cfg.skipLabel || "claude-skip"}' 라벨을 붙이거나 완료 처리한 뒤 이어서 진행하세요` };
+  }
   const after = await fetchTask(task.key);
   if (!after.labels.includes(cfg.plannedLabel || "claude-planned")) {
     return { ok: false, reason: "plan 이 끝났지만 claude-planned 라벨이 없습니다(질문 코멘트 확인 필요)" };

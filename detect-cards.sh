@@ -42,7 +42,7 @@ if [[ -n "${PROJECT_KEY}" ]]; then
   PROJECT_FILTER=" AND project = \"${PROJECT_KEY}\""
 fi
 
-FAILED_FILTER=" AND (labels != \"${FAILED_LABEL}\" OR labels IS EMPTY)"
+FAILED_FILTER=" AND (labels != \"${FAILED_LABEL}\" OR labels IS EMPTY) AND (labels != \"${SKIP_LABEL:-claude-skip}\" OR labels IS EMPTY)"
 if [[ "${TRIGGER_MODE}" == "text" ]]; then
   TRIGGER_FILTER="text ~ \"${TRIGGER_TEXT}\""
 else

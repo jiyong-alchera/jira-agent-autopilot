@@ -129,6 +129,7 @@ Jira 카드를 자동으로 탐지해 **Claude가 개발 → PR 생성 → 카�
 | 담당자 답변 코멘트 | 실제 답변 존재(build 진입 게이트 ②) | 사람(담당자) |
 | 완료(상태 카테고리 Done 또는 `DONE_STATUS` 이름) | 처리 완료, 탐지 제외 | build 단계의 Claude/사람 |
 | `claude-failed` 라벨 | 연속 실패 N회 초과 → 탐지 제외(수동 확인 필요) | 실패 처리 로직(Claude) |
+| `claude-skip` 라벨 | 작업 대상 아님(이미 끝난 산출물을 기록하는 카드 등) → plan/build/review 탐지와 에픽 연속 개발 모두에서 제외 | 사람 |
 | 처리 락(`repos/.state/<KEY>.lock`(plan/build) · `<KEY>.review.lock`(review) · `<KEY>.reviewloop.lock`(승인까지 루프) + `.phase`/`.pid`) | 해당 카드 **처리 중**(phase·스크립트 PID 기록 → 대시보드 '중지'에 사용). 대시보드는 세 락을 모두 인식해 plan/build·review·승인 루프 작업 모두 '처리 중' 표시·중지 가능. **`REVIEW_LOOP_AFTER` 로 build → 승인 루프가 이어질 때는 build 가 `<KEY>.lock` 을 먼저 놓고 루프를 띄운다**(루프가 회차마다 그 락을 다시 잡아야 하므로) | run-jira-agent.sh / run-review.sh / run-review-loop.sh(시작 시 생성, 종료 시 trap 으로 제거) |
 | `repo_<name>` 라벨 | 카드의 대상 repo(여러 개 가능) | 사람/대시보드(카드 등록 시) |
 
@@ -236,7 +237,7 @@ Jira 카드를 자동으로 탐지해 **Claude가 개발 → PR 생성 → 카�
 - **plan 대상 JQL**(label 모드): `assignee = currentUser() AND statusCategory != Done AND status != "DEV COMPLETED" AND labels = "claude-work" AND (labels != "claude-planned" OR labels IS EMPTY) AND (labels != "claude-failed" OR labels IS EMPTY)`
 - **build 대상 JQL**(label 모드): `assignee = currentUser() AND statusCategory != Done AND status != "DEV COMPLETED" AND labels = "claude-work" AND labels = "claude-planned" AND labels = "claude-answered" AND (labels != "claude-failed" OR labels IS EMPTY)`
 - build 후보는 `claude-planned` **그리고** `claude-answered` 라벨이 둘 다 있어야 한다(담당자 답변 완료 신호).
-- 두 JQL 모두 `claude-failed` 라벨이 붙은(반복 실패) 카드를 제외해 무한 재시도를 막는다.
+- 두 JQL 모두 `claude-failed` 라벨이 붙은(반복 실패) 카드를 제외해 무한 재시도를 막는다. 작업 제외 라벨(`claude-skip`, 설정 `skipLabel`) 이 붙은 카드도 모든 모드에서 `(labels != "claude-skip" OR labels IS EMPTY)` 로 제외한다(위 예시에는 생략).
 - `PROJECT_KEY`가 설정되면 `AND project = "<KEY>"` 필터 추가.
 - claude 출력에서 `이슈키(PROJ-숫자)` 패턴만 추출해 잡텍스트를 제거.
 
@@ -320,7 +321,7 @@ Jira 카드를 자동으로 탐지해 **Claude가 개발 → PR 생성 → 카�
 | 단계 | 하는 일 | 실패 시 |
 |------|---------|---------|
 | `prepare` | 트리거 라벨(`claude-work`)과 **선택한 repo 의 `repo_<name>` 라벨**을 카드에 맞춘다 | 중단(paused) |
-| `plan` | `run-jira-agent.sh <KEY> plan` — 질문 코멘트 + `claude-planned` | 중단 |
+| `plan` | `run-jira-agent.sh <KEY> plan` — 질문 코멘트 + `claude-planned` | 중단. plan 이 카드를 스스로 건너뛰었으면(`SKIP: <사유>` 출력) 그 사유를 중단 사유로 보여 준다(`lib.skipLine`) |
 | `adopt` | plan 이 질문마다 남긴 **`💡 제안:` 답변을 자동 채택**해 답변 코멘트(원 질문 인용) + `claude-answered` | plan 이 「질문 없음 — 구현 준비 완료」 로 끝났으면(그 뒤 제안 질문 코멘트가 없을 때) 채택할 것 없이 `claude-answered` 만 붙이고 통과. 그 밖에 제안이 없으면 중단(사람이 직접 답변 후 재개) |
 | `build` | `REVIEW_LOOP_AFTER=1 run-jira-agent.sh <KEY> build` — 개발·PR 생성 후 **[승인까지 리뷰 루프](#43c-run-review-loopsh-승인까지-반복-루프--대시보드-승인까지-루프)** 가 이어서 실행 | 중단 |
 | `ci` | 열린 PR 의 **CI(체크)가 초록이 될 때까지** '원인 파악 → 수정/재실행 → 재검증' 을 반복(기본 5회, `EPIC_CI_LOOP_MAX`) — [4.3e](#43e-ci-단계-ci-실패-자동-수정) | 상한을 다 써도 빨간색이면 중단 |
@@ -666,6 +667,7 @@ CI 가 끝난 뒤 에픽 러너의 '병합만 남음' 알림이 또 와서 그�
 | plan 라벨 | `PLANNED_LABEL` | `claude-planned` | plan 완료 표시 라벨 |
 | 답변 라벨 | `ANSWERED_LABEL` | `claude-answered` | 담당자 답변 완료 신호(build 진입 게이트) |
 | 실패 라벨 | `FAILED_LABEL` | `claude-failed` | 반복 실패 표시 라벨(탐지 제외) |
+| 작업 제외 라벨 | `SKIP_LABEL`(대시보드 `skipLabel`) | `claude-skip` | 작업 대상이 아닌 카드 표시. 탐지 JQL 과 에픽 연속 개발(`lib.epicTaskStep`)에서 제외 |
 | 최대 재시도 | `MAX_RETRIES` | `3` | 연속 실패 N회 초과 시 실패 처리 |
 | 테스트 명령 | `TEST_CMD` | (없음=자동 감지) | PR 전 실행할 테스트 명령 |
 | 빌드 명령 | `BUILD_CMD` | (없음=자동 감지) | 테스트 없을 때 시도할 빌드 명령 |
@@ -944,6 +946,7 @@ loop-work/                     # (= 저장소 루트)
 | 리뷰 승인 루프가 **2회차에서 항상 멈춤** — Slack `⏸ … 2/5회차 — 카드가 이미 처리 중이라 중단`, 직전 로그에 `PR 생성 완료 → 리뷰 승인 루프 시작` + `SKIP: … 리뷰 승인 루프가 이미 실행 중입니다(lock)` | (해결됨) 대시보드가 최상위 build 의 env 에 넣은 `REVIEW_LOOP_AFTER=1` 이 자손 프로세스에 상속돼, 루프가 2회차에 부른 rework(`run-jira-agent.sh build`)가 **반영에 성공한 뒤 승인 루프를 또 띄움** → 중첩 실행이 루프 락에 막혀 `SKIP:` 을 찍고, 부모 루프의 `grep "^SKIP: "` 가 이를 **자기 카드 락 스킵으로 오인**해 중단. 반영은 이미 성공했으므로 재리뷰만 유실됨 | 수정됨: ① 루프가 하위를 부를 때 `REVIEW_LOOP_AFTER`/`REVIEW_AFTER`/`REVIEW_FIRST` 를 비우고 `IN_REVIEW_LOOP=1` 주입 ② `run-jira-agent.sh` 는 `REWORK`/`IN_REVIEW_LOOP` 이면 루프를 띄우지 않음 ③ 스킵 판정을 `SKIP: [KEY] 이미 처리 중(lock)` / `SKIP: awaiting answers` 정확 매칭으로 좁힘. 중단된 카드는 PR 목록의 `🔁 승인까지 루프` 로 이어서 진행 |
 | 카드에 붙인 **docx·xlsx·pptx 요구사항이 추론에 반영되지 않음**. 로그에 `읽을 수 없어 제외: 요구사항.docx` | (해결됨) 오피스 파일은 압축된 XML 바이너리라 `Read` 로 열어도 의미 있는 텍스트가 나오지 않아 다운로드 대상에서 빼고 있었다 | 수정됨: `lib-office.js` 가 **텍스트로 변환**해 `<이름>.docx.txt` 로 넘긴다(docx=문단, xlsx=시트별 TSV, pptx=슬라이드별). 서식·이미지·차트는 빠지고 본문 텍스트만 들어간다. 구형 `.doc/.xls/.ppt` 와 암호화 파일은 여전히 제외 |
 | **plan/build 가 카드 본문 이미지를 인식하지 못함**(스크린샷·UI 시안을 못 본 채 작업). 로그에 `카드 첨부 인식` 줄이 없음 | (해결됨) 첨부 다운로드가 `run-cycle.js`(스케줄 루프 전용) 안에만 있어서, **대시보드 '단건 즉시 실행'·승인 루프의 rework/재리뷰**처럼 `run-cycle` 를 거치지 않는 경로는 `CARD_IMAGES`/`CARD_DOCS` 가 비어 프롬프트에 첨부가 아예 주입되지 않았다 | 수정됨: 다운로드 로직을 `lib-attachments.js` 로 분리(모듈+CLI 겸용)하고, `run-jira-agent.sh`·`run-review.sh` 가 첨부 env 가 비어 있으면 **직접 CLI 로 받아 채운다**. 스케줄 루프는 종전대로 `run-cycle` 가 미리 넣어주므로 중복 다운로드 없음 |
+| 에픽이 `plan 이 끝났지만 claude-planned 라벨이 없습니다` 로 멈춤. plan 로그에는 `SKIP: … 기록 카드라 건너뜁니다` (PO-148) | 에픽 prepare 가 기록용 카드에도 `claude-work` 를 붙였고, plan 에이전트는 카드 본문의 '작업 대상 아님'을 보고 스스로 건너뛰었다. 러너는 SKIP 을 구분하지 못해 일반 메시지로 멈췄다 | (해결됨) 중단 사유에 SKIP 사유가 그대로 나온다. 작업 대상이 아닌 카드에는 `claude-skip` 라벨을 붙이면 에픽·탐지 모두 건너뛰고, 그 카드만 남았으면 에픽은 완료로 끝난다. 이미 멈췄다면 라벨을 붙이거나 완료 처리한 뒤 [이어서 진행] |
 | 에픽이 `adopt: plan 질문에 '💡 제안:' 답변이 없어 자동 채택할 수 없습니다` 로 멈추고 [이어서 진행]을 눌러도 곧바로 다시 멈춤. 카드에는 plan 의 「질문 없음 — 구현 준비 완료」 코멘트만 있음 (PO-145) | plan 이 질문 없이 끝나면 `claude-answered` 를 사람이 붙이도록 안내만 하는데, 에픽의 adopt 는 제안 답변만 찾아 '답변 없음'으로 판정했다 | (해결됨) adopt 가 「질문 없음」 코멘트(그 뒤 제안 질문 코멘트가 없을 때)를 인식해 `claude-answered` 를 붙이고 build 로 넘어간다(`lib.planHasNoQuestions`) |
 | 실행 중인 에픽이 **'중단됨'으로 보이고, [이어서 진행]을 누를 때마다 1~2초 만에 다시 중단**. 로그에는 카드마다 `SKIP: [KEY] 이미 처리 중(lock)` 과 `build 가 끝났지만 PR 표시(claude-pr 라벨)가 없습니다` 가 반복 (EKYB-951) | 에픽을 **중지한 뒤 6초 안에 [이어서 진행]** 을 누르면, 중지 API 의 6초 강제 정리가 **새 러너의 락까지 지웠다**. 락이 없으니 대시보드는 살아 있는 러너를 중단으로 보고, 재개할 때마다 복제 러너가 떠 카드 락에 막혀 곧장 '중단'을 기록하며 락을 또 지웠다 | (해결됨) 강제 정리는 락 pid 가 중지한 러너이거나 죽은 프로세스일 때만 락을 지운다. 이미 이 상태라면 살아 있는 러너 pid 로 `repos/.state/<EPIC>.epic.lock/` 디렉터리와 `<EPIC>.epic.lock.pid`·`.phase`(`epic`) 를 다시 만들면 '진행 중'으로 돌아온다 |
 | 리뷰 승인 루프가 `⏸ 반영할 새 피드백이 없어 진전 없음, 사람 확인 필요` 로 끝났는데, rework 로그에는 **권한 거부로 반영 실패**(예: `addCommentToJiraIssue` 가 auto mode 분류기에 막힘)가 적혀 있음 (PHYS-411) | 실패를 알리는 문장 속 `NO_REWORK_NEEDED` 언급을 마커로 잡아 무변경(`noop`)으로 분류했다. 엔진은 '비정상 종료'를 종료코드로 표현할 수 없어 실패 신호도 없었다 | (해결됨) 무변경 마커는 줄 전체일 때만 인식하고, 실패는 `REWORK_FAILED: <사유>` 마커로 받아 `failed` 로 분류해 알림에 사유를 싣는다. 권한 거부가 원인이면 `~/.claude/settings.json` 의 `permissions.allow` 에 해당 도구(예: `mcp__claude_ai_Atlassian_Rovo__addCommentToJiraIssue`)를 추가한 뒤 리뷰 루프를 다시 돌린다 |

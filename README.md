@@ -89,7 +89,7 @@ npm test           # 단위 테스트 (node:test, 무설치) — lib.js 순수 �
 `ENGINE`(기본 claude · codex/gemini 선택 가능), `MODEL`(비우면 엔진 기본 모델),
 `TRIGGER_MODE`(기본 label), `TRIGGER_LABEL`(기본 claude-work), `TRIGGER_TEXT`(text 모드 레거시),
 `DONE_STATUS`(기본 DEV COMPLETED), `PLANNED_LABEL`(기본 claude-planned),
-`ANSWERED_LABEL`(기본 claude-answered), `FAILED_LABEL`(기본 claude-failed), `MAX_RETRIES`(기본 3),
+`ANSWERED_LABEL`(기본 claude-answered), `FAILED_LABEL`(기본 claude-failed), `SKIP_LABEL`(기본 claude-skip — 붙은 카드는 자동화가 건너뜀), `MAX_RETRIES`(기본 3),
 `ENV_SRC`(기본 work.env), `CLONE_BASE`(기본 repos/), `LOOP_INTERVAL`(기본 3600),
 `MAX_PARALLEL`(기본 3), `TEST_CMD`/`BUILD_CMD`(미설정 시 자동 감지),
 `ANTHROPIC_API_KEY`, `GH_TOKEN`, `SLACK_WEBHOOK_URL`(설정 시 처리 완료/실패 알림)

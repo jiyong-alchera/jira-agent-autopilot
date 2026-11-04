@@ -44,6 +44,7 @@ const DEFAULT_CONFIG = {
   plannedLabel: "claude-planned",
   answeredLabel: "claude-answered",
   failedLabel: "claude-failed",
+  skipLabel: "claude-skip",      // 작업 제외 표시(기록용 카드 등) — 탐지·에픽 연속 개발 모두 건너뜀
   prOpenLabel: "claude-pr",
   maxRetries: 3,
   maxParallel: 5,
@@ -151,6 +152,7 @@ function scriptEnv(id) {
   env.PLANNED_LABEL = cfg.plannedLabel;
   env.ANSWERED_LABEL = cfg.answeredLabel || "claude-answered";
   env.FAILED_LABEL = cfg.failedLabel || "claude-failed";
+  env.SKIP_LABEL = cfg.skipLabel || "claude-skip";
   env.PR_OPEN_LABEL = cfg.prOpenLabel || "claude-pr";
   env.MAX_RETRIES = String(cfg.maxRetries || 3);
   env.TEST_CMD = cfg.testCmd || "";

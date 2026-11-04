@@ -33,6 +33,8 @@ test("detectJql: plan/build 게이트 + 제외 필터 + 프로젝트", () => {
   assert.match(build, /labels = "P" AND labels = "A"/);           // build: planned+answered 둘 다
   assert.match(build, /\(labels != "claude-pr" OR labels IS EMPTY\)/);  // PR 올린 카드 제외
   assert.match(build, /\(labels != "F" OR labels IS EMPTY\)/);
+  for (const q of [plan, build, lib.detectJql("review", cfg)]) assert.match(q, /\(labels != "claude-skip" OR labels IS EMPTY\)/);   // 작업 제외 카드
+  assert.match(lib.detectJql("plan", { ...cfg, skipLabel: "S" }), /\(labels != "S" OR labels IS EMPTY\)/);
 });
 
 test("detectJql: review = claude-pr(PR 올린) 카드 대상", () => {

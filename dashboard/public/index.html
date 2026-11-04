@@ -754,6 +754,8 @@ function ProjectCard({ proj, onDeleted, flash, jumpTo }) {
               info={"label 모드에서 자동화 대상을 표시하는 Jira 라벨입니다. 기본: claude-work\n\n이 라벨이 붙은 카드만 plan/build 대상으로 탐지합니다. Jira에서 카드에 이 라벨을 달아 자동화를 시작하세요."} />}
         <Field label="plan 라벨" value={config.plannedLabel} onChange={(v) => setConfig({ ...config, plannedLabel: v })}
           info={"plan 단계가 끝난 카드에 붙는 라벨입니다. 기본: claude-planned\n\n같은 카드를 plan에서 중복 처리하지 않게 하고, build 진입 게이트(planned+answered)의 한 조건이 됩니다. 보통 기본값 그대로 두세요."} />
+        <Field label="작업 제외 라벨" value={config.skipLabel} onChange={(v) => setConfig({ ...config, skipLabel: v })} placeholder="claude-skip"
+          info={"이 라벨이 붙은 카드는 자동화가 건너뜁니다. 기본: claude-skip\n\n이미 끝난 산출물을 기록하는 카드처럼 작업 대상이 아닌 카드에 붙이세요. plan/build/review 탐지와 에픽 연속 개발 모두에서 제외됩니다."} />
         <Field label="주기(초)" type="number" value={config.intervalSeconds} onChange={(v) => setConfig({ ...config, intervalSeconds: parseInt(v || "3600", 10) })}
           info={"plan/build 루프의 실행 주기(초)입니다. 기본 3600(1시간).\n\n루프는 이 주기마다 등록된 모든 프로젝트를 순회하며 대상 카드를 탐지·처리합니다."} />
         <Field label="review 주기(초)" type="number" value={config.reviewIntervalSeconds} onChange={(v) => setConfig({ ...config, reviewIntervalSeconds: parseInt(v || "3600", 10) })} placeholder="3600"

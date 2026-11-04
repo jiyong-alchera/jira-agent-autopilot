@@ -799,3 +799,23 @@ test("stopLockClearable: 중지 직후 재개된 새 러너의 락은 강제 정
   assert.equal(lib.stopLockClearable(300, 100, isAlive), true);    // 다른 pid 지만 죽은 스테일 락
   assert.equal(lib.stopLockClearable(200, 100, isAlive), false);   // 6초 안에 [이어서 진행]으로 뜬 새 러너
 });
+
+test("작업 제외 라벨(claude-skip): 에픽은 그 카드를 고르지 않고, 남은 게 그것뿐이면 완료로 끝난다", async () => {
+  const cfg = {};
+  assert.equal(lib.epicTaskStep({ key: "PO-148", labels: ["claude-work", "claude-skip"] }, cfg), null);
+  assert.equal(lib.epicTaskStep({ key: "PO-148", labels: ["x-skip"] }, { skipLabel: "x-skip" }), null);
+  assert.equal(lib.epicTaskStep({ key: "PO-149", labels: [] }, cfg), "prepare");
+  const r = await lib.runEpicSlots({
+    cfg, pollMs: 0,
+    fetchChildren: async () => [{ key: "PO-148", labels: ["claude-skip"] }],
+    runTask: async () => { throw new Error("고르면 안 된다"); },
+  });
+  assert.equal(r.outcome, "done");
+});
+
+test("skipLine: 하위 출력의 마지막 SKIP 줄 사유(문장 중간 언급은 무시)", () => {
+  assert.equal(lib.skipLine("요약\n`SKIP:` 이면 건너뜁니다\nSKIP: PO-148은 기록 카드라 건너뜁니다."), "PO-148은 기록 카드라 건너뜁니다.");
+  assert.equal(lib.skipLine("SKIP: a\n중간\nSKIP: b"), "b");
+  assert.equal(lib.skipLine("출력에 SKIP: 이 있으면 skip 처리"), "");
+  assert.equal(lib.skipLine(""), "");
+});
