@@ -652,6 +652,10 @@ function stopLockClearable(lockPid, stoppedPid, isAlive) {
 // approve 단계에서 리뷰 루프를 다시 태울 PR. [이어서 진행]으로 approve 에 들어온 카드만 대상이다 —
 // 그 단계는 승인 마커만 보므로, 그대로 두면 미승인 PR 은 반영 없이 즉시 다시 멈춘다.
 // 평소 흐름(build·ci 직후)은 이미 리뷰 루프를 거쳤으니 다시 돌리지 않는다.
+// 재개 지점이 ci 여도 같다 — 사람이 CI 를 고치려 커밋을 올린 뒤 ci 에서 재개하면(AML-12) 그 뒤 approve 는
+// 리뷰 없이 바로 멈춘다. 이미 승인된 PR 은 approveReviewTargets 가 거르므로 다시 리뷰하지 않는다.
+const REVIEW_ON_RESUME_STEPS = ["ci", "approve"];
+function reviewOnResume(step) { return REVIEW_ON_RESUME_STEPS.includes(step); }
 function approveReviewTargets(prs, resumed) {
   if (!resumed) return [];
   return (prs || []).filter((p) => p && !p.approved);
@@ -994,7 +998,7 @@ module.exports = {
   ciCheckState, ciStateOf, ciStateWithRuns, failedChecks, runIdFromCheckUrl,
   CI_LOOP_MAX_DEFAULT, CI_LOOP_MAX_LIMIT, clampCiLoopMax,
   SUGGEST_MARK, parseSuggestedAnswers, planHasNoQuestions, skipLine, projectRulesInstr,
-  EPIC_STEPS, epicChildrenJql, searchEpicChildren, epicBlockers, epicTaskStep, pickEpicTasks, nextEpicTask, epicTaskStates, epicBlockedReason, nextEpicStep, approveReviewTargets, stopLockClearable, ALREADY_DONE_MARK, alreadyDoneComment,
+  EPIC_STEPS, epicChildrenJql, searchEpicChildren, epicBlockers, epicTaskStep, pickEpicTasks, nextEpicTask, epicTaskStates, epicBlockedReason, nextEpicStep, approveReviewTargets, reviewOnResume, stopLockClearable, ALREADY_DONE_MARK, alreadyDoneComment,
   EPIC_PARALLEL_EXTRA_MAX, clampParallelExtra, epicResumePoints, summarizeEpicRuns, runEpicSlots, buildAdoptedAnswerBody, prBelongsToCard,
   EPIC_HIERARCHY_LEVEL, EPIC_LABEL_FALLBACK, topLevelIssueTypes, epicSearchJql, epicTypeLabel,
   EPIC_AUTO_MERGE_MIN_DEFAULT, EPIC_AUTO_MERGE_MIN_LIMIT, clampAutoMergeMin, shouldAutoMerge, mergeReadyState, isMergeReady, ciFixTargets,

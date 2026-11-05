@@ -325,7 +325,7 @@ Jira 카드를 자동으로 탐지해 **Claude가 개발 → PR 생성 → 카�
 | `adopt` | plan 이 질문마다 남긴 **`💡 제안:` 답변을 자동 채택**해 답변 코멘트(원 질문 인용) + `claude-answered` | plan 이 「질문 없음 — 구현 준비 완료」 로 끝났으면(그 뒤 제안 질문 코멘트가 없을 때) 채택할 것 없이 `claude-answered` 만 붙이고 통과. 그 밖에 제안이 없으면 중단(사람이 직접 답변 후 재개) |
 | `build` | `REVIEW_LOOP_AFTER=1 run-jira-agent.sh <KEY> build` — 개발·PR 생성 후 **[승인까지 리뷰 루프](#43c-run-review-loopsh-승인까지-반복-루프--대시보드-승인까지-루프)** 가 이어서 실행 | 중단 |
 | `ci` | 열린 PR 의 **CI(체크)가 초록이 될 때까지** '원인 파악 → 수정/재실행 → 재검증' 을 반복(기본 5회, `EPIC_CI_LOOP_MAX`) — [4.3e](#43e-ci-단계-ci-실패-자동-수정) | 상한을 다 써도 빨간색이면 중단 |
-| `approve` | 카드의 **열린 봇 PR 전부**에 승인 마커(`CLAUDE-REVIEW-APPROVED`)가 있는지 확인. **[이어서 진행]으로 이 단계에서 재개하면** 미승인 PR 마다 `run-review-loop.sh`(반영 → 재리뷰, 최대 `REVIEW_LOOP_MAX`회)를 **한 번** 다시 태운 뒤 확인한다(`lib.approveReviewTargets`) | 미승인 PR 이 남으면 중단 |
+| `approve` | 카드의 **열린 봇 PR 전부**에 승인 마커(`CLAUDE-REVIEW-APPROVED`)가 있는지 확인. **[이어서 진행]으로 이 단계나 `ci` 에서 재개하면**(`lib.reviewOnResume`) 미승인 PR 마다 `run-review-loop.sh`(반영 → 재리뷰, 최대 `REVIEW_LOOP_MAX`회)를 **한 번** 다시 태운 뒤 확인한다(`lib.approveReviewTargets`) | 미승인 PR 이 남으면 중단 |
 | `await-merge` | **사용자가 그 카드의 PR 을 모두 병합할 때까지 대기.** `EPIC_MERGE_POLL`(기본 60초)마다 `/api/cards/sync-merged` 를 호출해 외부 병합 감지를 앞당긴 뒤 카드가 완료됐는지 확인. **자동 병합**이 켜져 있으면 조건 충족 시 대신 병합. **base 충돌**이 나면 알림 후(버튼 포함) **자동 충돌 해소**가 켜져 있으면 대기 시간 뒤 `rebase 해소 → 재푸시 → 승인 무효화 → 재리뷰`. 대기 중 **CI 가 깨지면**(`lib.ciFixTargets` — 충돌 PR 제외) `ci` 단계와 같은 CI 수정 루프(수정 → 승인 무효화 → 재리뷰)를 즉시 다시 태운다 | 자동 병합 실패 · 충돌 해소 실패 · CI 수정 상한 소진 시 중단 |
 
 - **이미 진행된 카드는 건너뛴다**: 시작 단계는 카드의 라벨/상태로 판정한다(`lib.epicTaskStep`) —
@@ -1066,6 +1066,8 @@ CI 실패·미확정이면 **병합 버튼을 붙이지 않는다**(막히는 �
 원인: `approve` 는 승인 마커만 확인하는 단계라, 재개해도 리뷰 반영·재리뷰가 다시 돌지 않았다. 권한을 풀어 줘도 작업 자체가 재실행되지 않았다.
 
 해결: `approve` 에서 재개한 카드는 미승인 PR 에 리뷰 루프를 한 번 다시 태운 뒤 확인한다(`lib.approveReviewTargets`).
+`ci` 에서 재개한 카드도 같다(`lib.reviewOnResume`). 사람이 CI 를 고치는 커밋을 올리고 ci 에서 재개하면 CI 는 통과해도
+approve 가 리뷰 없이 바로 멈췄다(AML-12). 이미 승인된 PR 은 다시 리뷰하지 않는다.
 평소 흐름(build·ci 직후의 approve)은 이미 리뷰 루프를 거쳤으므로 다시 돌리지 않는다. 카드 생성처럼 자동 모드가 막는 외부 쓰기가
 원인이면 `~/.claude/settings.json` 의 `permissions.allow` 에 해당 MCP 도구(예: `mcp__claude_ai_Atlassian_Rovo__createJiraIssue`)를 먼저 추가한다.
 

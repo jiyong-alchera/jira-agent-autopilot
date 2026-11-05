@@ -410,7 +410,7 @@ async function stepBuild(task) {
   }
   return { ok: true };
 }
-// [이어서 진행]으로 approve 에서 재개한 카드 — 한 번만 리뷰 루프를 다시 태운다(runTask 시작 시 채움).
+// [이어서 진행]으로 ci·approve 에서 재개한 카드 — approve 에서 한 번만 리뷰 루프를 다시 태운다(runTask 시작 시 채움).
 const REVIEW_ON_RESUME = new Set();
 async function stepApprove(task) {
   let prs = await cardOpenPRs(task.key);
@@ -789,7 +789,7 @@ const STEP_FN = { prepare: stepPrepare, plan: stepPlan, adopt: stepAdopt, build:
     startStep: (t) => {
       const resumed = resumePoints.get(t.key) || legacyStep;
       const step = resumed || t.step;
-      if (resumed === "approve") REVIEW_ON_RESUME.add(t.key);
+      if (lib.reviewOnResume(resumed)) REVIEW_ON_RESUME.add(t.key);
       resumePoints.delete(t.key); legacyStep = "";
       return step;
     },

@@ -761,6 +761,12 @@ test("summarizeEpicRuns: .state 를 공유하는 프로젝트마다 잡힌 같�
   assert.strictEqual(runs[0].projectName, "EKYB");
 });
 
+test("reviewOnResume: ci·approve 에서 재개한 카드만 approve 에서 리뷰 루프를 다시 태운다", () => {
+  assert.equal(lib.reviewOnResume("ci"), true);       // 사람이 CI 수정 커밋을 올리고 ci 에서 재개(AML-12)
+  assert.equal(lib.reviewOnResume("approve"), true);
+  for (const s of ["prepare", "plan", "adopt", "build", "await-merge", "", undefined]) assert.equal(lib.reviewOnResume(s), false);
+});
+
 test("approveReviewTargets: [이어서 진행]으로 approve 에 들어온 카드만 미승인 PR 을 리뷰 루프에 다시 태운다", () => {
   const prs = [
     { owner: "o/r", number: 1, approved: true },
