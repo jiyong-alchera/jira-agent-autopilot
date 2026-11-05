@@ -473,6 +473,10 @@ Jira 카드를 자동으로 탐지해 **Claude가 개발 → PR 생성 → 카�
 - **CI 판정은 한 곳에서**: `lib.ciStateOf(statusCheckRollup)` 이 `pass`/`fail`/`pending`/`none` 을 낸다.
   하나라도 실패면 `fail`(도는 게 남아 있어도 기다리지 않는다), `SKIPPED`·`NEUTRAL` 은 통과,
   `CANCELLED`·`TIMED_OUT`·`ACTION_REQUIRED` 는 실패로 본다. 자동 병합 게이트도 같은 함수를 쓴다.
+  rollup 에는 같은 커밋의 **모든 실행**이 섞여 오므로 같은 체크(워크플로+잡 이름, StatusContext 는 context)는
+  **가장 최근 실행만** 본다(`lib.latestChecks`) — `concurrency: cancel-in-progress` 로 밀려 취소된 옛 실행의
+  `CANCELLED` 가 뒤 실행의 통과와 함께 남아, 이미 초록인 PR 을 실패로 읽고 CI 수정 루프를 헛돌리던 문제를 막는다.
+  다시 돌지 않은 취소는 여전히 실패다.
 - **원인 분류는 엔진이 로그를 읽고 한다**: `CI_FIX` 프롬프트는 실패 잡 로그(`gh run view --log-failed`)를
   **반드시 읽고** 두 갈래로 나누게 한다 —
   (a) **코드와 무관한 일시적 실패**(패키지 미러 다운·네트워크 타임아웃·러너 자원·명백한 플레이크)

@@ -511,6 +511,28 @@ test("ciStateOf: SKIPPED·NEUTRAL 은 통과, CANCELLED·TIMED_OUT 은 실패로
   assert.equal(lib.ciStateOf([CHECK("a", "ACTION_REQUIRED")]), "fail");
 });
 
+// 실측 사례: aml-lite PR #23 — concurrency cancel-in-progress 로 같은 커밋의 첫 실행이 취소되고
+// 뒤 실행이 전부 통과했는데, rollup 에 남은 CANCELLED 때문에 CI 수정 루프가 5회를 헛돌았다.
+const RUN = (name, conclusion, startedAt, status) => ({ ...CHECK(name, conclusion, status), workflowName: "CI", startedAt });
+test("ciStateOf: 같은 체크는 가장 최근 실행만 본다 — 밀려 취소된 옛 실행은 무시", () => {
+  const rollup = [
+    RUN("backend", "CANCELLED", "2026-11-05T08:39:32Z"),
+    RUN("backend", "SUCCESS", "2026-11-05T08:45:56Z"),
+    RUN("e2e", "CANCELLED", "2026-11-05T08:39:48Z"),
+    RUN("e2e", "SUCCESS", "2026-11-05T08:43:11Z"),
+  ];
+  assert.equal(lib.ciStateOf(rollup), "pass");
+  assert.deepEqual(lib.failedChecks(rollup), []);
+  // 다시 돌지 않은 취소는 여전히 실패
+  assert.equal(lib.ciStateOf([RUN("backend", "SUCCESS", "2026-11-05T08:39:32Z"), RUN("e2e", "CANCELLED", "2026-11-05T08:39:48Z")]), "fail");
+  // 최근 실행이 실패면 옛 통과가 있어도 실패
+  assert.equal(lib.ciStateOf([RUN("backend", "SUCCESS", "2026-11-05T08:39:32Z"), RUN("backend", "FAILURE", "2026-11-05T08:45:56Z")]), "fail");
+  // 옛 실행 취소 + 새 실행 대기 중(시작 시각 없음) → pending
+  assert.equal(lib.ciStateOf([RUN("backend", "CANCELLED", "2026-11-05T08:39:32Z"), RUN("backend", null, "", "QUEUED")]), "pending");
+  // 다른 워크플로의 같은 잡 이름은 별개 체크
+  assert.equal(lib.ciStateOf([RUN("build", "SUCCESS", "2026-11-05T08:45:00Z"), { ...RUN("build", "FAILURE", "2026-11-05T08:40:00Z"), workflowName: "Release" }]), "fail");
+});
+
 test("ciStateOf: StatusContext(구형 상태 API) 도 같은 기준으로 읽는다", () => {
   const ctx = (context, state) => ({ __typename: "StatusContext", context, state });
   assert.equal(lib.ciStateOf([ctx("ci/x", "SUCCESS")]), "pass");

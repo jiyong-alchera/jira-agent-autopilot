@@ -702,10 +702,29 @@ function ciCheckState(c) {
   if (String(c.status || "").toUpperCase() !== "COMPLETED") return "pending";
   return CI_FAIL_CONCLUSIONS.has(String(c.conclusion || "").toUpperCase()) ? "fail" : "pass";
 }
+// rollup 에는 같은 커밋의 '모든 실행'이 섞여 온다. concurrency cancel-in-progress 로 밀려 취소된
+// 옛 실행의 CANCELLED 가 뒤 실행의 통과와 함께 남으므로, 같은 체크는 가장 최근 것만 본다.
+// 시작 시각이 없으면(대기 중) 가장 최근으로 친다.
+function checkTime(c) {
+  const t = Date.parse(c.startedAt || c.completedAt || "");
+  return Number.isFinite(t) && t > 0 ? t : Infinity;
+}
+function latestChecks(rollup) {
+  const byKey = new Map();
+  for (const c of (Array.isArray(rollup) ? rollup : [])) {
+    if (!c) continue;
+    const key = (c.__typename === "StatusContext" || (!c.status && c.state))
+      ? `ctx:${c.context || ""}`
+      : `run:${c.workflowName || ""}/${c.name || ""}`;
+    const prev = byKey.get(key);
+    if (!prev || checkTime(c) >= checkTime(prev)) byKey.set(key, c);
+  }
+  return [...byKey.values()];
+}
 // PR 1건의 CI 상태 → "pass" | "fail" | "pending" | "none"(체크 자체가 없음)
 // 하나라도 실패면 실패, 실패는 없고 도는 게 있으면 대기.
 function ciStateOf(rollup) {
-  const list = Array.isArray(rollup) ? rollup : [];
+  const list = latestChecks(rollup);
   if (!list.length) return "none";
   let pending = false;
   for (const c of list) {
@@ -717,7 +736,7 @@ function ciStateOf(rollup) {
 }
 // 실패한 체크만 추림 — 알림 문구와 CI_FIX 프롬프트에 '무엇이 왜 깨졌는지' 넣기 위한 것.
 function failedChecks(rollup) {
-  return (Array.isArray(rollup) ? rollup : [])
+  return latestChecks(rollup)
     .filter((c) => ciCheckState(c) === "fail")
     .map((c) => ({
       name: c.name || c.context || "(이름없음)",
@@ -995,7 +1014,7 @@ module.exports = {
   loadOrCreateEnvKey, encryptEnv, decryptEnv,
   ENGINES, DEFAULT_ENGINE, DEFAULT_MODEL, resolveEngine,
   REVIEW_LOOP_MAX_DEFAULT, REVIEW_LOOP_MAX_LIMIT, clampReviewLoopMax,
-  ciCheckState, ciStateOf, ciStateWithRuns, failedChecks, runIdFromCheckUrl,
+  ciCheckState, ciStateOf, ciStateWithRuns, failedChecks, latestChecks, runIdFromCheckUrl,
   CI_LOOP_MAX_DEFAULT, CI_LOOP_MAX_LIMIT, clampCiLoopMax,
   SUGGEST_MARK, parseSuggestedAnswers, planHasNoQuestions, skipLine, projectRulesInstr,
   EPIC_STEPS, epicChildrenJql, searchEpicChildren, epicBlockers, epicTaskStep, pickEpicTasks, nextEpicTask, epicTaskStates, epicBlockedReason, nextEpicStep, approveReviewTargets, reviewOnResume, stopLockClearable, ALREADY_DONE_MARK, alreadyDoneComment,
