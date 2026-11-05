@@ -30,6 +30,7 @@ plan(질문) → build(개발·PR·완료처리) 두 루프로 처리합니다. 
 
 - **plan 중복 방지**: `claude-planned` 라벨이 붙으면 plan 루프가 다시 잡지 않음.
 - **작업 제외**: 기록용 카드처럼 작업 대상이 아닌 카드에는 `claude-skip` 라벨을 붙인다. plan/build/review 루프와 에픽 연속 개발이 모두 건너뛴다.
+- **프로젝트 규칙**: 대시보드 설정 '프로젝트 규칙'에 한 줄씩 적은 규칙(예: GitHub Actions 는 사내 러너 라벨 사용)은 plan/build/리뷰 반영/CI 수정과 자동 리뷰가 모두 따른다.
 - **build 답변 대기**: 답변 전이면 build 가 `SKIP` 하고 종료 → 다음 주기 재시도.
 - **완료 제외**: `DEV COMPLETED` 상태는 JQL `status != "DEV COMPLETED"` 로 두 루프에서 제외.
 

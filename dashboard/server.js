@@ -44,7 +44,8 @@ const DEFAULT_CONFIG = {
   plannedLabel: "claude-planned",
   answeredLabel: "claude-answered",
   failedLabel: "claude-failed",
-  skipLabel: "claude-skip",      // 작업 제외 표시(기록용 카드 등) — 탐지·에픽 연속 개발 모두 건너뜀
+  skipLabel: "claude-skip",
+  agentRules: "",                // 프로젝트 공통 작업 규칙(줄마다 하나) — plan/build/리뷰 반영/CI 수정/리뷰 프롬프트에 붙는다      // 작업 제외 표시(기록용 카드 등) — 탐지·에픽 연속 개발 모두 건너뜀
   prOpenLabel: "claude-pr",
   maxRetries: 3,
   maxParallel: 5,
@@ -157,6 +158,7 @@ function scriptEnv(id) {
   env.MAX_RETRIES = String(cfg.maxRetries || 3);
   env.TEST_CMD = cfg.testCmd || "";
   env.BUILD_CMD = cfg.buildCmd || "";
+  env.PROJECT_RULES_INSTR = lib.projectRulesInstr(cfg.agentRules);
   env.HISTORY_FILE = HISTORY_PATH;
   env.PROJECT_KEY = cfg.projectKey || "";
   env.ENV_SRC = projectEnvPath(cfg);

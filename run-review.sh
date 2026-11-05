@@ -258,6 +258,9 @@ ${LAST_BODY}
    승인 마커 코멘트에는 반드시 '${APPROVED_MARKER}' 문자열이 포함돼야 합니다(이후 재리뷰 스킵 판정에 사용).
 4. 절대 코드를 수정하거나 커밋/푸시/머지하지 마세요. 리뷰(코멘트)만 남깁니다. Jira 상태·라벨도 바꾸지 마세요.
 마지막에 결과를 'REVIEW_RESULT: approved' 또는 'REVIEW_RESULT: commented' 한 줄로 출력하세요."
+    # 프로젝트 규칙 위반도 리뷰 지적 대상이다
+    [[ -n "${PROJECT_RULES_INSTR:-}" ]] && PROMPT="${PROMPT}${PROJECT_RULES_INSTR}
+변경이 위 프로젝트 규칙을 어기면 (A)로 지적하세요."
 
     CLAUDE_LOG="${CLAUDE_LOG_DIR}/${ISSUE_KEY}-review.log"
     { echo ""; echo "===== $(date -u +%FT%TZ) ${ISSUE_KEY} ${OR}#${N} review ====="; } >> "${CLAUDE_LOG}"

@@ -92,6 +92,7 @@ npm test           # 단위 테스트 (node:test, 무설치) — lib.js 순수 �
 `ANSWERED_LABEL`(기본 claude-answered), `FAILED_LABEL`(기본 claude-failed), `SKIP_LABEL`(기본 claude-skip — 붙은 카드는 자동화가 건너뜀), `MAX_RETRIES`(기본 3),
 `ENV_SRC`(기본 work.env), `CLONE_BASE`(기본 repos/), `LOOP_INTERVAL`(기본 3600),
 `MAX_PARALLEL`(기본 3), `TEST_CMD`/`BUILD_CMD`(미설정 시 자동 감지),
+`PROJECT_RULES_INSTR`(대시보드 설정 '프로젝트 규칙' — 모든 에이전트·리뷰 프롬프트에 붙는 프로젝트 공통 규칙),
 `ANTHROPIC_API_KEY`, `GH_TOKEN`, `SLACK_WEBHOOK_URL`(설정 시 처리 완료/실패 알림)
 
 ## 보안

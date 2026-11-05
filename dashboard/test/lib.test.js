@@ -335,3 +335,26 @@ test("clampReviewLoopMax: 요청값 → 프로젝트 설정 → 기본 5, 1~20 c
   assert.equal(lib.clampReviewLoopMax(-1, {}), 5);
   assert.equal(lib.clampReviewLoopMax("abc", null), 5);                // 파싱 실패·cfg 없음 → 기본값
 });
+
+test("projectRulesInstr: 프로젝트 규칙을 프롬프트 꼬리말로, 빈 설정은 빈 문자열", () => {
+  assert.equal(lib.projectRulesInstr(""), "");
+  assert.equal(lib.projectRulesInstr("  \n\n "), "");
+  assert.equal(lib.projectRulesInstr(undefined), "");
+  const s = lib.projectRulesInstr("- GitHub Actions 는 사내 러너를 쓴다\n\n  * apt 금지  \r\n테스트 필수");
+  assert.match(s, /^\n\n\[프로젝트 규칙\]/);
+  assert.deepEqual(s.split("\n").filter((l) => l.startsWith("- ")), ["- GitHub Actions 는 사내 러너를 쓴다", "- apt 금지", "- 테스트 필수"]);
+});
+
+test("projectRulesInstr: 대시보드·루프 env 와 에이전트·리뷰 프롬프트에 연결돼 있다", () => {
+  const { projectEnv } = require("../../lib-project-env");
+  const { env } = projectEnv({ id: "p", repos: [], agentRules: "사내 러너 사용" }, {});
+  assert.equal(env.PROJECT_RULES_INSTR, lib.projectRulesInstr("사내 러너 사용"));
+  assert.equal(projectEnv({ id: "p", repos: [] }, {}).env.PROJECT_RULES_INSTR, "");
+  const root = path.join(__dirname, "..", "..");
+  const agent = fs.readFileSync(path.join(root, "run-jira-agent.sh"), "utf8");
+  assert.match(agent, /^PROMPT="\$\{PROMPT\}.*\$\{PROJECT_RULES_INSTR:-\}"$/m, "run-jira-agent.sh 공통 꼬리말에 규칙이 빠졌습니다");
+  const review = fs.readFileSync(path.join(root, "run-review.sh"), "utf8");
+  assert.ok(review.includes('PROMPT="${PROMPT}${PROJECT_RULES_INSTR}'), "run-review.sh 리뷰 프롬프트에 규칙이 빠졌습니다");
+  const server = fs.readFileSync(path.join(__dirname, "..", "server.js"), "utf8");
+  assert.ok(server.includes("env.PROJECT_RULES_INSTR = lib.projectRulesInstr(cfg.agentRules)"), "server.js scriptEnv 에 규칙이 빠졌습니다");
+});

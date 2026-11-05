@@ -366,6 +366,14 @@ function parseSuggestedAnswers(comments) {
     draft: items.map((it, i) => `${it.n || i + 1}. ${it.suggestion}`).join("\n"),
   };
 }
+// 프로젝트 공통 작업 규칙(설정 agentRules)을 에이전트 프롬프트 꼬리말로. 빈 줄·앞뒤 공백은 버리고
+// 줄마다 '- ' 를 붙인다. 레포 문서로는 알 수 없는 조직 환경 제약(사내 CI 러너 라벨 등)을 모든 단계에 전한다.
+function projectRulesInstr(rules) {
+  const lines = String(rules || "").split(/\r?\n/).map((l) => l.trim().replace(/^[-*]\s+/, "")).filter(Boolean);
+  if (!lines.length) return "";
+  return "\n\n[프로젝트 규칙] 이 프로젝트에서 반드시 지킬 규칙입니다. 레포 문서·기존 코드와 충돌하면 이 규칙을 따르세요:\n"
+    + lines.map((l) => `- ${l}`).join("\n");
+}
 // 하위 스크립트 출력의 마지막 'SKIP:' 줄 사유. plan 이 카드를 스스로 건너뛰었을 때 중단 사유로 보여 준다(PO-148).
 function skipLine(out) {
   const m = String(out || "").match(/^SKIP:[ \t]*(.+)$/gm);
@@ -985,7 +993,7 @@ module.exports = {
   REVIEW_LOOP_MAX_DEFAULT, REVIEW_LOOP_MAX_LIMIT, clampReviewLoopMax,
   ciCheckState, ciStateOf, ciStateWithRuns, failedChecks, runIdFromCheckUrl,
   CI_LOOP_MAX_DEFAULT, CI_LOOP_MAX_LIMIT, clampCiLoopMax,
-  SUGGEST_MARK, parseSuggestedAnswers, planHasNoQuestions, skipLine,
+  SUGGEST_MARK, parseSuggestedAnswers, planHasNoQuestions, skipLine, projectRulesInstr,
   EPIC_STEPS, epicChildrenJql, searchEpicChildren, epicBlockers, epicTaskStep, pickEpicTasks, nextEpicTask, epicTaskStates, epicBlockedReason, nextEpicStep, approveReviewTargets, stopLockClearable, ALREADY_DONE_MARK, alreadyDoneComment,
   EPIC_PARALLEL_EXTRA_MAX, clampParallelExtra, epicResumePoints, summarizeEpicRuns, runEpicSlots, buildAdoptedAnswerBody, prBelongsToCard,
   EPIC_HIERARCHY_LEVEL, EPIC_LABEL_FALLBACK, topLevelIssueTypes, epicSearchJql, epicTypeLabel,
