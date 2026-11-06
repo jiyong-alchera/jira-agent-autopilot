@@ -21,6 +21,18 @@ function makeSandbox(reworkStdout) {
   fs.mkdirSync(bin);
   fs.mkdirSync(path.join(root, "repos", ".state"), { recursive: true });
   fs.copyFileSync(path.join(SCRIPTS_DIR, "run-review-loop.sh"), path.join(root, "run-review-loop.sh"));
+  fs.copyFileSync(path.join(SCRIPTS_DIR, "lib-notify.sh"), path.join(root, "lib-notify.sh"));
+  // ci-state.js 스텁: FAKE_CI 를 그대로 답한다. FAKE_CI_STOP=1 이면 대기 중 중지 버튼이 눌린 상황을 흉내 낸다.
+  fs.writeFileSync(path.join(root, "ci-state.js"), `
+const fs = require("fs");
+fs.appendFileSync(${JSON.stringify(path.join(root, "calls.log"))}, "ci|" + process.argv.slice(2).join(" ") + "\\n");
+if (process.env.FAKE_CI_STOP === "1") {
+  fs.writeFileSync(${JSON.stringify(path.join(root, "repos", ".state", KEY + ".reviewloop.stop"))}, "");
+  setTimeout(() => {}, 30000);
+} else {
+  process.stdout.write((process.env.FAKE_CI || "pass") + "\\t" + (process.env.FAKE_FAILED || "") + "\\n");
+}
+`);
 
   // gh: PR 은 항상 OPEN, 승인 마커는 없음(루프가 최대 회차까지 돌도록)
   fs.writeFileSync(path.join(bin, "gh"), `#!/usr/bin/env bash\n[[ "\${1:-}" == "pr" ]] && echo OPEN\nexit 0\n`, { mode: 0o755 });
@@ -31,7 +43,9 @@ printf '%s|REVIEW_LOOP_AFTER=%s|REVIEW_AFTER=%s|IN_REVIEW_LOOP=%s\\n' \\
   "${name}" "\${REVIEW_LOOP_AFTER:-}" "\${REVIEW_AFTER:-}" "\${IN_REVIEW_LOOP:-}" >> "${path.join(root, "calls.log")}"
 `;
   fs.writeFileSync(path.join(root, "run-jira-agent.sh"), trace("rework") + reworkStdout + "\nexit 0\n", { mode: 0o755 });
-  fs.writeFileSync(path.join(root, "run-review.sh"), trace("review") + "exit 0\n", { mode: 0o755 });
+  fs.writeFileSync(path.join(root, "run-review.sh"), trace("review") +
+    `printf 'review-ci|%s|%s|%s\\n' "\${REVIEW_CI_STATE:-}" "\${REVIEW_CI_FAILED:-}" "\${REVIEW_CI_SHA:-}" >> "${path.join(root, "calls.log")}"\n` +
+    "exit 0\n", { mode: 0o755 });
   return { root, bin };
 }
 
@@ -135,4 +149,32 @@ test("run-jira-agent: REWORK_FAILED 는 줄 머리 마커만, 마커 이름은 �
   assert.ok(hit("요약\nREWORK_FAILED: addCommentToJiraIssue 권한 거부"));
   assert.ok(hit("**REWORK_FAILED: 권한 거부**"));
   assert.ok(!hit("실패하면 REWORK_FAILED: 마커를 쓰라고 했습니다"));
+});
+
+test("review-loop: 재리뷰 전에 CI 확정을 기다리고 그 판정을 리뷰에 넘긴다", () => {
+  // AML-21: CI 도는 중에 리뷰 → 'CI 대기' 미승인 → 반영 push → CI 취소 가 반복돼 CI 가 한 번도 끝나지 않았다
+  const { stdout, calls } = runLoop("echo done", { REVIEW_LOOP_MAX: "1", FAKE_CI: "fail", FAKE_FAILED: "e2e, electron" });
+  const ci = calls.findIndex((l) => l.startsWith("ci|"));
+  const review = calls.findIndex((l) => l.startsWith("review|"));
+  assert.ok(ci >= 0 && ci < review, `CI 대기가 리뷰보다 먼저여야 한다: ${calls.join(" / ")}`);
+  assert.match(calls[ci], /--wait-min 40/);
+  assert.match(stdout, /재리뷰 전 CI 확정 대기\(최대 40분\)/);
+  assert.match(stdout, /CI 판정: fail \(실패: e2e, electron\)/);
+  // gh 스텁은 pr 하위 명령에 OPEN 을 답하므로 headRefOid 도 OPEN 으로 잡힌다
+  assert.ok(calls.includes("review-ci|fail|e2e, electron|OPEN"), calls.join(" / "));
+});
+
+test("review-loop: CI 대기를 끄면(0분) 기다리지 않고 판정도 넘기지 않는다", () => {
+  const { stdout, calls } = runLoop("echo done", { REVIEW_LOOP_MAX: "1", REVIEW_LOOP_CI_WAIT_MIN: "0" });
+  assert.ok(!calls.some((l) => l.startsWith("ci|")), calls.join(" / "));
+  assert.doesNotMatch(stdout, /CI 확정 대기/);
+  assert.ok(calls.includes("review-ci|||"), calls.join(" / "));
+});
+
+test("review-loop: CI 대기 중 중지 요청에 바로 멈춘다", () => {
+  const t0 = Date.now();
+  const { stdout, calls } = runLoop("echo done", { REVIEW_LOOP_MAX: "1", FAKE_CI_STOP: "1" });
+  assert.ok(Date.now() - t0 < 15000, "CI 대기가 끝날 때까지 붙잡혀 있었다");
+  assert.match(stdout, /중지 신호/);
+  assert.ok(!calls.some((l) => l.startsWith("review|")), calls.join(" / "));
 });

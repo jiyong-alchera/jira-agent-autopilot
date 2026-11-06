@@ -19,6 +19,8 @@
 # env: PROJECT_ID, CARD_REPOS(name\x1furl\x1f...), GH_TOKEN, JIRA_SITE, ASSIGNEE_NAME,
 #      CLONE_BASE, HISTORY_FILE, PROJECT_KEY, MAX_AUTO_REWORK(기본 3),
 #      REVIEW_APPROVE_CI_WAIT_MIN(승인 알림 전 CI 확정 대기 분, 기본 40 · lib-notify.sh)
+#      REVIEW_CI_STATE / REVIEW_CI_FAILED / REVIEW_CI_SHA / REVIEW_CI_WAITED_MIN
+#        (리뷰 루프가 재리뷰 직전에 확정한 CI 판정 — HEAD 가 REVIEW_CI_SHA 일 때만 프롬프트에 넣는다)
 #      (+ Atlassian MCP 인증은 claude 쪽)
 # --------------------------------------------------------------------------
 set -euo pipefail
@@ -261,6 +263,10 @@ ${LAST_BODY}
     # 프로젝트 규칙 위반도 리뷰 지적 대상이다
     [[ -n "${PROJECT_RULES_INSTR:-}" ]] && PROMPT="${PROMPT}${PROJECT_RULES_INSTR}
 변경이 위 프로젝트 규칙을 어기면 (A)로 지적하세요."
+    # 리뷰 루프가 넘긴 CI 판정 — 판정한 커밋이 지금 HEAD 일 때만 쓴다(그 사이 push 됐으면 낡은 값).
+    if [[ -n "${REVIEW_CI_STATE:-}" && "${REVIEW_CI_SHA:-}" == "${HEAD_SHA}" ]]; then
+      PROMPT="${PROMPT}$(review_ci_instr "${REVIEW_CI_STATE}" "${REVIEW_CI_FAILED:-}" "${REVIEW_CI_WAITED_MIN:-?}")"
+    fi
 
     CLAUDE_LOG="${CLAUDE_LOG_DIR}/${ISSUE_KEY}-review.log"
     { echo ""; echo "===== $(date -u +%FT%TZ) ${ISSUE_KEY} ${OR}#${N} review ====="; } >> "${CLAUDE_LOG}"

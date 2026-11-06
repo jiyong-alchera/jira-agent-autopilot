@@ -1780,7 +1780,7 @@ function EpicPanel({ projects, flash, jump }) {
                       {reviewLoop && reviewLoop.running && (
                         <span className="ml-2 text-xs px-2 py-0.5 rounded-full border bg-violet-500/15 text-violet-300 border-violet-500/40"
                           title={`${reviewLoop.owner}#${reviewLoop.number} — 승인 마커가 남을 때까지 '반영 → 재리뷰' 반복`}>
-                          🔁 승인 루프 {reviewLoop.iter || 0}/{reviewLoop.max || 5}회차 · {reviewLoop.step === "rework" ? "리뷰 반영 중" : reviewLoop.step === "review" ? "리뷰 중" : reviewLoop.step || "진행 중"}
+                          🔁 승인 루프 {reviewLoop.iter || 0}/{reviewLoop.max || 5}회차 · {reviewLoop.step === "rework" ? "리뷰 반영 중" : reviewLoop.step === "review" ? "리뷰 중" : reviewLoop.step === "ci-wait" ? "재리뷰 전 CI 대기 중" : reviewLoop.step || "진행 중"}
                         </span>
                       )}
                     </span>

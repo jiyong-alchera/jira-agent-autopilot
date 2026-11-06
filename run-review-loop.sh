@@ -22,7 +22,9 @@
 #
 # env: PROJECT_ID, CARD_REPOS, GH_TOKEN, CLONE_BASE, HISTORY_FILE, SLACK_WEBHOOK_URL,
 #      REVIEW_LOOP_MAX(기본 5), REVIEW_FIRST(1이면 1회차 반영 생략),
-#      REVIEW_APPROVE_CI_WAIT_MIN(승인 알림 전 CI 확정 대기 분, 기본 40 · lib-notify.sh)
+#      REVIEW_APPROVE_CI_WAIT_MIN(승인 알림 전 CI 확정 대기 분, 기본 40 · lib-notify.sh),
+#      REVIEW_LOOP_CI_WAIT_MIN(재리뷰 전 CI 확정 대기 분, 기본 40, 0=기다리지 않음),
+#      REVIEW_LOOP_CI_POLL_SEC(그 폴링 간격 초, 기본 30)
 #      — 그 외는 하위 스크립트가 쓰는 값 그대로 상속
 # --------------------------------------------------------------------------
 set -uo pipefail
@@ -35,6 +37,8 @@ APPROVED_MARKER="CLAUDE-REVIEW-APPROVED"   # run-review.sh · lib.js 와 동일�
 NO_REWORK_MARK="NO_REWORK_NEEDED"          # run-jira-agent.sh 의 '반영할 새 피드백 없음' 마커와 동일해야 함
 REVIEW_LOOP_MAX="${REVIEW_LOOP_MAX:-5}"
 REVIEW_FIRST="${REVIEW_FIRST:-}"           # 1이면 1회차는 반영 없이 리뷰부터(방금 올린 새 PR)
+REVIEW_LOOP_CI_WAIT_MIN="${REVIEW_LOOP_CI_WAIT_MIN:-40}"
+[[ "${REVIEW_LOOP_CI_WAIT_MIN}" =~ ^[0-9]+$ ]] || REVIEW_LOOP_CI_WAIT_MIN=40
 
 ISSUE_KEY="${1:-}"
 OR="${2:-}"
@@ -93,10 +97,12 @@ write_status() {  # step
     "${ISSUE_KEY}" "${OR}" "${PR_NUM}" "${PR_URL}" "${ITER}" "${REVIEW_LOOP_MAX}" "$1" "${STARTED_AT}" "$(date -u +%FT%TZ)" \
     > "${STATUS_FILE}" 2>/dev/null || true
 }
+CI_PID=""
 cleanup() {
+  [[ -n "${CI_PID}" ]] && kill "${CI_PID}" 2>/dev/null
   rmdir "${LOCK_DIR}" 2>/dev/null || true
   rm -f "${LOCK_DIR}.phase" "${LOCK_DIR}.pid" "${STOP_FILE}" "${STATUS_FILE}" \
-        "${STATE_DIR}/${ISSUE_KEY}.reviewloop.rework.out" 2>/dev/null || true
+        "${STATE_DIR}/${ISSUE_KEY}.reviewloop.rework.out" "${STATE_DIR}/${ISSUE_KEY}.reviewloop.ci.out" 2>/dev/null || true
 }
 on_term() {
   # 중복 방지: 파이프라인 서브셸이 트랩을 함께 받아 두 번 도는 경우가 있어 원자적 mkdir 로 1회만 처리
@@ -115,6 +121,36 @@ is_approved() {
   gh api "repos/${OR}/issues/${PR_NUM}/comments?per_page=100" --jq '.[].body' 2>/dev/null | grep -q "${APPROVED_MARKER}"
 }
 stop_requested() { [[ -f "${STOP_FILE}" ]]; }
+
+# 재리뷰 직전에 현재 HEAD 의 CI 가 확정될 때까지 기다리고, 판정을 REVIEW_CI_* 로 남긴다(run-review.sh 가 프롬프트에 넣음).
+# 왜: CI 가 도는 중에 리뷰하면 리뷰어가 'CI 대기' 로 승인을 미루고, 그 미승인이 반영(push)을 부르고,
+# push 가 도는 CI 를 취소시켜 CI 가 한 번도 끝나지 않은 채 회차만 소진된다(AML-21).
+# 판정 기준은 대시보드·에픽 러너와 같다(ci-state.js → dashboard/lib.js).
+# node 는 백그라운드로 돌리고 1초 간격으로 지켜본다 — 대기 중에도 중지 파일·SIGTERM 에 바로 반응해야 한다.
+wait_ci_before_review() {
+  REVIEW_CI_STATE=""; REVIEW_CI_FAILED=""; REVIEW_CI_SHA=""; REVIEW_CI_WAITED_MIN=0
+  (( REVIEW_LOOP_CI_WAIT_MIN > 0 )) || return 0
+  command -v node >/dev/null 2>&1 || return 0
+  local out_file="${STATE_DIR}/${ISSUE_KEY}.reviewloop.ci.out" t0=${SECONDS} out
+  REVIEW_CI_SHA="$(gh pr view "${PR_NUM}" --repo "${OR}" --json headRefOid --jq '.headRefOid' 2>/dev/null || echo "")"
+  write_status "ci-wait"
+  echo ">> [${ISSUE_KEY}] === 루프 ${ITER}/${REVIEW_LOOP_MAX} 회차: 재리뷰 전 CI 확정 대기(최대 ${REVIEW_LOOP_CI_WAIT_MIN}분) ==="
+  node "${SELF_DIR}/ci-state.js" "${OR}" "${PR_NUM}" \
+    --wait-min "${REVIEW_LOOP_CI_WAIT_MIN}" --poll-sec "${REVIEW_LOOP_CI_POLL_SEC:-30}" > "${out_file}" 2>/dev/null &
+  CI_PID=$!
+  while kill -0 "${CI_PID}" 2>/dev/null; do
+    stop_requested && on_term
+    sleep 1
+  done
+  wait "${CI_PID}" 2>/dev/null
+  CI_PID=""
+  out="$(head -n1 "${out_file}" 2>/dev/null)"; rm -f "${out_file}" 2>/dev/null
+  [[ -z "${out}" ]] && out=$'unknown\t'
+  REVIEW_CI_STATE="${out%%$'\t'*}"
+  REVIEW_CI_FAILED="${out#*$'\t'}"
+  REVIEW_CI_WAITED_MIN=$(( (SECONDS - t0 + 59) / 60 ))
+  echo ">> [${ISSUE_KEY}] ${OR}#${PR_NUM} CI 판정: ${REVIEW_CI_STATE}${REVIEW_CI_FAILED:+ (실패: ${REVIEW_CI_FAILED})} · ${REVIEW_CI_WAITED_MIN}분 대기"
+}
 
 write_status "starting"
 MODE_NOTE=""; [[ "${REVIEW_FIRST}" == "1" ]] && MODE_NOTE=" · 리뷰부터 시작"
@@ -196,10 +232,14 @@ while (( ITER < REVIEW_LOOP_MAX )); do
     stop_requested && on_term
   fi
 
-  # 2) 재리뷰 — 승인 마커가 있어도 강제(FORCE_REVIEW), 그 PR 하나만(REVIEW_ONLY_*)
+  # 2) 재리뷰 — CI 확정을 기다린 뒤, 승인 마커가 있어도 강제(FORCE_REVIEW), 그 PR 하나만(REVIEW_ONLY_*)
+  wait_ci_before_review
+  stop_requested && on_term
   echo ">> [${ISSUE_KEY}] === 루프 ${ITER}/${REVIEW_LOOP_MAX} 회차: 재리뷰 ==="
   write_status "review"
   SLACK_WEBHOOK_URL="" REVIEW_LOOP_AFTER="" REVIEW_AFTER="" IN_REVIEW_LOOP=1 \
+    REVIEW_CI_STATE="${REVIEW_CI_STATE}" REVIEW_CI_FAILED="${REVIEW_CI_FAILED}" \
+    REVIEW_CI_SHA="${REVIEW_CI_SHA}" REVIEW_CI_WAITED_MIN="${REVIEW_CI_WAITED_MIN}" \
     FORCE_REVIEW=1 REVIEW_ONLY_OWNER="${OR}" REVIEW_ONLY_NUM="${PR_NUM}" \
     bash "${SELF_DIR}/run-review.sh" "${ISSUE_KEY}" \
     || echo ">> [${ISSUE_KEY}] ${ITER}회차 재리뷰 실행 오류 — 승인 여부로 계속 판정" >&2

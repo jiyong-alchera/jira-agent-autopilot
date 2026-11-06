@@ -105,3 +105,23 @@ test("stateFromPr: 닫힌 PR 은 closed, 조회 실패는 unknown, 그 외는 CI
   assert.strictEqual(ciState.stateFromPr(failing).state, "fail");
   assert.deepStrictEqual(ciState.stateFromPr(failing).failed.map((f) => f.name), ["unit"]);
 });
+
+// 리뷰 프롬프트용 CI 판정 문구 — 리뷰어가 체크 목록을 다시 해석하지 않게 한다
+function ciInstr(...args) {
+  return execFileSync("bash", ["-c", `source "${ROOT}/lib-notify.sh"; review_ci_instr "$@"`, "_", ...args], { encoding: "utf8" });
+}
+
+test("review_ci_instr: 판정이 없으면(루프 밖 단독 리뷰) 아무것도 붙이지 않는다", () => {
+  assert.equal(ciInstr("", "", "0"), "");
+});
+
+test("review_ci_instr: 통과·실패는 확정 값으로 알리고, 실패엔 체크 이름을 싣는다", () => {
+  assert.match(ciInstr("pass", "", "12"), /CI 판정.*\n- CI 통과/s);
+  assert.match(ciInstr("fail", "e2e, electron", "20"), /CI 실패: e2e, electron/);
+});
+
+test("review_ci_instr: 미확정이면 CI 대기를 이유로 승인을 미루지 말라고 한다", () => {
+  const out = ciInstr("pending", "", "40");
+  assert.match(out, /40분을 기다려도 확정되지 않았습니다\(pending\)/);
+  assert.match(out, /CI 미확정만을 이유로 승인을 미루지/);
+});
