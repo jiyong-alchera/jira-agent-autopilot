@@ -1238,11 +1238,12 @@ function sinceText(iso) {
 // 에픽 진행 로그 뷰 — 러너 진행 로그(loop-epic.log)와 현재 태스크의 엔진 상세 로그를 3초마다 갱신.
 // 긴 build 단계에서 "지금 무엇을 하고 있는지" 를 대시보드에서 바로 확인하기 위한 창.
 function EpicLogs({ pid, cardKey, step, reviewLoop }) {
-  // build 단계라도 그 안에서 '승인까지 리뷰 루프' 가 돌면 실제 활동은 review 로그에 쌓인다.
-  // ● 를 build 에 붙여두면 멈춘 로그를 보게 되므로 활동 중인 쪽을 가리킨다.
+  // build 단계 안의 '승인까지 리뷰 루프' 는 회차마다 리뷰(review 로그)와 반영(rework → build 로그)을 오간다.
+  // 루프가 돈다고 review 에 고정하면 반영 중엔 멈춘 로그를 보게 되므로 루프의 현재 step 을 따른다.
   const stepPhase = (step === "plan" || step === "prepare" || step === "adopt") ? "plan"
     : (step === "approve" || step === "await-merge") ? "review"
-    : (reviewLoop && reviewLoop.running) ? "review" : "build";
+    : (reviewLoop && reviewLoop.running) ? (reviewLoop.step === "rework" ? "build" : "review")
+    : "build";
   const [tab, setTab] = useState("epic");
   const [text, setText] = useState("");
   const [auto, setAuto] = useState(true);   // 새 줄이 오면 맨 아래로 따라감
@@ -1297,7 +1298,7 @@ function EpicLogs({ pid, cardKey, step, reviewLoop }) {
       <div className="text-[11px] text-slate-500 mt-1">
         {tab === "epic"
           ? "러너 진행 로그 (loop-epic.log · 3초 갱신)"
-          : `agent-logs/${cardKey || "<KEY>"}-${wanted}.log — 엔진의 도구 호출·메시지·결과 (3초 갱신). ● 는 지금 활동 중인 로그입니다(build 중 리뷰 루프가 돌면 review 를 가리킵니다).`}
+          : `agent-logs/${cardKey || "<KEY>"}-${wanted}.log — 엔진의 도구 호출·메시지·결과 (3초 갱신). ● 는 지금 활동 중인 로그입니다(build 중 리뷰 루프가 돌면 리뷰 중엔 review, 반영 중엔 build 를 가리킵니다).`}
       </div>
     </div>
   );
