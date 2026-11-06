@@ -709,10 +709,30 @@ function checkTime(c) {
   const t = Date.parse(c.startedAt || c.completedAt || "");
   return Number.isFinite(t) && t > 0 ? t : Infinity;
 }
+// 체크 이름만으로 고르면 부족하다: needs 로 묶인 잡(e2e·runtime 등)은 앞 잡이 끝나야 새 실행에 항목이 생겨,
+// 그 사이엔 옛 실행의 CANCELLED 만 남아 '가장 최근'으로 뽑힌다(aml-lite PR #35). 그래서 같은 워크플로에
+// 더 새 실행(run id 가 큰 것)이 있으면 옛 실행의 취소는 이름이 겹치든 말든 버린다.
+// 옛 실행의 FAILURE 는 남긴다 — 새 실행에 그 잡이 없을 수도 있어, 진짜 실패를 숨기면 안 된다.
+function supersededCancels(list) {
+  const newest = new Map();
+  for (const c of list) {
+    const id = Number(runIdFromCheckUrl(c.detailsUrl));
+    if (!id) continue;
+    const wf = c.workflowName || "";
+    if (!(newest.get(wf) >= id)) newest.set(wf, id);
+  }
+  return (c) => {
+    if (String(c.conclusion || "").toUpperCase() !== "CANCELLED") return false;
+    const id = Number(runIdFromCheckUrl(c.detailsUrl));
+    return !!id && id < (newest.get(c.workflowName || "") || 0);
+  };
+}
 function latestChecks(rollup) {
+  const list = (Array.isArray(rollup) ? rollup : []).filter(Boolean);
+  const superseded = supersededCancels(list);
   const byKey = new Map();
-  for (const c of (Array.isArray(rollup) ? rollup : [])) {
-    if (!c) continue;
+  for (const c of list) {
+    if (superseded(c)) continue;
     const key = (c.__typename === "StatusContext" || (!c.status && c.state))
       ? `ctx:${c.context || ""}`
       : `run:${c.workflowName || ""}/${c.name || ""}`;

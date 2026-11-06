@@ -533,6 +533,42 @@ test("ciStateOf: 같은 체크는 가장 최근 실행만 본다 — 밀려 취�
   assert.equal(lib.ciStateOf([RUN("build", "SUCCESS", "2026-11-05T08:45:00Z"), { ...RUN("build", "FAILURE", "2026-11-05T08:40:00Z"), workflowName: "Release" }]), "fail");
 });
 
+// 실측 사례: aml-lite PR #35 — 새 실행의 e2e·runtime 은 needs 로 묶여 아직 항목이 없고, 옛 실행의 CANCELLED 만
+// rollup 에 있어 CI 수정 루프가 '실패'로 읽고 회차를 헛썼다.
+const RUN_IN = (runId, name, conclusion, startedAt, status) =>
+  ({ ...RUN(name, conclusion, startedAt, status), detailsUrl: `https://github.com/o/r/actions/runs/${runId}/job/${runId}1` });
+test("ciStateOf: 더 새 실행이 있으면 옛 실행의 취소는 버린다 — 새 실행에 아직 잡이 안 생겼어도", () => {
+  const rollup = [
+    RUN_IN(42158473424, "backend", "CANCELLED", "2026-11-06T03:46:12Z"),
+    RUN_IN(42158473424, "e2e", "CANCELLED", "2026-11-06T03:46:12Z"),
+    RUN_IN(42158473424, "runtime", "CANCELLED", "2026-11-06T03:46:13Z"),
+    RUN_IN(42158523916, "backend", "SUCCESS", "2026-11-06T03:46:20Z"),
+    RUN_IN(42158523916, "electron", null, "", "QUEUED"),
+  ];
+  assert.equal(lib.ciStateOf(rollup), "pending");
+  assert.deepEqual(lib.failedChecks(rollup), []);
+  // 새 실행이 다 끝나 통과면 pass
+  assert.equal(lib.ciStateOf([rollup[1], rollup[2], RUN_IN(42158523916, "backend", "SUCCESS", "2026-11-06T03:46:20Z")]), "pass");
+});
+
+test("ciStateOf: 옛 실행이라도 취소가 아닌 실패, 더 새 실행이 없는 취소는 그대로 실패", () => {
+  // 새 실행에 없는 잡의 진짜 실패는 숨기지 않는다
+  assert.equal(lib.ciStateOf([
+    RUN_IN(100, "deploy", "FAILURE", "2026-11-06T03:00:00Z"),
+    RUN_IN(200, "backend", "SUCCESS", "2026-11-06T03:10:00Z"),
+  ]), "fail");
+  // 최신 실행 자체가 취소됐으면 실패
+  assert.equal(lib.ciStateOf([
+    RUN_IN(100, "backend", "SUCCESS", "2026-11-06T03:00:00Z"),
+    RUN_IN(200, "e2e", "CANCELLED", "2026-11-06T03:10:00Z"),
+  ]), "fail");
+  // 다른 워크플로의 더 새 실행은 이 워크플로의 취소를 덮지 않는다
+  assert.equal(lib.ciStateOf([
+    RUN_IN(100, "e2e", "CANCELLED", "2026-11-06T03:00:00Z"),
+    { ...RUN_IN(200, "build", "SUCCESS", "2026-11-06T03:10:00Z"), workflowName: "Release" },
+  ]), "fail");
+});
+
 test("ciStateOf: StatusContext(구형 상태 API) 도 같은 기준으로 읽는다", () => {
   const ctx = (context, state) => ({ __typename: "StatusContext", context, state });
   assert.equal(lib.ciStateOf([ctx("ci/x", "SUCCESS")]), "pass");
