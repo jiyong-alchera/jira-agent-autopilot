@@ -160,6 +160,8 @@ function scriptEnv(id) {
   env.BUILD_CMD = cfg.buildCmd || "";
   env.PROJECT_RULES_INSTR = lib.projectRulesInstr(cfg.agentRules);
   env.HISTORY_FILE = HISTORY_PATH;
+  const ciWait = lib.reviewCiWaitMin(cfg);
+  if (ciWait) env.REVIEW_LOOP_CI_WAIT_MIN = ciWait;
   env.PROJECT_KEY = cfg.projectKey || "";
   env.ENV_SRC = projectEnvPath(cfg);
   env.ENV_DEST_REL = cfg.envDest || "";

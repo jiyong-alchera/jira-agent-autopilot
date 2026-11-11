@@ -62,6 +62,8 @@ function projectEnv(p, cred) {
   env.TEST_CMD = cfg.testCmd || "";
   env.BUILD_CMD = cfg.buildCmd || "";
   env.PROJECT_RULES_INSTR = lib.projectRulesInstr(cfg.agentRules);
+  const ciWait = lib.reviewCiWaitMin(cfg);
+  if (ciWait) env.REVIEW_LOOP_CI_WAIT_MIN = ciWait;
   env.HISTORY_FILE = path.join(SELF, "history.jsonl");
   env.PROJECT_KEY = cfg.projectKey || "";
   env.ENV_SRC = cfg.envPath || path.join(cfg.workDir || SELF, `work-${cfg.id}.env`);

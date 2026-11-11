@@ -81,6 +81,18 @@ function clampReviewLoopMax(requested, cfg) {
   return Math.min(pick || REVIEW_LOOP_MAX_DEFAULT, REVIEW_LOOP_MAX_LIMIT);
 }
 
+const REVIEW_CI_WAIT_MIN_LIMIT = 180;
+
+// 재리뷰 전 CI 대기 분: 프로젝트 설정 reviewLoopCiWaitMin(0=대기 안 함, 최대 180).
+// 미설정·잘못된 값이면 "" → env 를 넣지 않아 스크립트 기본값(40)을 쓴다.
+function reviewCiWaitMin(cfg) {
+  const raw = cfg && cfg.reviewLoopCiWaitMin;
+  if (raw === undefined || raw === null || raw === "") return "";
+  const v = parseInt(raw, 10);
+  if (!Number.isFinite(v) || v < 0) return "";
+  return String(Math.min(v, REVIEW_CI_WAIT_MIN_LIMIT));
+}
+
 // 카드 라벨로 대상 repo 결정: repo_<name> 라벨과 매칭. 없으면 첫 repo(기본).
 function cardRepos(p, labels) {
   const repos = normalizeRepos(p);
@@ -1033,7 +1045,7 @@ module.exports = {
   REPO_LABEL_PREFIX, repoNameFromUrl, normalizeRepos, cardRepos, epicPrepareLabelDiff, REVIEW_APPROVED_MARKER,
   loadOrCreateEnvKey, encryptEnv, decryptEnv,
   ENGINES, DEFAULT_ENGINE, DEFAULT_MODEL, resolveEngine,
-  REVIEW_LOOP_MAX_DEFAULT, REVIEW_LOOP_MAX_LIMIT, clampReviewLoopMax,
+  REVIEW_LOOP_MAX_DEFAULT, REVIEW_LOOP_MAX_LIMIT, clampReviewLoopMax, reviewCiWaitMin,
   ciCheckState, ciStateOf, ciStateWithRuns, failedChecks, latestChecks, runIdFromCheckUrl,
   CI_LOOP_MAX_DEFAULT, CI_LOOP_MAX_LIMIT, clampCiLoopMax,
   SUGGEST_MARK, parseSuggestedAnswers, planHasNoQuestions, skipLine, projectRulesInstr,

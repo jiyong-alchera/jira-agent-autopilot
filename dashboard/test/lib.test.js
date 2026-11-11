@@ -336,6 +336,17 @@ test("clampReviewLoopMax: 요청값 → 프로젝트 설정 → 기본 5, 1~20 c
   assert.equal(lib.clampReviewLoopMax("abc", null), 5);                // 파싱 실패·cfg 없음 → 기본값
 });
 
+test("reviewCiWaitMin: 프로젝트 설정만 env 로, 미설정·잘못된 값은 스크립트 기본값에 맡긴다", () => {
+  assert.equal(lib.reviewCiWaitMin({}), "");
+  assert.equal(lib.reviewCiWaitMin(null), "");
+  assert.equal(lib.reviewCiWaitMin({ reviewLoopCiWaitMin: 60 }), "60");
+  assert.equal(lib.reviewCiWaitMin({ reviewLoopCiWaitMin: "45" }), "45");
+  assert.equal(lib.reviewCiWaitMin({ reviewLoopCiWaitMin: 0 }), "0");     // 0 = 기다리지 않음
+  assert.equal(lib.reviewCiWaitMin({ reviewLoopCiWaitMin: 999 }), "180");
+  assert.equal(lib.reviewCiWaitMin({ reviewLoopCiWaitMin: -5 }), "");
+  assert.equal(lib.reviewCiWaitMin({ reviewLoopCiWaitMin: "abc" }), "");
+});
+
 test("projectRulesInstr: 프로젝트 규칙을 프롬프트 꼬리말로, 빈 설정은 빈 문자열", () => {
   assert.equal(lib.projectRulesInstr(""), "");
   assert.equal(lib.projectRulesInstr("  \n\n "), "");
