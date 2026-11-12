@@ -216,3 +216,11 @@ test("advanceTrack: release 가 안 잡히면 태그 뒤 기간 내 재발 없�
   assert.ok(r.track.gaveUpAt);
   assert.equal(S.trackDone(r.track), true);
 });
+
+test("ignorePatterns: 시험 이벤트는 카드 대상에서 빠지고 보안 의심으로도 보지 않는다", () => {
+  const conf = S.sentryConfig({ sentry: { minEvents: 1, ignorePatterns: ["중계기 시험 오류"] } });
+  const test1 = { id: "1", level: "error", title: "EKYB-1172 중계기 시험 오류 (무시해도 됩니다)", count: "3" };
+  assert.ok(S.ignoreMatch(test1, conf));
+  assert.equal(S.securityMatch(test1, conf), "");
+  assert.deepEqual(S.pickIssues([test1, { id: "2", level: "error", title: "boom", count: "1" }], conf).map((i) => i.id), ["2"]);
+});

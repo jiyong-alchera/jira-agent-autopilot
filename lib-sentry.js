@@ -39,6 +39,7 @@ function sentryConfig(cfg) {
     epicSummary: String(s.epicSummary || DEFAULT_EPIC_SUMMARY).trim(),
     accessDir: String(s.accessDir || "").trim(),
     securityPatterns: (Array.isArray(s.securityPatterns) ? s.securityPatterns : []).map(String).filter(Boolean),
+    ignorePatterns: (Array.isArray(s.ignorePatterns) ? s.ignorePatterns : []).map(String).filter(Boolean),   // 시험 이벤트 등 카드·알림 없이 건너뛸 것
   };
 }
 
@@ -62,15 +63,17 @@ function eventCount(issue) {
 }
 
 // 보안 사건 의심 패턴(제목·culprit·메시지 정규식, 대소문자 무시). 맞으면 카드 대신 보안 알림 1회.
-function securityMatch(issue, conf) {
+function patternMatch(issue, patterns) {
   const fields = [issue && issue.title, issue && issue.culprit, issue && issue.metadata && issue.metadata.value]
     .filter(Boolean).map(String);
-  for (const p of conf.securityPatterns || []) {
+  for (const p of patterns || []) {
     let re; try { re = new RegExp(p, "i"); } catch { continue; }
     if (fields.some((f) => re.test(f))) return p;   // 필드마다 따로 — ^…$ 패턴이 culprit 과 합쳐져 빗나가지 않게
   }
   return "";
 }
+const securityMatch = (issue, conf) => patternMatch(issue, conf.securityPatterns);
+const ignoreMatch = (issue, conf) => patternMatch(issue, conf.ignorePatterns);
 
 // 카드로 만들 이슈만: 미해결 + (fatal 이면 즉시 | 기간 내 minEvents 이상), 이미 처리한 id 제외.
 function pickIssues(issues, conf, seen) {
@@ -79,6 +82,7 @@ function pickIssues(issues, conf, seen) {
     if (!i || !i.id || known.has(String(i.id))) return false;
     if (i.status && i.status !== "unresolved") return false;
     if (securityMatch(i, conf)) return false;
+    if (ignoreMatch(i, conf)) return false;
     if (conf.fatalImmediate && String(i.level || "").toLowerCase() === "fatal") return true;
     return eventCount(i) >= conf.minEvents;
   });
@@ -322,7 +326,7 @@ function overviewRows(state, epic) {
 
 module.exports = {
   overviewRows, combineContains, trackDone, trackStage, advanceTrack, sortTagsDesc,
-  SENTRY_LABEL, DEFAULT_EPIC_SUMMARY, sentryConfig, sentryReady, eventCount, pickIssues, securityMatch,
+  SENTRY_LABEL, DEFAULT_EPIC_SUMMARY, sentryConfig, sentryReady, eventCount, pickIssues, securityMatch, ignoreMatch,
   idLabel, envLabel, envOfLabels, isSentryCard, cardLabels, cardSummary, eventDigest, cardDescription,
   accessDirOf, accessFileOf, agentInstr, taskRepoNames, notifyUrls, prsFromHistory,
 };

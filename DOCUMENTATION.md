@@ -571,7 +571,7 @@ CI 가 끝난 뒤 에픽 러너의 '병합만 남음' 알림이 또 와서 그�
 2. **이슈 수집** — `sentry.projects` 의 `{slug, repo}` × `sentry.environments` 마다 `GET /api/0/projects/<org>/<slug>/issues/?query=is:unresolved&environment=<env>&statsPeriod=<windowHours>h`.
    **카드 기준**: 레벨 `fatal` 이면 즉시(`fatalImmediate`), 그 외는 기간 내 발생 수(stats 버킷 합, 없으면 `count`) ≥ `minEvents`(기본 5, 24시간).
    1회 최대 `maxCardsPerRun`(기본 5)건.
-   `sentry.securityPatterns` 에 맞는 이슈는 카드 대신 보안 의심 알림만 1회 보낸다.
+   `sentry.securityPatterns` 에 맞는 이슈는 카드 대신 보안 의심 알림만 1회 보낸다. `sentry.ignorePatterns` 에 맞는 이슈(시험 이벤트 등)는 카드·알림 없이 건너뛴다.
 3. **중복 방지** — 상태 파일의 이슈 id + Jira 라벨 `sentry-<이슈ID>` 검색 이중 확인. 같은 Sentry 이슈로는 카드를 한 번만 만든다.
 4. **카드 생성** — 에픽 하위(버그 타입 우선, 없으면 작업), 담당자 = 프로젝트 설정 담당자(`assigneeEmail`, 없거나 못 찾으면 토큰 계정). 연속 개발은 `assignee = currentUser()`(토큰 계정) 카드만 처리하므로 둘이 다르면 로그에 경고한다.
    제목 `[Sentry][<env>] <에러 제목>`, 본문은 링크·환경·레벨·발생 수·처음/마지막 발생·culprit·요청·**앱 프레임 우선 스택트레이스**·breadcrumb·태그.
@@ -800,6 +800,7 @@ CI 가 끝난 뒤 에픽 러너의 '병합만 남음' 알림이 또 와서 그�
 | 확인 주기(분) | (설정 `sentry.intervalMinutes`) | `10` | 1~1440 |
 | 1회 최대 카드 | (설정 `sentry.maxCardsPerRun`) | `5` | 1~50 |
 | 보안 의심 패턴 | (설정 `sentry.securityPatterns`) | `[]` | 제목·culprit·메시지 각각에 거는 정규식(대소문자 무시). 맞는 이슈는 **카드를 만들지 않고** `🚨 보안 사건 의심` 을 두 웹훅에 1회 알린다(침입 흔적 같은 에러를 자동 '수정' 하지 않도록) |
+| 무시 패턴 | (설정 `sentry.ignorePatterns`) | `[]` | 보안 의심 패턴과 같은 방식의 정규식. 맞는 이슈는 카드도 알림도 없이 건너뛴다(중계기 시험 이벤트 등). ekyb 는 기준을 1회(`minEvents: 1`)로 낮춰 쓰므로 시험 이벤트를 여기서 거른다 |
 | 자동 병합 대기(분) | (설정 `sentry.autoMergeAfterMin`) | `5` | Sentry 에픽 연속 개발을 시작할 때 넘기는 `autoMergeAfterMin` |
 | 병합 뒤 추적 기간(일) | (설정 `sentry.trackDays`) | `14` | 1~90. 병합 뒤 배포·해결·재발을 지켜보는 기간. 해결 확인 기준 기간은 `windowHours` |
 | 에픽 제목 | (설정 `sentry.epicSummary`) | `Sentry 작동 업무 처리` | 이 제목의 미완료 에픽을 쓰고, 없으면 만든다 |
