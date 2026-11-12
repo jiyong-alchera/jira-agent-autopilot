@@ -35,6 +35,7 @@ function sentryConfig(cfg) {
     intervalMinutes: int(s.intervalMinutes, 10, 1, 1440),
     maxCardsPerRun: int(s.maxCardsPerRun, 5, 1, 50),
     autoMergeAfterMin: int(s.autoMergeAfterMin, 5, 1, 1440),
+    trackDays: int(s.trackDays, 14, 1, 90),   // 병합 뒤 배포·해결·재발을 지켜보는 기간
     epicSummary: String(s.epicSummary || DEFAULT_EPIC_SUMMARY).trim(),
     accessDir: String(s.accessDir || "").trim(),
     securityPatterns: (Array.isArray(s.securityPatterns) ? s.securityPatterns : []).map(String).filter(Boolean),
@@ -218,8 +219,77 @@ function prsFromHistory(lines, key) {
   return [...urls];
 }
 
-// 대시보드 표시용 — 추적 중인 Sentry 이슈마다 진행 단계. 우선순위: 병합 완료 > 에픽 워커(돌거나 멈춘 카드) > 에픽 태스크 목록 > 대기.
-// epic: .state/<EPIC>.epic.json (없으면 {}). stage: merged | failed | stopped | running | blocked | queued
+// ----- 병합 뒤 추적: 태그 → 배포 → 해결/재발 -----
+// 배포는 Sentry release 로 판정한다. release 값은 배포된 커밋(SHA 나 태그)이라, 그 환경에서 수정 커밋을
+// 포함한 release 의 이벤트가 보이면 그 환경이 새 버전으로 돈다는 뜻이다. 배포 경로(워크플로·스크립트·수동)와 무관.
+
+// 여러 수정 커밋의 포함 여부 → 하나라도 빠졌으면 false, 모두 포함이면 true, 그 외(조회 실패)는 null
+function combineContains(list) {
+  if (!list.length) return null;
+  if (list.some((c) => c === false)) return false;
+  return list.every((c) => c === true) ? true : null;
+}
+
+// 재발했거나 추적 기한이 지났으면 더 묻지 않는다. 해결은 재발을 계속 지켜보느라 끝이 아니다.
+const trackDone = (t) => !!(t && (t.regressedAt || t.gaveUpAt));
+
+// merged 이후 단계. 재발 > 해결 > 배포 확인 > 재발 없음(배포 미확인) > 태그 포함 > 병합
+function trackStage(v) {
+  const n = (v && v.notified) || {}, t = (v && v.track) || {};
+  if (!n.merged) return "";
+  if (t.regressedAt) return "regressed";
+  if (t.resolvedAt) return "resolved";
+  if (t.deployedAt) return "deployed";
+  if (t.quietAt) return "quiet";
+  if (t.tag) return "tagged";
+  return "merged";
+}
+
+// inp: { now(ms), mergedAt, windowMs, giveUpMs, tag:{name,at}|null, lastSeen,
+//        envReleases:[{version,dateCreated}] (카드 환경), events:[{release,env,at}] (병합 뒤, 모든 환경),
+//        contains:{version: true|false|null} }
+// 반환: { track, changes:["deployed"|"resolved"|"regressed"] } — changes 는 이번에 새로 일어난 일
+function advanceTrack(t0, inp) {
+  const t = { ...(t0 || {}) }, changes = [];
+  const iso = (ms) => new Date(ms).toISOString().replace(/\.\d{3}Z$/, "Z");
+  const has = (ver) => !!ver && (inp.contains || {})[ver] === true;
+  const mergedMs = Date.parse(inp.mergedAt) || 0;
+  if (!t.tag && inp.tag && inp.tag.name) { t.tag = inp.tag.name; t.tagAt = inp.tag.at || ""; }
+  if (!t.deployedAt) {
+    const hit = (inp.envReleases || []).filter((r) => has(r.version))
+      .sort((a, b) => String(a.dateCreated).localeCompare(String(b.dateCreated)))[0];
+    if (hit) {
+      t.deployedRelease = hit.version;
+      t.deployedAt = iso(Math.max(Date.parse(hit.dateCreated) || 0, mergedMs));
+      changes.push("deployed");
+    }
+  }
+  if (!t.regressedAt) {
+    const ev = (inp.events || []).filter((e) => has(e.release) && Date.parse(e.at) > mergedMs)
+      .sort((a, b) => String(a.at).localeCompare(String(b.at)))[0];
+    if (ev) { t.regressedAt = ev.at; t.regressedRelease = ev.release; t.regressedEnv = ev.env || ""; changes.push("regressed"); }
+  }
+  if (!t.regressedAt && !t.resolvedAt && t.deployedAt && inp.now - Date.parse(t.deployedAt) >= inp.windowMs) {
+    t.resolvedAt = iso(inp.now);
+    changes.push("resolved");
+  }
+  // release 가 안 잡히는 경우(새 버전에서 에러가 없으면 그 release 이벤트도 없다)를 위한 보조 표시. 태그 뒤로
+  // 기간 내내 어느 환경에서도 안 났으면 '재발 없음'. 다시 나면 지운다 — 옛 버전이 아직 돈다는 뜻이다.
+  const quiet = !t.deployedAt && !!t.tagAt && inp.now - Date.parse(t.tagAt) >= inp.windowMs
+    && !(Date.parse(inp.lastSeen) > Date.parse(t.tagAt));
+  if (quiet) t.quietAt = t.quietAt || iso(inp.now); else delete t.quietAt;
+  if (!trackDone(t) && inp.giveUpMs && inp.now - mergedMs > inp.giveUpMs) t.gaveUpAt = iso(inp.now);
+  return { track: t, changes };
+}
+
+// 태그를 최신 순으로 — v1.5.9 < v1.5.68 이 되도록 숫자 비교
+function sortTagsDesc(tags) {
+  return (tags || []).slice().sort((a, b) => String(b.name).localeCompare(String(a.name), undefined, { numeric: true }));
+}
+
+// 대시보드 표시용 — 추적 중인 Sentry 이슈마다 진행 단계. 우선순위: 병합 뒤 추적 > 에픽 워커(돌거나 멈춘 카드) > 에픽 태스크 목록 > 대기.
+// epic: .state/<EPIC>.epic.json (없으면 {}).
+// stage: regressed | failed | running | stopped | blocked | queued | merged | tagged | quiet | deployed | resolved
 function overviewRows(state, epic) {
   const workers = Object.fromEntries(((epic && epic.workers) || []).map((w) => [w.key, w]));
   const tasks = Object.fromEntries(((epic && epic.tasks) || []).map((t) => [t.key, t]));
@@ -227,7 +297,7 @@ function overviewRows(state, epic) {
     const n = v.notified || {};
     const w = workers[v.key], t = tasks[v.key];
     let stage = "queued", step = "", reason = "";
-    if (n.merged) stage = "merged";
+    if (n.merged) stage = trackStage(v);
     else if (w && w.status === "failed") { stage = "failed"; step = w.step || ""; reason = w.reason || ""; }
     else if (w && w.status === "stopped") { stage = "stopped"; step = w.step || ""; }
     else if (w) { stage = "running"; step = w.step || ""; }
@@ -236,9 +306,14 @@ function overviewRows(state, epic) {
       issueId: id, shortId: v.shortId || "", title: v.title || "", env: v.env || "", permalink: v.permalink || "",
       key: v.key || "", repo: v.repo || "", level: v.level || "", count: v.count || 0,
       stage, step, reason, createdAt: v.createdAt || "", mergedAt: n.merged || "", recovered: !!v.recovered,
+      track: v.track ? {
+        tag: v.track.tag || "", tagAt: v.track.tagAt || "", deployedRelease: v.track.deployedRelease || "", deployedAt: v.track.deployedAt || "",
+        resolvedAt: v.track.resolvedAt || "", quietAt: v.track.quietAt || "", regressedAt: v.track.regressedAt || "",
+        regressedRelease: v.track.regressedRelease || "", regressedEnv: v.track.regressedEnv || "", note: v.track.note || "",
+      } : null,
     };
   });
-  const order = { failed: 0, running: 1, stopped: 2, blocked: 3, queued: 4, merged: 5 };
+  const order = { regressed: 0, failed: 0, running: 1, stopped: 2, blocked: 3, queued: 4, merged: 5, tagged: 5, quiet: 5, deployed: 5, resolved: 6 };
   rows.sort((a, b) => (order[a.stage] - order[b.stage]) || String(b.createdAt).localeCompare(String(a.createdAt)));
   const security = Object.entries((state && state.security) || {}).map(([id, s]) => ({ issueId: id, ...s }))
     .sort((a, b) => String(b.at || "").localeCompare(String(a.at || "")));
@@ -246,7 +321,7 @@ function overviewRows(state, epic) {
 }
 
 module.exports = {
-  overviewRows,
+  overviewRows, combineContains, trackDone, trackStage, advanceTrack, sortTagsDesc,
   SENTRY_LABEL, DEFAULT_EPIC_SUMMARY, sentryConfig, sentryReady, eventCount, pickIssues, securityMatch,
   idLabel, envLabel, envOfLabels, isSentryCard, cardLabels, cardSummary, eventDigest, cardDescription,
   accessDirOf, accessFileOf, agentInstr, taskRepoNames, notifyUrls, prsFromHistory,

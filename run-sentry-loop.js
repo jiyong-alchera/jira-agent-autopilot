@@ -5,7 +5,9 @@
 // 2) 매핑된 Sentry 프로젝트 × 환경마다 미해결 이슈를 가져와 기준(fatal 즉시 | 기간 내 N회 이상)에 맞는
 //    새 이슈를 에픽 하위 카드로 만든다(라벨 claude-work · sentry · sentry-<id> · sentry-env-<env> · repo_<repo>).
 // 3) 새 카드는 '처리 시작' 을 두 웹훅(slackWebhookUrl + sentrySlackWebhookUrl)에 알리고 Sentry 이슈에 코멘트.
-// 4) 추적 중인 카드가 완료(병합)되면 '병합 완료(배포 전)', 에픽에서 멈추면 '실패' 를 두 웹훅에 한 번씩 알린다.
+// 4) 추적 중인 카드가 완료(병합)되면 '병합 완료', 에픽에서 멈추면 '실패' 를 두 웹훅에 한 번씩 알린다.
+//    병합 뒤에는 수정 커밋이 들어간 태그 → 카드 환경의 Sentry release 에 포함됐는지(배포 확인) → 기간 내 재발
+//    없음(해결) / 수정 버전에서 재발을 추적해 해결·재발을 알린다(trackDays 동안).
 // 5) 남은 카드가 있는데 에픽 연속 개발이 안 돌면(idle/done) 자동 병합을 켜서 시작한다.
 //    사용자가 멈춘(stopped) 실행이나 실패로 멈춘(paused) 실행은 건드리지 않는다.
 //
@@ -14,6 +16,7 @@
 // --------------------------------------------------------------------------
 const fs = require("fs");
 const path = require("path");
+const { execFile } = require("child_process");
 const { SELF, lib, projectEnv, loadProjects, loadCreds } = require("./lib-project-env");
 const S = require("./lib-sentry");
 
@@ -102,6 +105,18 @@ async function sentryComment(issueId, text) {
   catch (e) { log(`Sentry 코멘트 실패(${issueId}): ${e.message}`); }
 }
 const browse = (key) => `https://${cfg.jiraSite}/browse/${key}`;
+
+function gh(args) {
+  const env = { ...process.env };
+  if (cred.githubToken) { env.GH_TOKEN = cred.githubToken; env.GITHUB_TOKEN = cred.githubToken; }
+  return new Promise((resolve) => {
+    execFile("gh", args, { env, maxBuffer: 10 * 1024 * 1024 }, (err, stdout) => {
+      if (err) return resolve(null);
+      try { resolve(JSON.parse(stdout || "null")); } catch { resolve(null); }
+    });
+  });
+}
+const prOwnerRepo = (url) => { const m = String(url).match(/github\.com\/([^/]+\/[^/]+)\/pull\/\d+/); return m ? m[1] : ""; };
 
 // ----- Jira 메타 -----
 let META = null;
@@ -261,8 +276,8 @@ async function followUp(epicKey) {
     if (statusOf[v.key]) {
       const prs = S.prsFromHistory(lines, v.key);
       const prTxt = prs.length ? prs.map((u) => `<${u}|PR>`).join(" ") : "PR 기록 없음";
-      await notifyBoth(`✅ [Sentry][${v.env}] ${v.title} — 병합 완료(배포 전) · <${browse(v.key)}|${v.key}> · ${prTxt}`);
-      await sentryComment(id, `수정이 병합됐습니다(배포 전): ${v.key} ${prs.join(" ")}`);
+      await notifyBoth(`🔀 [Sentry][${v.env}] ${v.title} — 병합 완료, 배포·해결 추적 시작 · <${browse(v.key)}|${v.key}> · ${prTxt}`);
+      await sentryComment(id, `수정이 병합됐습니다: ${v.key} ${prs.join(" ")}`);
       v.notified.merged = nowIso();
       continue;
     }
@@ -273,6 +288,105 @@ async function followUp(epicKey) {
       v.notified.failed = sig;
     }
   }
+  save();
+}
+
+// ----- 3-1) 병합 뒤 추적: 태그 포함 → 배포 확인(Sentry release) → 해결/재발 -----
+// 포함 판정은 GitHub compare(base...head 의 status 가 ahead|identical 이면 head 가 base 를 포함).
+// 결과는 바뀌지 않으므로 확정된 것만 STATE.cmp 에 남긴다.
+async function contains(or, base, head) {
+  if (!or || !base || !head) return null;
+  if (base === head) return true;
+  const k = `${or}@${base}..${head}`;
+  STATE.cmp = STATE.cmp || {};
+  if (k in STATE.cmp) return STATE.cmp[k];
+  const r = await gh(["api", `repos/${or}/compare/${encodeURIComponent(base)}...${encodeURIComponent(head)}`, "--jq", "{status: .status}"]);
+  const st = r && r.status;
+  const v = st === "ahead" || st === "identical" ? true : st === "behind" || st === "diverged" ? false : null;
+  if (v !== null) STATE.cmp[k] = v;
+  return v;
+}
+async function mergedFixes(v, lines) {
+  const out = [];
+  for (const url of S.prsFromHistory(lines, v.key)) {
+    const or = prOwnerRepo(url);
+    if (!or) continue;
+    const p = await gh(["pr", "view", url, "--json", "state,mergeCommit,mergedAt"]);
+    if (p && p.state === "MERGED" && p.mergeCommit && p.mergeCommit.oid) out.push({ or, pr: url, sha: p.mergeCommit.oid, mergedAt: p.mergedAt || "" });
+  }
+  return out;
+}
+// 수정 커밋을 처음 포함한 태그. 최신 태그부터 내려가다 포함하지 않는 태그를 만나면 멈춘다(최대 15개).
+async function firstTag(or, has) {
+  const tags = S.sortTagsDesc((await gh(["api", `repos/${or}/tags?per_page=30`])) || []).slice(0, 15);
+  let found = null;
+  for (const t of tags) {
+    const c = await has(t.commit && t.commit.sha);
+    if (c === true) found = t; else break;
+  }
+  if (!found) return null;
+  const c = await gh(["api", `repos/${or}/commits/${found.commit.sha}`, "--jq", "{at: .commit.committer.date}"]);
+  return { name: found.name, at: (c && c.at) || "" };
+}
+async function trackDeploys() {
+  const items = Object.entries(STATE.issues).filter(([, v]) => v.notified && v.notified.merged && !S.trackDone(v.track));
+  if (!items.length) return;
+  let lines = [];
+  try { lines = fs.readFileSync(HISTORY_FILE, "utf8").split("\n"); } catch {}
+  const relCache = {};
+  const now = Date.now();
+  for (const [id, v] of items) {
+    try {
+      const t = { ...(v.track || {}) };
+      const issue = await sentry("GET", `/api/0/issues/${encodeURIComponent(id)}/`);
+      if (!v.shortId && issue.shortId) v.shortId = issue.shortId;
+      if (!t.fixes || !t.fixes.length) t.fixes = await mergedFixes(v, lines);
+      const or = (t.fixes[0] || {}).or || "";
+      const shas = t.fixes.filter((f) => f.or === or).map((f) => f.sha);
+      t.note = shas.length ? "" : "병합 커밋을 못 찾음(PR 기록 없음)";
+      const has = async (ref) => (shas.length && ref ? S.combineContains(await Promise.all(shas.map((s) => contains(or, s, ref)))) : null);
+      const tag = !t.tag && shas.length ? await firstTag(or, has) : null;
+
+      const pid = issue.project && issue.project.id;
+      const rk = `${pid}:${v.env}`;
+      if (!(rk in relCache)) {
+        relCache[rk] = await sentry("GET", `/api/0/organizations/${conf.org}/releases/?project=${pid}&environment=${encodeURIComponent(v.env)}&per_page=10`)
+          .then((a) => (Array.isArray(a) ? a.map((r) => ({ version: r.version, dateCreated: r.dateCreated })) : []))
+          .catch(() => []);   // 이벤트가 한 번도 없던 환경은 404
+      }
+      const mergedAt = (t.fixes.map((f) => f.mergedAt).filter(Boolean).sort().pop()) || v.notified.merged;
+      const evs = await sentry("GET", `/api/0/issues/${encodeURIComponent(id)}/events/?per_page=50`).catch(() => []);
+      const events = (Array.isArray(evs) ? evs : []).map((e) => {
+        const tg = Object.fromEntries((e.tags || []).map((x) => [x.key, x.value]));
+        return { release: tg.release || "", env: tg.environment || "", at: e.dateCreated || "" };
+      }).filter((e) => Date.parse(e.at) > Date.parse(mergedAt));
+      const versions = [...new Set([...relCache[rk].map((r) => r.version), ...events.map((e) => e.release)].filter(Boolean))];
+      const cmap = {};
+      for (const ver of versions) cmap[ver] = await has(ver);
+
+      const { track, changes } = S.advanceTrack(t, {
+        now, mergedAt, windowMs: conf.windowHours * 3600000, giveUpMs: conf.trackDays * 86400000,
+        tag, lastSeen: issue.lastSeen || "", envReleases: relCache[rk], events, contains: cmap,
+      });
+      v.track = track;
+      const head = `[Sentry][${v.env}] ${v.title} · <${browse(v.key)}|${v.key}> · <${v.permalink || ""}|Sentry>`;
+      const rel = (s) => String(s || "").slice(0, 12);
+      if (changes.includes("deployed")) log(`${v.key} 배포 확인: ${v.env} release ${rel(track.deployedRelease)}`);
+      if (changes.includes("regressed")) {
+        await notifyBoth(`🔁 ${head} — 배포된 수정 버전(${rel(track.regressedRelease)}, ${track.regressedEnv || "?"})에서 다시 발생했습니다. 사람 확인 필요`);
+        await sentryComment(id, `수정 배포 뒤 재발: release ${track.regressedRelease} (${v.key})`);
+      }
+      if (changes.includes("resolved")) {
+        await notifyBoth(`✅ ${head} — ${v.env} 배포(${rel(track.deployedRelease)}) 뒤 ${conf.windowHours}시간 동안 재발 없음, 해결 확인`);
+        await sentryComment(id, `수정 배포 뒤 ${conf.windowHours}시간 재발 없음: ${v.key}`);
+      }
+      if (track.gaveUpAt) log(`${v.key} 추적 종료(${conf.trackDays}일 경과)`);
+    } catch (e) {
+      log(`배포 추적 실패(${v.key}): ${e.message}`);
+    }
+  }
+  const cmp = Object.entries(STATE.cmp || {});
+  if (cmp.length > 500) STATE.cmp = Object.fromEntries(cmp.slice(-500));
   save();
 }
 
@@ -316,6 +430,7 @@ async function ensureRun(epicKey) {
     // dry-run 은 에픽이 아직 없어도 어떤 이슈가 카드가 될지까지 보여 준다
     const made = await collect(epicKey);
     if (epicKey) await followUp(epicKey);
+    if (!DRY) await trackDeploys();
     const run = epicKey ? await ensureRun(epicKey) : "(dry) 에픽 생성 후 시작 예정";
     save({ lastCreated: made, lastRun: run });
     log(`완료 — 새 카드 ${made}건 · ${run}`);

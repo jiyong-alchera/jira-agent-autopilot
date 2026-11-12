@@ -258,6 +258,7 @@
     `dashboard/public/index.html`, `dashboard/test/sentry.test.js`
   → (완료 2026-11-12) 대시보드가 1분 판정으로 프로젝트별 주기 실행, `/api/sentry/{status,run,access/:env}` 추가, 자격증명 `sentryToken`·`sentrySlackWebhookUrl`,
     Sentry 카드는 자기 repo 만 다루고 `SENTRY_INSTR` 로 환경 접근 규칙을 받는다. `npm test` 202건 통과.
+  → (완료 2026-11-12) 병합 뒤 추적 추가: 배포 태그 포함 → Sentry release 로 배포 확인 → 해결 확인/재발 알림(`sentry.trackDays`), 화면 단계 확장. `npm test` 209건 통과.
 
 ---
 

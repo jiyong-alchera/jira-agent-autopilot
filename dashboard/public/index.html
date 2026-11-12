@@ -1559,8 +1559,36 @@ const SENTRY_STAGE = {
   stopped: { label: "중지됨", tone: "bg-amber-500/15 text-amber-200 border-amber-500/50" },
   blocked: { label: "선행 대기", tone: "bg-slate-600/30 text-slate-300 border-slate-600" },
   queued: { label: "대기", tone: "bg-slate-600/30 text-slate-300 border-slate-600" },
-  merged: { label: "병합 완료(배포 전)", tone: "bg-emerald-500/15 text-emerald-200 border-emerald-500/40" },
+  merged: { label: "병합됨", tone: "bg-teal-500/15 text-teal-200 border-teal-500/40" },
+  tagged: { label: "배포 태그 포함", tone: "bg-teal-500/15 text-teal-200 border-teal-500/40" },
+  quiet: { label: "재발 없음(배포 미확인)", tone: "bg-teal-500/15 text-teal-200 border-teal-500/40" },
+  deployed: { label: "배포 확인 · 재발 감시", tone: "bg-sky-500/15 text-sky-200 border-sky-500/40" },
+  resolved: { label: "해결 확인", tone: "bg-emerald-500/15 text-emerald-200 border-emerald-500/40" },
+  regressed: { label: "재발", tone: "bg-rose-500/15 text-rose-200 border-rose-500/50" },
 };
+// 병합 뒤 단계 옆에 붙는 근거(태그·release). release 가 SHA 면 앞 7자리만.
+function sentryTrackDetail(r) {
+  const t = r.track;
+  if (!t) return "";
+  const rel = (s) => (/^[0-9a-f]{40}$/.test(s) ? s.slice(0, 7) : s);
+  if (r.stage === "regressed") return `${t.regressedEnv || ""} ${rel(t.regressedRelease)}`.trim();
+  if (r.stage === "resolved" || r.stage === "deployed") return rel(t.deployedRelease);
+  if (r.stage === "tagged" || r.stage === "quiet") return t.tag;
+  return "";
+}
+function sentryTrackTitle(r) {
+  const t = r.track || {};
+  const at = (s) => (s ? new Date(s).toLocaleString() : "");
+  return [
+    r.mergedAt && `병합: ${at(r.mergedAt)}`,
+    t.tag && `태그: ${t.tag}${t.tagAt ? ` (${at(t.tagAt)})` : ""}`,
+    t.deployedAt && `배포 확인: ${r.env} release ${t.deployedRelease} (${at(t.deployedAt)})`,
+    t.quietAt && `태그 이후 재발 없음 — 배포 여부는 Sentry release 로 아직 확인 못 함`,
+    t.resolvedAt && `해결 확인: ${at(t.resolvedAt)}`,
+    t.regressedAt && `재발: ${t.regressedEnv} release ${t.regressedRelease} (${at(t.regressedAt)})`,
+    t.note,
+  ].filter(Boolean).join("\n");
+}
 function SentryOverview({ onOpen, flash }) {
   const [data, setData] = useState(null);
   const [busy, setBusy] = useState("");
@@ -1627,7 +1655,7 @@ function SentryOverview({ onOpen, flash }) {
                   </div>
                   {p.rows.length > 0 && (
                     <table className="w-full text-sm table-fixed mt-2">
-                      <thead><tr className="text-xs text-slate-500 text-left"><th className="w-24 font-normal">Sentry</th><th className="w-14 font-normal">환경</th><th className="font-normal">에러</th><th className="w-28 font-normal">Jira 카드</th><th className="w-48 font-normal text-right">단계</th><th className="w-20 font-normal text-right">시작</th></tr></thead>
+                      <thead><tr className="text-xs text-slate-500 text-left"><th className="w-24 font-normal">Sentry</th><th className="w-14 font-normal">환경</th><th className="font-normal">에러</th><th className="w-28 font-normal">Jira 카드</th><th className="w-60 font-normal text-right">단계</th><th className="w-20 font-normal text-right">시작</th></tr></thead>
                       <tbody>
                         {p.rows.map((r) => {
                           const st = SENTRY_STAGE[r.stage] || SENTRY_STAGE.queued;
@@ -1643,8 +1671,9 @@ function SentryOverview({ onOpen, flash }) {
                                 {r.key ? <a className="text-indigo-300 hover:underline" href={jira(p, r.key)} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()}>{r.key}</a> : "-"}
                               </td>
                               <td className="text-right whitespace-nowrap">
-                                <span className={`inline-block text-xs px-2 py-0.5 rounded-full border ${st.tone}`}>
+                                <span className={`inline-block text-xs px-2 py-0.5 rounded-full border ${st.tone}`} title={sentryTrackTitle(r) || undefined}>
                                   {st.label}{r.step ? ` · ${EPIC_STEP_LABEL[r.step] || r.step}` : ""}
+                                  {sentryTrackDetail(r) ? <span className="font-mono opacity-80"> · {sentryTrackDetail(r)}</span> : null}
                                 </span>
                               </td>
                               <td className="text-right text-xs text-slate-500">{r.createdAt ? `${sinceText(r.createdAt)} 전` : ""}</td>
