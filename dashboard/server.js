@@ -538,6 +538,10 @@ app.post("/api/loops/:type/run-once", (req, res) => {
 // 특정 카드 1건 즉시 실행
 app.post("/api/cards/:key/run", async (req, res) => {
   const key = req.params.key;
+  {
+    const off = lib.disabledMessage(getProject(String((req.query && req.query.project) || (req.body && req.body.project) || defaultProjectId() || "")));
+    if (off) return res.json({ ok: false, message: off });
+  }
   const b = req.body || {};
   const phase = b.phase;
   const rework = !!b.rework;
@@ -591,6 +595,10 @@ app.post("/api/cards/:key/run", async (req, res) => {
 //    실행이 끝난 뒤 그 에픽을 이어서 진행시킨다.
 app.post("/api/cards/:key/resolve-conflict", async (req, res) => {
   const key = req.params.key;
+  {
+    const off = lib.disabledMessage(getProject(String((req.query && req.query.project) || (req.body && req.body.project) || defaultProjectId() || "")));
+    if (off) return res.json({ ok: false, message: off });
+  }
   const b = req.body || {};
   const owner = String(b.owner || "").trim();
   const number = String(b.number == null ? "" : b.number).trim();
@@ -686,6 +694,10 @@ app.post("/api/cards/:key/stop", (req, res) => {
 // 리뷰 승인까지 반복 루프 시작 — body.{owner,number,memo,max}. 한 카드당 1개만 실행된다.
 app.post("/api/cards/:key/review-loop", async (req, res) => {
   const key = req.params.key;
+  {
+    const off = lib.disabledMessage(getProject(String((req.query && req.query.project) || (req.body && req.body.project) || defaultProjectId() || "")));
+    if (off) return res.json({ ok: false, message: off });
+  }
   const b = req.body || {};
   if (!/^[A-Z][A-Z0-9]+-[0-9]+$/.test(key)) return res.status(400).json({ ok: false, message: "이슈 키 형식 오류" });
   if (!b.owner || b.number == null) return res.status(400).json({ ok: false, message: "owner·number 가 필요합니다" });
@@ -861,6 +873,7 @@ function runSentryLoop(id, extraEnv) {
 // 1분마다: 켜진 프로젝트 중 마지막 실행이 intervalMinutes 보다 오래된 것만 띄운다.
 function scanSentry() {
   for (const p of listProjects()) {
+    if (!lib.projectEnabled(p)) continue;
     const conf = sentryLib.sentryConfig(p);
     if (!sentryLib.sentryReady(conf, getProjectCreds(p.id)).ok) continue;
     const st = lib.readJson(sentryStatePath(p), {});
@@ -945,6 +958,7 @@ function epicRetryPlan(cfg, key, st, now) {
 async function retryPausedEpics() {
   const out = [];
   for (const p of listProjects()) {
+    if (!lib.projectEnabled(p)) continue;
     const cfg = getProject(p.id);
     let files = [];
     try { files = fs.readdirSync(stateDirOf(cfg)).filter((f) => f.endsWith(".epic.json")); } catch { continue; }
@@ -1062,6 +1076,7 @@ app.get("/api/sentry/status", (req, res) => {
 app.post("/api/sentry/run", (req, res) => {
   try {
     const { id, cfg } = resolveProject(req);
+    if (!lib.projectEnabled(cfg)) return res.json({ ok: false, message: lib.disabledMessage(cfg) });
     const ready = sentryLib.sentryReady(sentryLib.sentryConfig(cfg), getProjectCreds(id));
     if (!ready.ok) return res.json({ ok: false, message: `Sentry 설정 미완료: ${ready.why}` });
     res.json(runSentryLoop(id, req.body && req.body.dryRun ? { SENTRY_DRY_RUN: "1" } : null));
@@ -1088,6 +1103,10 @@ app.post("/api/sentry/access/:env", (req, res) => {
 // 에픽 연속 개발 시작 — body { repos:[name], reviewLoopMax? }. 에픽당 1개만 실행된다.
 app.post("/api/epics/:key/run", async (req, res) => {
   const key = req.params.key;
+  {
+    const off = lib.disabledMessage(getProject(String((req.query && req.query.project) || (req.body && req.body.project) || defaultProjectId() || "")));
+    if (off) return res.json({ ok: false, message: off });
+  }
   const b = req.body || {};
   if (!/^[A-Z][A-Z0-9]+-[0-9]+$/.test(key)) return res.status(400).json({ ok: false, message: "이슈 키 형식 오류" });
   try {
@@ -1113,6 +1132,10 @@ app.post("/api/epics/:key/run", async (req, res) => {
 // 멈춘(paused/stopped) 에픽을 이어서 진행 — body.skip=true 면 멈춘 단계를 건너뛰고 다음 단계부터.
 app.post("/api/epics/:key/run/resume", (req, res) => {
   const key = req.params.key;
+  {
+    const off = lib.disabledMessage(getProject(String((req.query && req.query.project) || (req.body && req.body.project) || defaultProjectId() || "")));
+    if (off) return res.json({ ok: false, message: off });
+  }
   if (!/^[A-Z][A-Z0-9]+-[0-9]+$/.test(key)) return res.status(400).json({ ok: false, message: "이슈 키 형식 오류" });
   try {
     const { id, cfg } = resolveProject(req);
@@ -1402,7 +1425,7 @@ async function completeMergedCards(id) {
 app.post("/api/cards/sync-merged", async (req, res) => {
   try {
     const pid = req.query.project || (req.body && req.body.project);
-    const ids = pid ? [pid] : listProjects().map((p) => p.id);
+    const ids = pid ? [pid] : listProjects().filter(lib.projectEnabled).map((p) => p.id);
     const completed = [];
     for (const id of ids) { try { const r = await completeMergedCards(id); r.completed.forEach((k) => completed.push({ project: id, key: k })); } catch {} }
     res.json({ ok: true, completed });
@@ -1528,7 +1551,7 @@ app.get("/api/active", async (req, res) => {
   try {
     const issues = [], errors = [];
     for (const p of listProjects()) {
-      if (!p.projectKey) continue;   // 프로젝트 키 없으면 탐지 대상 아님
+      if (!p.projectKey || !lib.projectEnabled(p)) continue;   // 프로젝트 키 없음·비활성이면 대상 아님
       const cfg = getProject(p.id), cred = getProjectCreds(p.id);
       try {
         for (const it of await buildProjectCards(cfg, cred)) {
@@ -1902,7 +1925,7 @@ app.listen(PORT, () => {
   for (const t of ["plan", "build", "review"]) if (st[t].running) console.log(`  복구: ${t} 루프 실행 중 (pid ${st[t].pid})`);
   // 외부(대시보드 밖) 병합 자동 반영: 주기적으로 await-merge 카드의 PR 병합 여부를 확인해 완료 처리
   const MERGE_SYNC_MS = 180000; // 3분
-  const syncAll = async () => { for (const p of listProjects()) { try { const r = await completeMergedCards(p.id); if (r.completed.length) console.log(`[merge-sync] ${p.id}: 외부 병합 완료 처리 ${r.completed.join(", ")}`); } catch {} } };
+  const syncAll = async () => { for (const p of listProjects().filter(lib.projectEnabled)) { try { const r = await completeMergedCards(p.id); if (r.completed.length) console.log(`[merge-sync] ${p.id}: 외부 병합 완료 처리 ${r.completed.join(", ")}`); } catch {} } };
   setInterval(syncAll, MERGE_SYNC_MS).unref?.();
   setTimeout(syncAll, 8000).unref?.(); // 부팅 직후 1회
   console.log(`  외부 병합 자동 동기화: ${MERGE_SYNC_MS / 1000}s 주기`);

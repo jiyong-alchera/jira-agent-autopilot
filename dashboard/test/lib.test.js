@@ -349,6 +349,15 @@ test("reviewCiWaitMin: 프로젝트 설정만 env 로, 미설정·잘못된 값�
   assert.equal(lib.reviewCiWaitMin({ reviewLoopCiWaitMin: "abc" }), "");
 });
 
+test("projectEnabled / disabledMessage: enabled:false 만 비활성, 미설정은 활성", () => {
+  assert.equal(lib.projectEnabled({}), true);
+  assert.equal(lib.projectEnabled(null), true);
+  assert.equal(lib.projectEnabled({ enabled: true }), true);
+  assert.equal(lib.projectEnabled({ enabled: false }), false);
+  assert.equal(lib.disabledMessage({ id: "a" }), "");
+  assert.match(lib.disabledMessage({ id: "fs", name: "FireScout3.0", enabled: false }), /FireScout3\.0.*비활성/);
+});
+
 test("projectRulesInstr: 프로젝트 규칙을 프롬프트 꼬리말로, 빈 설정은 빈 문자열", () => {
   assert.equal(lib.projectRulesInstr(""), "");
   assert.equal(lib.projectRulesInstr("  \n\n "), "");

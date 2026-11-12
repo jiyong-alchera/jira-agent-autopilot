@@ -81,6 +81,10 @@ function clampReviewLoopMax(requested, cfg) {
   return Math.min(pick || REVIEW_LOOP_MAX_DEFAULT, REVIEW_LOOP_MAX_LIMIT);
 }
 
+// 프로젝트 비활성(enabled: false) — 자동 루프·동기화·재시도·Sentry 에서 빠지고 실행 API 는 거부한다. 미설정이면 활성.
+const projectEnabled = (p) => !(p && p.enabled === false);
+const disabledMessage = (p) => (projectEnabled(p) ? "" : `프로젝트 '${(p && (p.name || p.id)) || ""}' 는 비활성화돼 있습니다. 설정에서 '프로젝트 활성' 을 켜면 다시 실행할 수 있습니다.`);
+
 const REVIEW_CI_WAIT_MIN_LIMIT = 180;
 
 // 재리뷰 전 CI 대기 분: 프로젝트 설정 reviewLoopCiWaitMin(0=대기 안 함, 최대 180).
@@ -1048,7 +1052,7 @@ module.exports = {
   REPO_LABEL_PREFIX, repoNameFromUrl, normalizeRepos, cardRepos, epicPrepareLabelDiff, REVIEW_APPROVED_MARKER,
   loadOrCreateEnvKey, encryptEnv, decryptEnv,
   ENGINES, DEFAULT_ENGINE, DEFAULT_MODEL, resolveEngine,
-  REVIEW_LOOP_MAX_DEFAULT, REVIEW_LOOP_MAX_LIMIT, clampReviewLoopMax, reviewCiWaitMin,
+  REVIEW_LOOP_MAX_DEFAULT, REVIEW_LOOP_MAX_LIMIT, clampReviewLoopMax, reviewCiWaitMin, projectEnabled, disabledMessage,
   ciCheckState, ciStateOf, ciStateWithRuns, failedChecks, latestChecks, runIdFromCheckUrl,
   CI_LOOP_MAX_DEFAULT, CI_LOOP_MAX_LIMIT, clampCiLoopMax,
   SUGGEST_MARK, parseSuggestedAnswers, planHasNoQuestions, skipLine, projectRulesInstr,

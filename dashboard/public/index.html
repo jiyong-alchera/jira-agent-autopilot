@@ -709,13 +709,16 @@ function ProjectCard({ proj, onDeleted, flash, jumpTo }) {
   };
   const del = async () => { if (!window.confirm(`프로젝트 '${config.name || PID}' 를 삭제할까요? (설정/자격증명만 제거, Jira/repo 는 영향 없음)`)) return; await api.del(`/api/projects/${PID}`); onDeleted(); };
 
-  const title = <span>📁 {config.name || PID} <span className="text-xs text-slate-500">({config.projectKey || "프로젝트 키 미설정"})</span></span>;
+  const title = <span>📁 {config.name || PID} <span className="text-xs text-slate-500">({config.projectKey || "프로젝트 키 미설정"})</span>{config.enabled === false && <span className="ml-2 text-xs px-1.5 py-0.5 rounded bg-slate-700 text-slate-300">비활성</span>}</span>;
 
   return (
     <div ref={rootRef} style={{ scrollMarginTop: "1rem" }}>
     <Section title={title} collapsible openSignal={openSig} right={<div className="flex gap-2"><Btn onClick={saveConfig}>설정 저장</Btn><Btn color="red" onClick={del}>삭제</Btn></div>}>
       {/* 설정 */}
       <SubSection title="설정">
+      <label className="flex items-center gap-2 text-sm text-slate-300 cursor-pointer mb-3" title="끄면 주기 루프·병합 동기화·에픽 자동 재시도·Sentry 감시에서 빠지고, 카드·에픽 실행 버튼도 거부됩니다. 설정·기록은 그대로 남습니다. '설정 저장' 으로 반영.">
+        <input type="checkbox" checked={config.enabled !== false} onChange={(e) => setConfig({ ...config, enabled: e.target.checked })} /><span>프로젝트 활성</span>
+      </label>
       <div className="grid grid-cols-2 gap-x-5">
         <Field label="프로젝트 이름" value={config.name} onChange={(v) => setConfig({ ...config, name: v })} placeholder="표시 이름"
           info={"대시보드에 표시할 프로젝트 이름입니다.\n\n내부 식별자(id)는 이 이름에서 자동 생성됩니다. 여러 Jira 프로젝트를 각각 등록해 함께 운영할 수 있습니다."} />

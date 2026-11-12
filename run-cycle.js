@@ -92,6 +92,7 @@ async function runWithCap(keys, env, cap, cfg, cred) {
   const creds = loadCreds();
   if (!projects.length) { log(`프로젝트가 없습니다 — 건너뜀`); return; }
   for (const p of projects) {
+    if (!lib.projectEnabled(p)) { log(`[${p.id}] 비활성 프로젝트 — 건너뜀`); continue; }
     const cred = creds[p.id];
     const { cfg, env } = projectEnv(p, cred);
     try {

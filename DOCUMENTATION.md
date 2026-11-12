@@ -770,6 +770,7 @@ CI 가 끝난 뒤 에픽 러너의 '병합만 남음' 알림이 또 와서 그�
 | 상위 카드 표시 이름 | `EPIC_LABEL` | `에픽` | 프로젝트가 에픽 계층을 부르는 이름(에픽 · 워크스트림 …). 대시보드가 이슈 타입 메타에서 뽑아 주입하며, 러너의 로그·Slack·자동 채택 코멘트 문구에만 쓰인다(동작에는 영향 없음) |
 | 에픽 추가 동시 실행 | `EPIC_PARALLEL_EXTRA` (옵션 파일 `parallelExtra`) | `0` | 선행(`is blocked by`)이 없는 하위 카드를 **1 + 이 값** 건까지 함께 진행(0~4, 0 이면 순차). 병합 대기 카드도 슬롯을 차지한다. 패널의 '추가 동시 실행' 입력이 설정하며 실행 중 변경은 다음 슬롯 채우기부터 반영 |
 | 에픽 재개 지점 | `EPIC_RESUME_POINTS` (예전: `EPIC_RESUME_STEP`·`EPIC_RESUME_KEY`) | (없음) | 대시보드 [이어서 진행]/[건너뛰기] 가 주입하는 카드별 재개 단계 JSON `[{key, step}]`. 예전 두 변수도 러너가 계속 읽는다 |
+| 프로젝트 활성 | (설정 `enabled`) | `true`(미설정) | `false` 면 그 프로젝트는 **비활성** — 주기 루프(`run-cycle.js`)·외부 병합 동기화·에픽 자동 재시도·Sentry 감시·'활성 작업' 취합에서 빠지고, 카드 실행·충돌 해소·승인 루프·에픽 시작/재개·Sentry 즉시 실행 API 는 이유와 함께 거부한다. 설정·자격증명·기록은 그대로 남아 다시 켜면 이어서 쓴다. 대시보드 프로젝트 설정의 '프로젝트 활성' 체크박스 |
 | Sentry 자동 처리 | (설정 `sentry.enabled`) | (꺼짐) | 켜면 대시보드가 `run-sentry-loop.js` 를 주기 실행([4.3e](#43e-run-sentry-loopjs-sentry-에러-자동-처리)). `sentryToken`·`org`·`projects` 가 모두 있어야 동작 |
 | Sentry 주소 | (설정 `sentry.baseUrl`) | `https://sentry.io` | self-hosted 면 그 서버 주소 |
 | Sentry org | (설정 `sentry.org`) | **(필수)** | Sentry 조직 slug |
