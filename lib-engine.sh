@@ -10,6 +10,7 @@
 #   MODEL    엔진에 넘길 모델명(비우면 엔진 기본값)
 #   CODEX_CMD / GEMINI_CMD   설치 버전별 플래그가 다를 때 명령 자체를 덮어쓰기 위한 훅
 #            (예: CODEX_CMD="codex exec". 프롬프트는 마지막 인자로 append 된다.)
+#   CLAUDE_ARTIFACT / CLAUDE_CHROME   claude 헤드리스에 Artifact 도구·Chrome 도구를 켬(기본 1, 0이면 끔)
 #
 # 제공 함수:
 #   engine_name              현재 엔진명(소문자) 출력
@@ -33,7 +34,9 @@ _engine_build_cmd() {
   _ENGINE_CMD=()
   case "${engine}" in
     claude)
-      _ENGINE_CMD=(claude -p)
+      # 헤드리스는 Artifact(sdk_default_off)·Chrome 도구가 기본으로 빠진다. 끄려면 각각 0.
+      _ENGINE_CMD=(env "CLAUDE_CODE_ARTIFACT=${CLAUDE_ARTIFACT:-1}" claude -p)
+      [[ "${CLAUDE_CHROME:-1}" != "0" ]] && _ENGINE_CMD+=(--chrome)
       [[ -n "${model}" ]] && _ENGINE_CMD+=(--model "${model}")
       ;;
     codex)

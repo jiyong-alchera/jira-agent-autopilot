@@ -728,6 +728,8 @@ CI 가 끝난 뒤 에픽 러너의 '병합만 남음' 알림이 또 와서 그�
 | 담당자 이름 | `ASSIGNEE_NAME` | `담당자` | 코멘트 멘션용 |
 | LLM 엔진 | `ENGINE` (설정 `engine`) | `claude` | plan/build/review/탐지에 쓰는 CLI 엔진: `claude`·`codex`·`gemini`. 프로젝트 `engine` 이 비면 전역 기본값(claude) 상속. **비-Claude 는 stream-json 미지원 → 상세 로그가 평문 폴백** |
 | 모델 | `MODEL` (설정 `model`) | (없음=엔진 기본) | 엔진에 넘길 모델명(엔진의 `--model`/`-m`). 예: Claude `opus`/`sonnet`, Codex `gpt-5-codex`, Gemini `gemini-2.5-pro`. 비우면 각 CLI 기본 모델 |
+| Claude Artifact 도구 | `CLAUDE_ARTIFACT` | `1` | claude 헤드리스(`-p`)는 Artifact 도구가 기본으로 꺼진다(CLI 2.1.322 실측). `lib-engine.sh` 가 `CLAUDE_CODE_ARTIFACT` 로 넘겨 켠다. `0` 이면 끔 |
+| Claude Chrome 도구 | `CLAUDE_CHROME` | `1` | claude 헤드리스는 `claudeInChromeDefaultEnabled` 와 관계없이 `--chrome` 을 줘야 Chrome 도구가 붙는다. `lib-engine.sh` 가 `--chrome` 을 붙인다. 사용자의 실제 Chrome 을 쓰므로 카드를 동시에 돌리면 탭이 섞일 수 있음. `0` 이면 끔 |
 | 트리거 방식 | `TRIGGER_MODE` | `label` | `label`(권장) 또는 `text`(레거시) |
 | 트리거 라벨 | `TRIGGER_LABEL` | `claude-work` | label 모드에서 자동화 대상 표시 라벨 |
 | 트리거 텍스트 | `TRIGGER_TEXT` | `claude-work` | text 모드(레거시)에서 대상 표시 키워드 |
