@@ -26,6 +26,8 @@ test("sentryReady: 빠진 항목을 이유로 알려 준다", () => {
   assert.equal(S.sentryReady(conf, {}).why, "sentryToken 없음");
   assert.equal(S.sentryReady(conf, { sentryToken: "t" }).ok, true);
   assert.equal(S.sentryReady(S.sentryConfig({}), { sentryToken: "t" }).ok, false);
+  const off = S.sentryConfig({ sentry: { enabled: false, org: "o", projects: [{ slug: "a", repo: "r" }] } });
+  assert.equal(S.sentryReady(off, { sentryToken: "t" }, { ignoreEnabled: true }).ok, true);   // 미리보기
 });
 
 test("pickIssues: fatal 은 즉시, 그 외는 기간 내 발생 수 기준, 처리한 id·해결된 이슈 제외", () => {
@@ -124,4 +126,27 @@ test("securityMatch: 보안 의심 패턴은 카드 대상에서 빠진다", () 
   assert.equal(S.securityMatch(hit, conf), "^Error: x$");
   assert.equal(S.securityMatch({ title: "Error: xyz" }, conf), "");
   assert.deepEqual(S.pickIssues([hit, { id: "8", level: "fatal", title: "TypeError" }], conf).map((i) => i.id), ["8"]);
+});
+
+test("overviewRows: 병합 > 에픽 워커 > 태스크 목록 > 대기 순으로 단계를 정하고, 문제 있는 것부터 정렬", () => {
+  const state = {
+    issues: {
+      "1": { key: "K-1", env: "dev", title: "a", createdAt: "2026-11-12T00:00:01Z", notified: { start: true, merged: "2026-11-12T01:00:00Z" } },
+      "2": { key: "K-2", env: "qa", title: "b", createdAt: "2026-11-12T00:00:02Z", notified: { start: true } },
+      "3": { key: "K-3", env: "prod", title: "c", createdAt: "2026-11-12T00:00:03Z", notified: { start: true } },
+      "4": { key: "K-4", env: "dev", title: "d", createdAt: "2026-11-12T00:00:04Z" },
+      "5": { key: "K-5", env: "dev", title: "e", createdAt: "2026-11-12T00:00:05Z" },
+    },
+    security: { "9": { env: "dev", title: "Error: x", at: "2026-11-12T00:00:00Z" } },
+  };
+  const epic = {
+    workers: [{ key: "K-2", status: "running", step: "build" }, { key: "K-3", status: "failed", step: "ci", reason: "CI 실패" }],
+    tasks: [{ key: "K-4", state: "blocked" }, { key: "K-5", state: "pending" }],
+  };
+  const { rows, security } = S.overviewRows(state, epic);
+  assert.deepEqual(rows.map((r) => [r.key, r.stage]), [["K-3", "failed"], ["K-2", "running"], ["K-4", "blocked"], ["K-5", "queued"], ["K-1", "merged"]]);
+  assert.equal(rows[0].reason, "CI 실패");
+  assert.equal(rows[1].step, "build");
+  assert.equal(security.length, 1);
+  assert.deepEqual(S.overviewRows({}, {}), { rows: [], security: [] });
 });

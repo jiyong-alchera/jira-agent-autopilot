@@ -870,6 +870,28 @@ function runSentryLoop(id, extraEnv) {
   SENTRY_PROCS.set(cfg.id, proc.pid);
   return { ok: true, pid: proc.pid };
 }
+// 대시보드 'Sentry 자동 처리' 화면 — sentry 설정이 있는 전 프로젝트. 상태 파일만 읽는다(Sentry·Jira 조회 없음).
+function sentryOverview() {
+  const out = [];
+  for (const p of listProjects()) {
+    if (!p.sentry) continue;
+    const cfg = getProject(p.id);
+    const st = sentryStatus(p.id);
+    const raw = lib.readJson(sentryStatePath(cfg), {});
+    const epicRun = st.epicKey ? epicRunStatus(cfg, st.epicKey) : null;
+    const epicState = st.epicKey ? lib.readJson(path.join(stateDirOf(cfg), `${st.epicKey}.epic.json`), {}) : {};
+    const { rows, security } = sentryLib.overviewRows(raw, epicState);
+    const active = st.ready.ok && lib.projectEnabled(cfg);
+    const last = Date.parse(st.lastRunAt || "") || 0;
+    out.push({
+      ...st, projectName: cfg.name || cfg.id, projectEnabled: lib.projectEnabled(cfg), jiraSite: cfg.jiraSite || "",
+      nextRunAt: active ? new Date(Math.max(Date.now(), last + st.config.intervalMinutes * 60000)).toISOString() : "",
+      epicRun: epicRun ? { running: !!epicRun.running, status: epicRun.status || "", reason: epicRun.reason || "", step: epicRun.step || "" } : null,
+      rows, security,
+    });
+  }
+  return out;
+}
 // 1분마다: 켜진 프로젝트 중 마지막 실행이 intervalMinutes 보다 오래된 것만 띄운다.
 function scanSentry() {
   for (const p of listProjects()) {
@@ -1077,9 +1099,23 @@ app.post("/api/sentry/run", (req, res) => {
   try {
     const { id, cfg } = resolveProject(req);
     if (!lib.projectEnabled(cfg)) return res.json({ ok: false, message: lib.disabledMessage(cfg) });
-    const ready = sentryLib.sentryReady(sentryLib.sentryConfig(cfg), getProjectCreds(id));
+    const dry = !!(req.body && req.body.dryRun);
+    const ready = sentryLib.sentryReady(sentryLib.sentryConfig(cfg), getProjectCreds(id), { ignoreEnabled: dry });
     if (!ready.ok) return res.json({ ok: false, message: `Sentry 설정 미완료: ${ready.why}` });
     res.json(runSentryLoop(id, req.body && req.body.dryRun ? { SENTRY_DRY_RUN: "1" } : null));
+  } catch (e) { fail(res, e); }
+});
+app.get("/api/sentry/overview", (req, res) => {
+  try { res.json({ ok: true, projects: sentryOverview() }); } catch (e) { fail(res, e); }
+});
+// Sentry 자동 처리 켜기/끄기 — sentry.enabled 만 바꾼다(나머지 설정 보존).
+app.post("/api/sentry/enabled", (req, res) => {
+  try {
+    const { id, cfg } = resolveProject(req);
+    if (!cfg.sentry) return res.json({ ok: false, message: "이 프로젝트에는 sentry 설정이 없습니다." });
+    const enabled = !!(req.body && req.body.enabled);
+    saveProject({ id, sentry: { ...cfg.sentry, enabled } });
+    res.json({ ok: true, enabled });
   } catch (e) { fail(res, e); }
 });
 // 내용은 돌려주지 않는다(시크릿) — 있는지만 status.access 로 보인다. 빈 본문이면 삭제.

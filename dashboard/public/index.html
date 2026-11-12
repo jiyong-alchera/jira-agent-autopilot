@@ -1552,6 +1552,129 @@ function EpicRunsOverview({ onOpen, jiraUrlFor }) {
   );
 }
 
+// Sentry 에러 자동 처리 현황 — /api/sentry/overview(상태 파일만) 10초 폴링.
+const SENTRY_STAGE = {
+  failed: { label: "중단", tone: "bg-rose-500/15 text-rose-200 border-rose-500/50" },
+  running: { label: "진행 중", tone: "bg-indigo-500/15 text-indigo-200 border-indigo-500/40" },
+  stopped: { label: "중지됨", tone: "bg-amber-500/15 text-amber-200 border-amber-500/50" },
+  blocked: { label: "선행 대기", tone: "bg-slate-600/30 text-slate-300 border-slate-600" },
+  queued: { label: "대기", tone: "bg-slate-600/30 text-slate-300 border-slate-600" },
+  merged: { label: "병합 완료(배포 전)", tone: "bg-emerald-500/15 text-emerald-200 border-emerald-500/40" },
+};
+function SentryOverview({ onOpen, flash }) {
+  const [data, setData] = useState(null);
+  const [busy, setBusy] = useState("");
+  const load = useCallback(async () => { const r = await api.get("/api/sentry/overview"); if (r.ok) setData(r.projects || []); }, []);
+  useEffect(() => { load(); const t = setInterval(load, 10000); return () => clearInterval(t); }, [load]);
+  const act = async (p, what) => {
+    setBusy(`${p.project}:${what}`);
+    const q = `?project=${encodeURIComponent(p.project)}`;
+    const r = what === "toggle" ? await api.post(`/api/sentry/enabled${q}`, { enabled: !p.config.enabled })
+      : await api.post(`/api/sentry/run${q}`, { dryRun: what === "dry" });
+    setBusy("");
+    flash(r.ok ? (what === "toggle" ? `Sentry 자동 처리 ${r.enabled ? "켬" : "끔"}` : what === "dry" ? "미리보기 실행 — loop-sentry.log 에 (dry) 로 남습니다" : "지금 확인 시작")
+      : (r.message || "실패"));
+    load();
+  };
+  const list = data || [];
+  const nOpen = list.reduce((a, p) => a + p.rows.filter((r) => r.stage !== "merged").length, 0);
+  const nFail = list.reduce((a, p) => a + p.rows.filter((r) => r.stage === "failed").length, 0);
+  const jira = (p, key) => (p.jiraSite && key ? `https://${p.jiraSite}/browse/${key}` : "");
+  return (
+    <Section title={`🛡 Sentry 자동 처리 · 처리 중 ${nOpen}건${nFail ? ` · 중단 ${nFail}건` : ""}`} collapsible defaultOpen
+      right={<span className="text-xs text-slate-500">10초 자동 갱신 · 카드 행을 누르면 아래 연속 개발 패널에서 열림</span>}>
+      {data === null ? <p className="text-slate-500 text-sm">불러오는 중…</p>
+        : list.length === 0 ? <p className="text-slate-500 text-sm">sentry 설정이 있는 프로젝트가 없습니다(projects.json 의 sentry 항목, DOCUMENTATION 4.3e).</p>
+        : (
+          <div className="space-y-3">
+            {list.map((p) => {
+              const on = p.ready.ok && p.projectEnabled;
+              const why = !p.projectEnabled ? "프로젝트 비활성" : p.ready.why;
+              return (
+                <div key={p.project} className={`rounded-lg border p-3 ${on ? "border-emerald-500/30 bg-emerald-500/5" : "border-slate-700 bg-slate-800/40"}`}>
+                  <div className="flex items-start justify-between gap-3 flex-wrap">
+                    <div className="text-sm space-y-1 min-w-0">
+                      <div>
+                        <b>{p.projectName}</b>
+                        <span className={`ml-2 text-xs px-2 py-0.5 rounded-full border ${on ? "bg-emerald-500/15 text-emerald-200 border-emerald-500/40" : "bg-slate-600/30 text-slate-400 border-slate-600"}`}>
+                          {on ? (p.running ? "확인 중…" : "켜짐") : `꺼짐 — ${why}`}
+                        </span>
+                        <span className="ml-2 text-xs text-slate-500">{p.config.org} · {p.config.projects.map((x) => x.slug).join(", ")}</span>
+                      </div>
+                      <div className="text-xs text-slate-400">
+                        에픽 {p.epicKey
+                          ? <a className="font-mono text-indigo-300 hover:underline" href={jira(p, p.epicKey)} target="_blank" rel="noreferrer">{p.epicKey}</a>
+                          : <span className="text-slate-500">(첫 실행 때 생성)</span>}
+                        {p.epicRun && <span className="ml-1">· {p.epicRun.running ? `▶ 연속 개발 진행 중${p.epicRun.step ? ` (${p.epicRun.step})` : ""}` : p.epicRun.status === "paused" ? `⏸ 중단됨 — ${p.epicRun.reason || ""}` : p.epicRun.status === "stopped" ? "⏹ 중지됨 (새 카드가 쌓이기만 함)" : "대기"}</span>}
+                      </div>
+                      <div className="text-xs text-slate-400">
+                        마지막 확인 {p.lastRunAt ? `${sinceText(p.lastRunAt)} 전` : "없음"}
+                        {p.nextRunAt && <span> · 다음 {new Date(p.nextRunAt).toLocaleTimeString()}</span>}
+                        {p.lastRun && <span> · {p.lastRun}</span>}
+                        {p.lastError && <span className="text-rose-300"> · 오류: {p.lastError}</span>}
+                      </div>
+                      <div className="text-xs text-slate-500">
+                        기준: fatal 즉시 · {p.config.windowHours}시간 {p.config.minEvents}회 이상 · {p.config.intervalMinutes}분마다
+                        <span className="ml-2">접근 정보 {p.config.environments.map((e) => `${e} ${p.access[e] ? "✅" : "—"}`).join(" ")}</span>
+                        <span className="ml-2">Sentry 채널 알림 {p.dualSlack ? "✅" : "—"}</span>
+                      </div>
+                    </div>
+                    <div className="flex gap-2">
+                      <Btn color="indigo" disabled={!on || p.running || !!busy} onClick={() => act(p, "run")}>지금 확인</Btn>
+                      <Btn color="slate" disabled={(!p.ready.ok && p.ready.why !== "sentry.enabled 꺼짐") || !p.projectEnabled || p.running || !!busy} onClick={() => act(p, "dry")}>미리보기</Btn>
+                      <Btn color={p.config.enabled ? "red" : "green"} disabled={!!busy} onClick={() => act(p, "toggle")}>{p.config.enabled ? "끄기" : "켜기"}</Btn>
+                    </div>
+                  </div>
+                  {p.rows.length > 0 && (
+                    <table className="w-full text-sm table-fixed mt-2">
+                      <thead><tr className="text-xs text-slate-500 text-left"><th className="w-24 font-normal">Sentry</th><th className="w-14 font-normal">환경</th><th className="font-normal">에러</th><th className="w-28 font-normal">Jira 카드</th><th className="w-48 font-normal text-right">단계</th><th className="w-20 font-normal text-right">시작</th></tr></thead>
+                      <tbody>
+                        {p.rows.map((r) => {
+                          const st = SENTRY_STAGE[r.stage] || SENTRY_STAGE.queued;
+                          return (
+                            <tr key={r.issueId} className="border-t border-slate-800 hover:bg-slate-800/40 cursor-pointer" onClick={() => p.epicKey && onOpen(p.project, p.epicKey, r.key)}
+                              title={`${r.reason ? `중단 사유: ${r.reason}\n` : ""}${r.title}\n클릭하면 연속 개발 패널에서 이 카드를 엽니다.`}>
+                              <td className="py-1.5 font-mono text-xs truncate">
+                                {r.permalink ? <a className="text-amber-300 hover:underline" href={r.permalink} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()}>{r.shortId || r.issueId}</a> : (r.shortId || r.issueId)}
+                              </td>
+                              <td className="text-xs">{r.env}</td>
+                              <td className="pr-3 truncate">{r.title}</td>
+                              <td className="font-mono text-xs truncate">
+                                {r.key ? <a className="text-indigo-300 hover:underline" href={jira(p, r.key)} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()}>{r.key}</a> : "-"}
+                              </td>
+                              <td className="text-right whitespace-nowrap">
+                                <span className={`inline-block text-xs px-2 py-0.5 rounded-full border ${st.tone}`}>
+                                  {st.label}{r.step ? ` · ${EPIC_STEP_LABEL[r.step] || r.step}` : ""}
+                                </span>
+                              </td>
+                              <td className="text-right text-xs text-slate-500">{r.createdAt ? `${sinceText(r.createdAt)} 전` : ""}</td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  )}
+                  {p.rows.length === 0 && <p className="text-xs text-slate-500 mt-2">아직 카드로 만든 Sentry 이슈가 없습니다.</p>}
+                  {p.security.length > 0 && (
+                    <div className="mt-2 text-xs">
+                      <div className="text-rose-300 mb-1">🚨 보안 의심 — 카드 없이 알림만 보낸 이슈</div>
+                      {p.security.map((s) => (
+                        <div key={s.issueId} className="text-slate-400 truncate">
+                          {s.permalink ? <a className="font-mono text-rose-300 hover:underline" href={s.permalink} target="_blank" rel="noreferrer">{s.shortId || s.issueId}</a> : <span className="font-mono">{s.shortId || s.issueId}</span>}
+                          <span className="ml-2">{s.env}</span><span className="ml-2">{s.title}</span><span className="ml-2 text-slate-500">({s.pattern}) · {s.at ? `${sinceText(s.at)} 전` : ""}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+    </Section>
+  );
+}
+
 function EpicPanel({ projects, flash, jump }) {
   const [pid, setPid] = useState((projects[0] || {}).id || "");
   const [epics, setEpics] = useState([]);
@@ -2119,6 +2242,7 @@ function App() {
 
       {/* 진행 중인 에픽 개요 + 연속 개발 (전역) */}
       {projects.length > 0 && <EpicRunsOverview onOpen={openEpic} jiraUrlFor={jiraUrlFor} />}
+      {projects.length > 0 && <SentryOverview onOpen={openEpic} flash={flash} />}
       {projects.length > 0 && <EpicPanel projects={projects} flash={flash} jump={epicJump} />}
 
       {/* 프로젝트들 */}

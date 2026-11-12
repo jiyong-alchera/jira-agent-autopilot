@@ -42,8 +42,8 @@ function sentryConfig(cfg) {
 }
 
 // 실행 가능 여부와 막힌 이유(대시보드·로그 표시용)
-function sentryReady(conf, cred) {
-  if (!conf.enabled) return { ok: false, why: "sentry.enabled 꺼짐" };
+function sentryReady(conf, cred, opts) {
+  if (!conf.enabled && !(opts && opts.ignoreEnabled)) return { ok: false, why: "sentry.enabled 꺼짐" };
   if (!cred || !cred.sentryToken) return { ok: false, why: "sentryToken 없음" };
   if (!conf.org) return { ok: false, why: "sentry.org 없음" };
   if (!conf.projects.length) return { ok: false, why: "sentry.projects(slug→repo) 없음" };
@@ -218,7 +218,35 @@ function prsFromHistory(lines, key) {
   return [...urls];
 }
 
+// 대시보드 표시용 — 추적 중인 Sentry 이슈마다 진행 단계. 우선순위: 병합 완료 > 에픽 워커(돌거나 멈춘 카드) > 에픽 태스크 목록 > 대기.
+// epic: .state/<EPIC>.epic.json (없으면 {}). stage: merged | failed | stopped | running | blocked | queued
+function overviewRows(state, epic) {
+  const workers = Object.fromEntries(((epic && epic.workers) || []).map((w) => [w.key, w]));
+  const tasks = Object.fromEntries(((epic && epic.tasks) || []).map((t) => [t.key, t]));
+  const rows = Object.entries((state && state.issues) || {}).map(([id, v]) => {
+    const n = v.notified || {};
+    const w = workers[v.key], t = tasks[v.key];
+    let stage = "queued", step = "", reason = "";
+    if (n.merged) stage = "merged";
+    else if (w && w.status === "failed") { stage = "failed"; step = w.step || ""; reason = w.reason || ""; }
+    else if (w && w.status === "stopped") { stage = "stopped"; step = w.step || ""; }
+    else if (w) { stage = "running"; step = w.step || ""; }
+    else if (t && t.state === "blocked") stage = "blocked";
+    return {
+      issueId: id, shortId: v.shortId || "", title: v.title || "", env: v.env || "", permalink: v.permalink || "",
+      key: v.key || "", repo: v.repo || "", level: v.level || "", count: v.count || 0,
+      stage, step, reason, createdAt: v.createdAt || "", mergedAt: n.merged || "", recovered: !!v.recovered,
+    };
+  });
+  const order = { failed: 0, running: 1, stopped: 2, blocked: 3, queued: 4, merged: 5 };
+  rows.sort((a, b) => (order[a.stage] - order[b.stage]) || String(b.createdAt).localeCompare(String(a.createdAt)));
+  const security = Object.entries((state && state.security) || {}).map(([id, s]) => ({ issueId: id, ...s }))
+    .sort((a, b) => String(b.at || "").localeCompare(String(a.at || "")));
+  return { rows, security };
+}
+
 module.exports = {
+  overviewRows,
   SENTRY_LABEL, DEFAULT_EPIC_SUMMARY, sentryConfig, sentryReady, eventCount, pickIssues, securityMatch,
   idLabel, envLabel, envOfLabels, isSentryCard, cardLabels, cardSummary, eventDigest, cardDescription,
   accessDirOf, accessFileOf, agentInstr, taskRepoNames, notifyUrls, prsFromHistory,

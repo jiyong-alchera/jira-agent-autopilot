@@ -29,7 +29,7 @@ if (!project) { console.error(`프로젝트 ${PROJECT_ID} 가 없습니다.`); p
 const cred = loadCreds()[project.id] || {};
 const { cfg } = projectEnv(project, cred);
 const conf = S.sentryConfig(cfg);
-const ready = S.sentryReady(conf, cred);
+const ready = S.sentryReady(conf, cred, { ignoreEnabled: DRY });   // 미리보기는 꺼져 있어도 돈다
 if (!ready.ok) { log(`건너뜀: ${ready.why}`); process.exit(0); }
 if (!cfg.jiraSite || !cred.atlassianEmail || !cred.atlassianToken || !cfg.projectKey) {
   console.error("Jira 사이트·프로젝트 키·Atlassian 자격증명이 없습니다."); process.exit(2);
@@ -210,7 +210,7 @@ async function collect(epicKey) {
       for (const issue of issues || []) {
         const pat = S.securityMatch(issue, conf);
         if (!pat || STATE.security[String(issue.id)]) continue;
-        if (!DRY) { STATE.security[String(issue.id)] = { env, slug: p.slug, title: issue.title || "", pattern: pat, at: nowIso() }; save(); }
+        if (!DRY) { STATE.security[String(issue.id)] = { env, slug: p.slug, title: issue.title || "", pattern: pat, at: nowIso(), shortId: issue.shortId || "", permalink: issue.permalink || "" }; save(); }
         log(`보안 의심 — 카드 만들지 않음: ${p.slug}/${env} #${issue.shortId || issue.id} (${pat})`);
         await notifyBoth(`🚨 [Sentry][${env}] 보안 사건 의심 에러 — 자동 수정 대상에서 제외했습니다. 사람이 확인해 주세요 · ${issue.title || ""} · <${issue.permalink || ""}|Sentry>`);
       }
@@ -224,6 +224,7 @@ async function collect(epicKey) {
         NEW_KEYS.push(key);
         STATE.issues[String(issue.id)] = {
           key, env, repo: p.repo, slug: p.slug, title: issue.title || "", permalink: issue.permalink || "",
+          shortId: issue.shortId || "", level: issue.level || "", count: S.eventCount(issue),
           createdAt: nowIso(), notified: { start: true },
         };
         save();
