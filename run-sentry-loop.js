@@ -113,8 +113,18 @@ async function meta() {
   const lv0 = types.filter((t) => !t.subtask && Number(t.hierarchyLevel) === 0);
   const pick = (re) => lv0.find((t) => re.test(t.name));
   const childType = pick(/^(bug|버그)$/i) || pick(/^(task|작업)$/i) || lv0[0];
+  // 담당자 = 프로젝트 설정의 담당자(assigneeEmail) → 없거나 못 찾으면 토큰 계정.
+  // 연속 개발은 assignee = currentUser()(토큰 계정) 카드만 처리하므로, 둘이 다르면 경고한다.
   const me = await jira("GET", "/rest/api/3/myself");
-  META = { types, epicType, childType, accountId: me.accountId };
+  let accountId = me.accountId;
+  if (cfg.assigneeEmail) {
+    const found = await jira("GET", `/rest/api/3/user/search?query=${encodeURIComponent(cfg.assigneeEmail)}`).catch(() => []);
+    const u = (found || []).find((x) => String(x.emailAddress || "").toLowerCase() === cfg.assigneeEmail.toLowerCase()) || (found || [])[0];
+    if (u && u.accountId) accountId = u.accountId;
+    else log(`담당자 ${cfg.assigneeEmail} 를 Jira 에서 찾지 못해 토큰 계정으로 할당합니다.`);
+  }
+  if (accountId !== me.accountId) log(`⚠️ 담당자(${cfg.assigneeEmail})가 토큰 계정(${me.emailAddress || me.displayName})과 달라 에픽 연속 개발이 이 카드들을 처리하지 않습니다.`);
+  META = { types, epicType, childType, accountId };
   return META;
 }
 

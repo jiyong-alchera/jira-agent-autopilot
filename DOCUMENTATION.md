@@ -563,13 +563,13 @@ CI 가 끝난 뒤 에픽 러너의 '병합만 남음' 알림이 또 와서 그�
 (`loop-sentry.log`, 락 `.state/sentry-<프로젝트>.lock` 으로 겹침 방지). 즉시 실행은 `POST /api/sentry/run`.
 
 1. **에픽 확보** — 기록된 에픽(`.state/sentry-<프로젝트>.json` 의 `epicKey`)이 미완료면 그대로 쓴다. 아니면 에픽 계층 타입 id 로
-   제목이 정확히 `sentry.epicSummary`(기본 「Sentry 작동 업무 처리」)인 미완료 에픽을 찾고, 없으면 만든다(담당자 = 토큰 계정).
+   제목이 정확히 `sentry.epicSummary`(기본 「Sentry 작동 업무 처리」)인 미완료 에픽을 찾고, 없으면 만든다(담당자 = 아래 카드와 같음).
 2. **이슈 수집** — `sentry.projects` 의 `{slug, repo}` × `sentry.environments` 마다 `GET /api/0/projects/<org>/<slug>/issues/?query=is:unresolved&environment=<env>&statsPeriod=<windowHours>h`.
    **카드 기준**: 레벨 `fatal` 이면 즉시(`fatalImmediate`), 그 외는 기간 내 발생 수(stats 버킷 합, 없으면 `count`) ≥ `minEvents`(기본 5, 24시간).
    1회 최대 `maxCardsPerRun`(기본 5)건.
    `sentry.securityPatterns` 에 맞는 이슈는 카드 대신 보안 의심 알림만 1회 보낸다.
 3. **중복 방지** — 상태 파일의 이슈 id + Jira 라벨 `sentry-<이슈ID>` 검색 이중 확인. 같은 Sentry 이슈로는 카드를 한 번만 만든다.
-4. **카드 생성** — 에픽 하위(버그 타입 우선, 없으면 작업), 담당자 = 토큰 계정(연속 개발은 `assignee = currentUser()` 만 처리).
+4. **카드 생성** — 에픽 하위(버그 타입 우선, 없으면 작업), 담당자 = 프로젝트 설정 담당자(`assigneeEmail`, 없거나 못 찾으면 토큰 계정). 연속 개발은 `assignee = currentUser()`(토큰 계정) 카드만 처리하므로 둘이 다르면 로그에 경고한다.
    제목 `[Sentry][<env>] <에러 제목>`, 본문은 링크·환경·레벨·발생 수·처음/마지막 발생·culprit·요청·**앱 프레임 우선 스택트레이스**·breadcrumb·태그.
    라벨 `claude-work · sentry · sentry-<id> · sentry-env-<env> · repo_<repo>`.
 5. **알림** — 처리 시작 · 병합 완료(배포 전) · 중단(에픽 워커 `failed`, 사유가 바뀔 때마다 1회)만 **`slackWebhookUrl` 과 `sentrySlackWebhookUrl` 에 동시에**
