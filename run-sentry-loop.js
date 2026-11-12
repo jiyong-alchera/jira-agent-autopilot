@@ -186,6 +186,7 @@ async function createCard(epicKey, issue, env, repo) {
   return c.key;
 }
 
+const NEW_KEYS = [];   // 이번 실행에서 만든 카드 — 에픽 시작 전 색인 대기 대상
 async function collect(epicKey) {
   let made = 0;
   for (const p of conf.projects) {
@@ -210,6 +211,7 @@ async function collect(epicKey) {
         const key = await createCard(epicKey, issue, env, p.repo);
         if (!key) { made++; continue; }   // dry-run: 예정 건수도 상한에 센다
         made++;
+        NEW_KEYS.push(key);
         STATE.issues[String(issue.id)] = {
           key, env, repo: p.repo, slug: p.slug, title: issue.title || "", permalink: issue.permalink || "",
           createdAt: nowIso(), notified: { start: true },
@@ -264,7 +266,20 @@ async function followUp(epicKey) {
 }
 
 // ----- 4) 에픽 연속 개발 유지 -----
+// 방금 만든 카드는 Jira 검색 색인에 몇 초~수십 초 늦게 잡힌다. 그 사이 러너가 시작하면 하위 0건으로 곧장
+// '완료' 가 된다(EKYB-1182 첫 실행). 러너와 같은 조회(parent·Rank)에 새 카드가 다 보일 때까지 기다린다.
+async function waitIndexed(epicKey, keys) {
+  if (!keys.length) return true;
+  for (let i = 0; i < 9; i++) {
+    const r = await jiraSearch(lib.epicChildrenJql(epicKey, cfg, "parent", "rank"), ["summary"]).catch(() => null);
+    const seen = new Set(((r && r.issues) || []).map((x) => x.key));
+    if (keys.every((k) => seen.has(k))) return true;
+    await new Promise((res) => setTimeout(res, 10000));
+  }
+  return false;
+}
 async function ensureRun(epicKey) {
+  if (!(await waitIndexed(epicKey, NEW_KEYS))) return `새 카드(${NEW_KEYS.join(", ")})가 아직 검색에 안 잡혀 다음 주기에 시작`;
   const r = await jiraSearch(lib.epicChildrenJql(epicKey, cfg, "parent", "created"), ["summary"]).catch(() => null);
   const pending = r ? (r.issues || []).length : 0;
   if (!pending) return "남은 카드 없음";
