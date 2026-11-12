@@ -120,7 +120,7 @@ test("prsFromHistory: 카드의 PR URL 을 모은다", () => {
 
 test("securityMatch: 보안 의심 패턴은 카드 대상에서 빠진다", () => {
   const conf = S.sentryConfig({ sentry: { securityPatterns: ["^Error: x$", "(bad"] } });   // 잘못된 정규식은 무시
-  const hit = { id: "9", level: "fatal", title: "Error: x", count: "100" };
+  const hit = { id: "9", level: "fatal", title: "Error: x", culprit: "app/page", count: "100" };   // culprit 이 있어도 제목만으로 걸린다
   assert.equal(S.securityMatch(hit, conf), "^Error: x$");
   assert.equal(S.securityMatch({ title: "Error: xyz" }, conf), "");
   assert.deepEqual(S.pickIssues([hit, { id: "8", level: "fatal", title: "TypeError" }], conf).map((i) => i.id), ["8"]);

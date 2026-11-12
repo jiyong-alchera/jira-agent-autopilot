@@ -586,7 +586,7 @@ CI 가 끝난 뒤 에픽 러너의 '병합만 남음' 알림이 또 와서 그�
   없으면 "실제 환경에 접속하지 말고 Sentry 정보와 코드만으로" 를 붙인다.
 - **병합 대상**: 환경(dev·qa·prod)과 무관하게 repo 의 `baseBranch`. 배포는 이 자동화의 범위가 아니다.
 
-`SENTRY_DRY_RUN=1`(또는 `POST /api/sentry/run` body `{dryRun:true}`)이면 Jira·Sentry 를 조회만 하고 카드·알림·에픽 시작은 하지 않는다(로그에 `(dry)`).
+`SENTRY_DRY_RUN=1`(또는 `POST /api/sentry/run` body `{dryRun:true}`)이면 Jira·Sentry 를 조회만 하고 카드·알림·에픽 시작은 하지 않는다(로그에 `(dry)`). 에픽이 아직 없어도 카드 후보·보안 의심 건까지 보여 주며, 상태 파일에 처리 기록을 남기지 않는다.
 
 ### 4.4 대시보드 백엔드 (dashboard/server.js, Express)
 
@@ -778,7 +778,7 @@ CI 가 끝난 뒤 에픽 러너의 '병합만 남음' 알림이 또 와서 그�
 | 카드 기준 | (설정 `sentry.minEvents` · `windowHours` · `fatalImmediate`) | `5` · `24` · `true` | 기간 내 발생 수 기준, fatal 은 즉시 |
 | 확인 주기(분) | (설정 `sentry.intervalMinutes`) | `10` | 1~1440 |
 | 1회 최대 카드 | (설정 `sentry.maxCardsPerRun`) | `5` | 1~50 |
-| 보안 의심 패턴 | (설정 `sentry.securityPatterns`) | `[]` | 제목·culprit·메시지 정규식(대소문자 무시). 맞는 이슈는 **카드를 만들지 않고** `🚨 보안 사건 의심` 을 두 웹훅에 1회 알린다(침입 흔적 같은 에러를 자동 '수정' 하지 않도록) |
+| 보안 의심 패턴 | (설정 `sentry.securityPatterns`) | `[]` | 제목·culprit·메시지 각각에 거는 정규식(대소문자 무시). 맞는 이슈는 **카드를 만들지 않고** `🚨 보안 사건 의심` 을 두 웹훅에 1회 알린다(침입 흔적 같은 에러를 자동 '수정' 하지 않도록) |
 | 자동 병합 대기(분) | (설정 `sentry.autoMergeAfterMin`) | `5` | Sentry 에픽 연속 개발을 시작할 때 넘기는 `autoMergeAfterMin` |
 | 에픽 제목 | (설정 `sentry.epicSummary`) | `Sentry 작동 업무 처리` | 이 제목의 미완료 에픽을 쓰고, 없으면 만든다 |
 | 접근 정보 폴더 | (설정 `sentry.accessDir`) | `<workDir>/env-access` | `<프로젝트>-<env>.md` (gitignore, 600). 없거나 빈 파일이면 그 환경은 Sentry 정보만으로 처리 |

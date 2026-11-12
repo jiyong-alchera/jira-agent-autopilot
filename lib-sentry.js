@@ -62,11 +62,11 @@ function eventCount(issue) {
 
 // 보안 사건 의심 패턴(제목·culprit·메시지 정규식, 대소문자 무시). 맞으면 카드 대신 보안 알림 1회.
 function securityMatch(issue, conf) {
-  const hay = [issue && issue.title, issue && issue.culprit, issue && issue.metadata && issue.metadata.value]
-    .filter(Boolean).join("\n");
+  const fields = [issue && issue.title, issue && issue.culprit, issue && issue.metadata && issue.metadata.value]
+    .filter(Boolean).map(String);
   for (const p of conf.securityPatterns || []) {
     let re; try { re = new RegExp(p, "i"); } catch { continue; }
-    if (re.test(hay)) return p;
+    if (fields.some((f) => re.test(f))) return p;   // 필드마다 따로 — ^…$ 패턴이 culprit 과 합쳐져 빗나가지 않게
   }
   return "";
 }

@@ -199,8 +199,7 @@ async function collect(epicKey) {
       for (const issue of issues || []) {
         const pat = S.securityMatch(issue, conf);
         if (!pat || STATE.security[String(issue.id)]) continue;
-        STATE.security[String(issue.id)] = { env, slug: p.slug, title: issue.title || "", pattern: pat, at: nowIso() };
-        save();
+        if (!DRY) { STATE.security[String(issue.id)] = { env, slug: p.slug, title: issue.title || "", pattern: pat, at: nowIso() }; save(); }
         log(`보안 의심 — 카드 만들지 않음: ${p.slug}/${env} #${issue.shortId || issue.id} (${pat})`);
         await notifyBoth(`🚨 [Sentry][${env}] 보안 사건 의심 에러 — 자동 수정 대상에서 제외했습니다. 사람이 확인해 주세요 · ${issue.title || ""} · <${issue.permalink || ""}|Sentry>`);
       }
@@ -209,7 +208,7 @@ async function collect(epicKey) {
         if (made >= conf.maxCardsPerRun) break;
         if (await alreadyCarded(String(issue.id))) continue;
         const key = await createCard(epicKey, issue, env, p.repo);
-        if (!key) continue;
+        if (!key) { made++; continue; }   // dry-run: 예정 건수도 상한에 센다
         made++;
         STATE.issues[String(issue.id)] = {
           key, env, repo: p.repo, slug: p.slug, title: issue.title || "", permalink: issue.permalink || "",
@@ -287,10 +286,11 @@ async function ensureRun(epicKey) {
   try {
     save({ lastRunAt: nowIso(), lastError: "" });
     const epicKey = await ensureEpic();
-    if (!epicKey) return;
+    if (!epicKey && !DRY) return;
+    // dry-run 은 에픽이 아직 없어도 어떤 이슈가 카드가 될지까지 보여 준다
     const made = await collect(epicKey);
-    await followUp(epicKey);
-    const run = await ensureRun(epicKey);
+    if (epicKey) await followUp(epicKey);
+    const run = epicKey ? await ensureRun(epicKey) : "(dry) 에픽 생성 후 시작 예정";
     save({ lastCreated: made, lastRun: run });
     log(`완료 — 새 카드 ${made}건 · ${run}`);
   } catch (e) {
