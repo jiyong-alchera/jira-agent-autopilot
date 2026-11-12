@@ -50,6 +50,7 @@ const { spawn, execFile } = require("child_process");
 
 const { SELF, lib, reposToLines, resolveCardEnv, projectEnv, loadProjects, loadCreds } = require("./lib-project-env");
 const { downloadCardAttachments } = require(path.join(SELF, "lib-attachments"));
+const sentryLib = require(path.join(SELF, "lib-sentry"));
 
 const EPIC_KEY = process.argv[2];
 if (!EPIC_KEY || !/^[A-Z][A-Z0-9]+-[0-9]+$/.test(EPIC_KEY)) {
@@ -263,9 +264,21 @@ for (const sig of ["SIGTERM", "SIGINT"]) {
 }
 
 // ----- 하위 스크립트 실행 -----
+// Sentry 카드는 자기 repo_ 라벨 repo 만(에픽 대상과의 교집합), 그 외 카드는 에픽 대상 repo 전부.
+const taskRepos = (labels) => {
+  const names = sentryLib.taskRepoNames(labels, epicRepos.map((r) => r.name));
+  return epicRepos.filter((r) => names.includes(r.name));
+};
 async function taskEnv(key) {
   const e = { ...BASE_ENV };
-  e.CARD_REPOS = reposToLines(cfg, epicRepos, resolveCardEnv(cfg, key));   // 에픽에서 고른 repo 로 고정
+  const t = await fetchTask(key).catch(() => null);
+  const labels = (t && t.labels) || [];
+  e.CARD_REPOS = reposToLines(cfg, taskRepos(labels), resolveCardEnv(cfg, key));   // 에픽에서 고른 repo 로 고정
+  if (sentryLib.isSentryCard(labels)) {
+    const env = sentryLib.envOfLabels(labels);
+    const sconf = sentryLib.sentryConfig(cfg);
+    e.SENTRY_INSTR = sentryLib.agentInstr(env, sentryLib.accessFileOf(sconf, cfg.workDir || SELF, project.id, env));
+  }
   e.EPIC_KEY = EPIC_KEY;
   e.EPIC_SUMMARY = STATE.epicSummary || "";
   if (fs.existsSync(DESIGN_FILE)) e.EPIC_DESIGN_FILE = DESIGN_FILE;
@@ -358,7 +371,7 @@ async function mergeViaDashboard(key) {
 // **prepare 단계가 아니라 태스크 진입마다** 부른다 — 이미 claude-work 가 붙은 카드는 시작 단계가
 // plan/build 라 prepare 를 건너뛰는데, 스테일 라벨이 남는 건 바로 그 카드들이기 때문.
 async function syncTaskLabels(task) {
-  const { add, remove } = lib.epicPrepareLabelDiff(task.labels, epicRepos.map((r) => r.name), cfg);
+  const { add, remove } = lib.epicPrepareLabelDiff(task.labels, taskRepos(task.labels).map((r) => r.name), cfg);
   if (!add.length && !remove.length) return { changed: false, note: "라벨 이미 설정됨" };
   await editLabels(task.key, add, remove);
   const note = [add.length ? `부여: ${add.join(", ")}` : "", remove.length ? `제거: ${remove.join(", ")}` : ""].filter(Boolean).join(" · ");

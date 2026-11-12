@@ -494,7 +494,7 @@ PR 을 하나도 생성하지 못했다면 절대 완료로 간주하지 말고,
 fi
 
 # 첨부(이미지·문서) 인식 지시와 프로젝트 규칙(설정 agentRules)을 모든 단계(plan/build/rework/ci/conflict) 프롬프트에 공통 추가
-PROMPT="${PROMPT}${IMAGE_INSTR}${DOC_INSTR}${EPIC_CTX}${JIRA_CTX}${PROJECT_RULES_INSTR:-}"
+PROMPT="${PROMPT}${IMAGE_INSTR}${DOC_INSTR}${EPIC_CTX}${SENTRY_INSTR:-}${JIRA_CTX}${PROJECT_RULES_INSTR:-}"
 
 # ===== 실행 + 실패 재시도/백오프 처리 =====
 # claude 가 0이 아닌 코드로 종료하면 실패로 보고 카드별 실패 카운터를 증가시킨다.

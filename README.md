@@ -32,6 +32,7 @@ Jira 카드를 자동 탐지해 **Claude로 개발 → PR 생성 → 카드 완�
 | `detect-cards.sh` | 대상 카드 탐지 (REST 우선, claude+MCP 폴백) |
 | `lib-engine.sh` | LLM 엔진 추상화 — `claude`/`codex`/`gemini` 중 선택(프로젝트별·전역 기본값), 위 스크립트가 공유 |
 | `loop-plan.sh` / `loop-build.sh` | 주기적으로 탐지 후 카드별 병렬 실행(동시 상한), `RUN_ONCE` 즉시 1회 지원 |
+| `run-sentry-loop.js` | **Sentry 에러 자동 처리** — 기준에 맞는 Sentry 이슈를 「Sentry 작동 업무 처리」 에픽 하위 카드로 만들고 연속 개발(자동 병합)로 수정·병합. 처리 시작·병합 완료·중단은 기존 웹훅과 Sentry 채널 웹훅에 동시 알림(DOCUMENTATION 4.3e) |
 | `run-epic-loop.js` | **연속 개발** — 한 상위 카드(에픽·워크스트림)의 **내게 할당된** 미완료 하위 태스크를 Jira 순위(Rank)순으로(기본 한 건씩, '추가 동시 실행' 수만큼 함께) 개발→PR→리뷰 승인→병합 대기(선행 `is blocked by` 카드가 남은 카드는 건너뜀) |
 | `render-claude-stream.js` | claude stream-json → 사람이 읽는 실행 전사 + 결과 추출 |
 | `dashboard/` | React + Express 로컬 대시보드 (설정·토큰·제어·모니터링·카드 등록/답변 등) |

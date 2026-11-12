@@ -282,6 +282,7 @@ function maskCreds(c) {
     anthropicApiKey: !!c.anthropicApiKey, openaiApiKey: !!c.openaiApiKey, geminiApiKey: !!c.geminiApiKey, githubToken: !!c.githubToken,
     atlassianEmail: c.atlassianEmail || "", atlassianToken: !!c.atlassianToken, slackWebhookUrl: !!c.slackWebhookUrl,
     slackAppToken: !!c.slackAppToken, slackAllowUsers: c.slackAllowUsers || "",
+    sentryToken: !!c.sentryToken, sentrySlackWebhookUrl: !!c.sentrySlackWebhookUrl,
   };
 }
 
@@ -297,6 +298,8 @@ function applyCreds(cur, b) {
     slackWebhookUrl: apply("slackWebhookUrl"),
     slackAppToken: apply("slackAppToken"),
     slackAllowUsers: b.slackAllowUsers !== undefined ? b.slackAllowUsers : cur.slackAllowUsers,
+    sentryToken: apply("sentryToken"),
+    sentrySlackWebhookUrl: apply("sentrySlackWebhookUrl"),
   };
 }
 

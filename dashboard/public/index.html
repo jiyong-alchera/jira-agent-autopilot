@@ -494,7 +494,7 @@ function ProjectCard({ proj, onDeleted, flash, jumpTo }) {
 
   const [config, setConfig] = useState(proj);
   const [creds, setCreds] = useState({});
-  const [credInput, setCredInput] = useState({ anthropicApiKey: "", openaiApiKey: "", geminiApiKey: "", githubToken: "", atlassianEmail: "", atlassianToken: "", slackWebhookUrl: "", slackAppToken: "", slackAllowUsers: "" });
+  const [credInput, setCredInput] = useState({ anthropicApiKey: "", openaiApiKey: "", geminiApiKey: "", githubToken: "", atlassianEmail: "", atlassianToken: "", slackWebhookUrl: "", slackAppToken: "", slackAllowUsers: "", sentryToken: "", sentrySlackWebhookUrl: "" });
   const [jiraMeta, setJiraMeta] = useState({ issueTypes: [], epics: [], epicLabel: "에픽", loaded: false, err: "" });
   const [jiraStatuses, setJiraStatuses] = useState({ list: [], loaded: false, err: "" });   // 상태→단계 매핑 UI용
   const [newCard, setNewCard] = useState({ issueType: "", summary: "", description: "", epicKey: "", parentInput: "", addTriggerLabel: true, assignSelf: true, attachments: [], repos: [], env: "" });
@@ -567,7 +567,7 @@ function ProjectCard({ proj, onDeleted, flash, jumpTo }) {
   const saveConfig = async () => { const r = await api.post("/api/projects", { ...config, id: PID }); if (r.ok) { setConfig(r.project); flash("설정 저장됨"); loadMeta(); } };
   const saveCreds = async () => {
     await api.post(`/api/projects/${PID}/credentials`, credInput);
-    setCredInput((p) => ({ ...p, anthropicApiKey: "", openaiApiKey: "", geminiApiKey: "", githubToken: "", atlassianToken: "", slackWebhookUrl: "", slackAppToken: "" }));
+    setCredInput((p) => ({ ...p, anthropicApiKey: "", openaiApiKey: "", geminiApiKey: "", githubToken: "", atlassianToken: "", slackWebhookUrl: "", slackAppToken: "", sentryToken: "", sentrySlackWebhookUrl: "" }));
     loadCreds(); flash("자격증명 저장됨");
   };
   const refineDesc = async () => {
@@ -879,6 +879,10 @@ function ProjectCard({ proj, onDeleted, flash, jumpTo }) {
             info={"Slack 알림 메시지의 버튼(병합·이어서 진행 등)을 눌렀을 때 그 클릭을 받기 위한 App-Level Token 입니다(선택).\n\nSlack 앱 설정에서 Socket Mode 를 켜고 connections:write 스코프로 발급하세요. Socket Mode 는 아웃바운드 WebSocket 이라 대시보드 포트를 외부에 열 필요가 없습니다.\n\n비우면 알림은 그대로 오고 버튼만 동작하지 않습니다. 저장 후 대시보드를 재시작해야 연결됩니다."} />
           <Field label="Slack 실행 허용 사용자" value={credInput.slackAllowUsers} onChange={(v) => setCredInput({ ...credInput, slackAllowUsers: v })} placeholder="U01ABCDEF, U02GHIJKL"
             info={"Slack 버튼을 눌러 병합·재개를 실행할 수 있는 Slack 사용자 ID 목록입니다(쉼표 구분).\n\n비워두면 아무도 실행할 수 없습니다 — 채널의 누구나 병합하는 것을 막기 위한 기본값입니다.\n\n사용자 ID 는 Slack 프로필 → 더보기 → '멤버 ID 복사' 에서 확인합니다(U 로 시작)."} />
+          <Field label={`Sentry Auth Token ${credSet("sentryToken") ? "✓" : ""}`} type="password" value={credInput.sentryToken} onChange={(v) => setCredInput({ ...credInput, sentryToken: v })} placeholder={credSet("sentryToken") ? "••• 저장됨" : "sntrys_..."}
+            info={"Sentry 에러 자동 처리(run-sentry-loop.js)가 이슈·이벤트를 읽고 코멘트를 남길 때 쓰는 토큰입니다(선택).\n\nproject:read · event:read · event:write 권한이 필요합니다. 동작 설정은 projects.json 의 sentry 항목입니다(DOCUMENTATION 4.3e)."} />
+          <Field label={`Sentry 채널 Slack Webhook ${credSet("sentrySlackWebhookUrl") ? "✓" : ""}`} type="password" value={credInput.sentrySlackWebhookUrl} onChange={(v) => setCredInput({ ...credInput, sentrySlackWebhookUrl: v })} placeholder={credSet("sentrySlackWebhookUrl") ? "••• 저장됨" : "https://hooks.slack.com/services/..."}
+            info={"Sentry 알림이 가는 채널의 Incoming Webhook URL 입니다(선택).\n\nSentry 자동 처리의 '처리 시작 · 병합 완료 · 중단' 알림을 위 Slack Webhook 과 이 주소에 동시에 보냅니다. 비우면 위 주소에만 보냅니다."} />
         </div>
       </SubSection>
 

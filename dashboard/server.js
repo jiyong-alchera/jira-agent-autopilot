@@ -826,6 +826,50 @@ function runEpicLoop(epicKey, projectId, opts) {
   proc.unref();
   return { ok: true, pid: proc.pid };
 }
+// ----- Sentry 에러 자동 처리 — 프로젝트별 주기로 run-sentry-loop.js(1회 실행)를 띄운다 -----
+const sentryLib = require(path.join(SCRIPTS_DIR, "lib-sentry"));
+const SENTRY_PROCS = new Map();   // projectId → pid (겹쳐 띄우지 않게; 러너도 락을 잡는다)
+const sentryStatePath = (cfg) => path.join(stateDirOf(cfg), `sentry-${cfg.id}.json`);
+function sentryStatus(id) {
+  const cfg = getConfig(id);
+  const conf = sentryLib.sentryConfig(cfg);
+  const st = lib.readJson(sentryStatePath(cfg), {});
+  const pid = SENTRY_PROCS.get(cfg.id);
+  const workDir = cfg.workDir || SCRIPTS_DIR;
+  return {
+    project: cfg.id, ready: sentryLib.sentryReady(conf, getProjectCreds(cfg.id)), running: !!(pid && isAlive(pid)),
+    config: { ...conf }, epicKey: st.epicKey || "", lastRunAt: st.lastRunAt || "", lastError: st.lastError || "",
+    lastCreated: st.lastCreated || 0, lastRun: st.lastRun || "", tracked: Object.keys(st.issues || {}).length,
+    access: Object.fromEntries(conf.environments.map((e) => [e, !!sentryLib.accessFileOf(conf, workDir, cfg.id, e)])),
+    dualSlack: !!getProjectCreds(cfg.id).sentrySlackWebhookUrl,
+  };
+}
+function runSentryLoop(id, extraEnv) {
+  const cfg = getConfig(id);
+  const pid = SENTRY_PROCS.get(cfg.id);
+  if (pid && isAlive(pid)) return { ok: false, message: "이미 실행 중입니다." };
+  const script = path.join(SCRIPTS_DIR, "run-sentry-loop.js");
+  let fd;
+  try { fd = fs.openSync(path.join(SCRIPTS_DIR, "loop-sentry.log"), "a"); } catch (e) { return { ok: false, message: String(e.message || e) }; }
+  const env = { ...scriptEnv(cfg.id), ...(extraEnv || {}) };
+  const proc = spawn("node", [script], { cwd: SCRIPTS_DIR, env, detached: true, stdio: ["ignore", fd, fd] });
+  try { fs.closeSync(fd); } catch {}
+  proc.unref();
+  SENTRY_PROCS.set(cfg.id, proc.pid);
+  return { ok: true, pid: proc.pid };
+}
+// 1분마다: 켜진 프로젝트 중 마지막 실행이 intervalMinutes 보다 오래된 것만 띄운다.
+function scanSentry() {
+  for (const p of listProjects()) {
+    const conf = sentryLib.sentryConfig(p);
+    if (!sentryLib.sentryReady(conf, getProjectCreds(p.id)).ok) continue;
+    const st = lib.readJson(sentryStatePath(p), {});
+    const last = Date.parse(st.lastRunAt || "") || 0;
+    if (Date.now() - last < conf.intervalMinutes * 60000) continue;
+    const r = runSentryLoop(p.id);
+    if (r.ok) console.log(`[sentry] ${p.id}: 확인 시작 (pid ${r.pid})`);
+  }
+}
 // 실행 중인 러너에게 '이 PR 충돌을 지금 해소하라'고 넘기는 요청 파일. 러너가 병합 대기 폴링에서 읽고 지운다.
 // 파일 한 장으로 주고받는 이유는 상태/중지 플래그와 같다 — 러너는 detached 라 직접 부를 방법이 없다.
 function epicConflictPath(cfg, key) { return path.join(stateDirOf(cfg), `${key}.epic.conflict.json`); }
@@ -1011,6 +1055,36 @@ app.get("/api/epics/:key/run", (req, res) => {
   try { const { cfg } = resolveProject(req); res.json({ ok: true, run: epicRunStatus(cfg, key) }); }
   catch (e) { fail(res, e); }
 });
+// Sentry 자동 처리 상태 / 즉시 1회 실행(body.dryRun=true 면 카드·알림 없이 조회만) / 환경 접근 정보 저장
+app.get("/api/sentry/status", (req, res) => {
+  try { const { id } = resolveProject(req); res.json({ ok: true, status: sentryStatus(id) }); } catch (e) { fail(res, e); }
+});
+app.post("/api/sentry/run", (req, res) => {
+  try {
+    const { id, cfg } = resolveProject(req);
+    const ready = sentryLib.sentryReady(sentryLib.sentryConfig(cfg), getProjectCreds(id));
+    if (!ready.ok) return res.json({ ok: false, message: `Sentry 설정 미완료: ${ready.why}` });
+    res.json(runSentryLoop(id, req.body && req.body.dryRun ? { SENTRY_DRY_RUN: "1" } : null));
+  } catch (e) { fail(res, e); }
+});
+// 내용은 돌려주지 않는다(시크릿) — 있는지만 status.access 로 보인다. 빈 본문이면 삭제.
+app.post("/api/sentry/access/:env", (req, res) => {
+  try {
+    const { id, cfg } = resolveProject(req);
+    const env = String(req.params.env || "");
+    if (!/^[A-Za-z0-9_-]+$/.test(env)) return res.status(400).json({ ok: false, message: "환경 이름 형식 오류" });
+    const conf = sentryLib.sentryConfig(cfg);
+    const dir = sentryLib.accessDirOf(conf, cfg.workDir || SCRIPTS_DIR);
+    const file = path.join(dir, `${id}-${env}.md`);
+    const text = String((req.body && req.body.text) || "");
+    if (!text.trim()) { try { fs.unlinkSync(file); } catch {} return res.json({ ok: true, removed: true }); }
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(file, text.endsWith("\n") ? text : `${text}\n`, { mode: 0o600 });
+    fs.chmodSync(file, 0o600);
+    res.json({ ok: true });
+  } catch (e) { fail(res, e); }
+});
+
 // 에픽 연속 개발 시작 — body { repos:[name], reviewLoopMax? }. 에픽당 1개만 실행된다.
 app.post("/api/epics/:key/run", async (req, res) => {
   const key = req.params.key;
@@ -1838,6 +1912,10 @@ app.listen(PORT, () => {
   setInterval(scanRetries, EPIC_RETRY_SCAN_MS).unref?.();
   setTimeout(scanRetries, 12000).unref?.();
   console.log(`  에픽 자동 재시도 감시: ${EPIC_RETRY_SCAN_MS / 1000}s 주기`);
+  // Sentry 에러 자동 처리 — 프로젝트별 intervalMinutes 주기(판정은 1분마다)
+  setInterval(() => { try { scanSentry(); } catch (e) { console.warn("[sentry] 스캔 오류:", e.message); } }, 60000).unref?.();
+  setTimeout(() => { try { scanSentry(); } catch {} }, 20000).unref?.();
+  console.log("  Sentry 에러 자동 처리 감시: 60s 판정 주기");
   // Slack 알림 버튼 수신(Socket Mode) — 아웃바운드 WebSocket 이라 포트를 열지 않는다.
   try {
     require("./slack-socket").startSlackSocket({

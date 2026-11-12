@@ -249,6 +249,16 @@
     중복 제거) 추가. 대시보드 '진행 중인 에픽' 섹션(5초 폴링)에서 [열기]·카드 행 클릭 시 연속 개발 패널을 그 에픽·카드로 전환.
     검증: `npm test` 168건 통과 + 실제 상태 파일 3건(EKYB-951·PHYS-389·PO-33) 집계 확인.
 
+- [x] **21. Sentry 에러 자동 처리 (에픽 하위 카드 → 자동 수정·병합)**
+  - 내용: Sentry 가 잡은 에러를 「Sentry 작동 업무 처리」 에픽(없으면 생성)의 하위 카드로 만들고, 에픽 연속 개발로
+    수정 → 리뷰 승인 + CI 통과 → repo baseBranch 자동 병합. 환경 접근 정보가 있으면 조사·재현에 쓰고 없으면 Sentry 정보만.
+    처리 시작·병합 완료·중단은 기존 웹훅과 Sentry 채널 웹훅에 동시에 알린다. 배포는 사람이 따로.
+  - AC: 설정한 프로젝트에서 기준(fatal 즉시 · 24시간 5회 이상)에 맞는 새 이슈가 카드 1건으로만 생기고, 에픽 연속 개발이 자동 병합으로 돈다.
+  - 영향: `run-sentry-loop.js`·`lib-sentry.js`(신규), `run-epic-loop.js`, `run-jira-agent.sh`, `dashboard/server.js`, `dashboard/lib.js`,
+    `dashboard/public/index.html`, `dashboard/test/sentry.test.js`
+  → (완료 2026-11-12) 대시보드가 1분 판정으로 프로젝트별 주기 실행, `/api/sentry/{status,run,access/:env}` 추가, 자격증명 `sentryToken`·`sentrySlackWebhookUrl`,
+    Sentry 카드는 자기 repo 만 다루고 `SENTRY_INSTR` 로 환경 접근 규칙을 받는다. `npm test` 202건 통과.
+
 ---
 
 *완료된 항목은 위 "완료 정의"에 따라 체크 표시 + 문서 동기화 후 마감합니다.*

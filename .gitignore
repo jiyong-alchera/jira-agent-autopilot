@@ -11,6 +11,8 @@ dashboard/project-credentials.json
 repos/
 # 카드 전용 env (로컬 전용, 런타임 생성 — <KEY>.env)
 card-envs/
+# Sentry 자동 처리 — 환경별 접근 정보(로컬 전용, 600)
+env-access/
 # (구버전 호환) 과거 평면 clone 디렉토리
 kyb-api/
 kyb-api-*/

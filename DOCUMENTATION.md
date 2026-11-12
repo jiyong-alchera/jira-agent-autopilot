@@ -171,6 +171,25 @@ Jira 카드를 자동으로 탐지해 **Claude가 개발 → PR 생성 → 카�
 동시 실행 중 한 카드가 실패하면 **새 카드는 시작하지 않고, 돌던 카드가 끝까지 간 뒤** 전체가 멈춥니다
 ([이어서 진행]은 카드마다 멈춘 단계부터).
 
+### Sentry 에러 자동 처리 (선택)
+
+Sentry 가 잡은 에러를 **「Sentry 작동 업무 처리」 에픽의 하위 카드**로 만들어 위 에픽 연속 개발로 처리합니다
+([4.3e](#43e-run-sentry-loopjs-sentry-에러-자동-처리)).
+
+```
+[대시보드 1분 판정 → 프로젝트별 intervalMinutes 마다 run-sentry-loop.js]
+   │  에픽 찾기(같은 제목의 미완료 에픽) — 없으면 생성
+   ▼
+[Sentry 미해결 이슈 × 환경(dev·qa·prod)]  fatal 은 즉시 · 그 외는 최근 24시간 5회 이상
+   │  새 이슈 → 에픽 하위 카드(라벨 sentry · sentry-<id> · sentry-env-<env> · repo_<repo>)
+   │  🛠 처리 시작 알림 → 기존 웹훅 + Sentry 채널 웹훅 동시
+   ▼
+[에픽 연속 개발(자동 병합)]  plan → build(접근 정보 있으면 그 환경 조사·재현) → 리뷰 루프 → CI → 리뷰 승인 + CI 통과 → 병합
+   │  병합 대상은 환경과 무관하게 repo 의 baseBranch
+   ▼
+[✅ 병합 완료(배포 전) / ⚠️ 중단 알림 → 두 웹훅]   배포는 사람이 병합 결과를 확인한 뒤 따로 한다
+```
+
 ---
 
 ## 4. 구성 요소 상세
@@ -538,6 +557,36 @@ CI 가 끝난 뒤 에픽 러너의 '병합만 남음' 알림이 또 와서 그�
   (4.3d의 '병합만 남음' 알림) 여기서 또 보내면 중복이고, CI 대기로 러너를 붙잡을 이유도 없다.
 - 상한을 넘긴 루프의 `⏸ 사람 확인 필요` 알림은 종전대로 병합 버튼을 유지한다 — 사람이 PR 을 직접 보고 판단하는 자리다.
 
+#### 4.3e run-sentry-loop.js (Sentry 에러 자동 처리)
+
+한 번 실행하면 아래를 순서대로 하고 끝난다. 대시보드 백엔드가 1분마다 판정해 **프로젝트별 `sentry.intervalMinutes`(기본 10분)** 마다 띄운다
+(`loop-sentry.log`, 락 `.state/sentry-<프로젝트>.lock` 으로 겹침 방지). 즉시 실행은 `POST /api/sentry/run`.
+
+1. **에픽 확보** — 기록된 에픽(`.state/sentry-<프로젝트>.json` 의 `epicKey`)이 미완료면 그대로 쓴다. 아니면 에픽 계층 타입 id 로
+   제목이 정확히 `sentry.epicSummary`(기본 「Sentry 작동 업무 처리」)인 미완료 에픽을 찾고, 없으면 만든다(담당자 = 토큰 계정).
+2. **이슈 수집** — `sentry.projects` 의 `{slug, repo}` × `sentry.environments` 마다 `GET /api/0/projects/<org>/<slug>/issues/?query=is:unresolved&environment=<env>&statsPeriod=<windowHours>h`.
+   **카드 기준**: 레벨 `fatal` 이면 즉시(`fatalImmediate`), 그 외는 기간 내 발생 수(stats 버킷 합, 없으면 `count`) ≥ `minEvents`(기본 5, 24시간).
+   1회 최대 `maxCardsPerRun`(기본 5)건.
+3. **중복 방지** — 상태 파일의 이슈 id + Jira 라벨 `sentry-<이슈ID>` 검색 이중 확인. 같은 Sentry 이슈로는 카드를 한 번만 만든다.
+4. **카드 생성** — 에픽 하위(버그 타입 우선, 없으면 작업), 담당자 = 토큰 계정(연속 개발은 `assignee = currentUser()` 만 처리).
+   제목 `[Sentry][<env>] <에러 제목>`, 본문은 링크·환경·레벨·발생 수·처음/마지막 발생·culprit·요청·**앱 프레임 우선 스택트레이스**·breadcrumb·태그.
+   라벨 `claude-work · sentry · sentry-<id> · sentry-env-<env> · repo_<repo>`.
+5. **알림** — 처리 시작 · 병합 완료(배포 전) · 중단(에픽 워커 `failed`, 사유가 바뀔 때마다 1회)만 **`slackWebhookUrl` 과 `sentrySlackWebhookUrl` 에 동시에**
+   보낸다(같은 URL 이면 1회, 한쪽 실패는 무시). Sentry 이슈에도 처리 시작·병합 코멘트를 남긴다(**resolve 하지 않는다** — 배포 전이다).
+   나머지 진행 알림(리뷰 회차·CI 등)은 종전대로 기존 웹훅에만 간다.
+6. **에픽 실행 유지** — 남은 하위 카드가 있고 연속 개발이 `idle`/`done` 이면 `POST /api/epics/<KEY>/run` 으로
+   **자동 병합(`autoMergeAfterMin`, 기본 5분) · 자동 재시도**를 켜서 시작한다(대상 repo = 매핑된 repo 전부).
+   **`paused`(실패로 멈춤)·`stopped`(사용자 중지)는 건드리지 않는다** — 사람이 [이어서 진행]할 때까지 새 카드는 쌓이기만 한다.
+
+에픽 러너 쪽 동작(Sentry 카드 = `sentry` 라벨):
+- **대상 repo 좁히기**: 에픽 대상 repo 중 카드의 `repo_<name>` 과 겹치는 것만 다룬다(`prepare` 라벨 동기화·clone 모두). 일반 카드는 종전대로 전부.
+- **환경 접근 지시**(`SENTRY_INSTR` → `run-jira-agent.sh` 프롬프트): `<workDir>/env-access/<프로젝트>-<env>.md`(또는 `sentry.accessDir`)가 있으면
+  "그 파일을 Read 해 조사·재현에 써라 — **조회·재현만**, 쓰기·삭제·배포·재시작·설정 변경 금지, 접근 정보를 코드·PR·Jira·로그에 남기지 말 것",
+  없으면 "실제 환경에 접속하지 말고 Sentry 정보와 코드만으로" 를 붙인다.
+- **병합 대상**: 환경(dev·qa·prod)과 무관하게 repo 의 `baseBranch`. 배포는 이 자동화의 범위가 아니다.
+
+`SENTRY_DRY_RUN=1`(또는 `POST /api/sentry/run` body `{dryRun:true}`)이면 Jira·Sentry 를 조회만 하고 카드·알림·에픽 시작은 하지 않는다(로그에 `(dry)`).
+
 ### 4.4 대시보드 백엔드 (dashboard/server.js, Express)
 
 기본 포트 `4317`. 주요 API:
@@ -565,6 +614,9 @@ CI 가 끝난 뒤 에픽 러너의 '병합만 남음' 알림이 또 와서 그�
 | POST | `/api/epics/:key/run/resume` | **멈춘 지점부터 이어서 진행** — body `{skip?}`. `skip:true` 면 멈춘 단계를 건너뛰고 다음 단계부터(동시 실행이면 멈춘 카드 전부 각자). `paused`/`stopped` 상태에서만 수용하며, 재개 단계는 멈췄던 그 카드에만 적용(카드별 `EPIC_RESUME_POINTS`). 응답 `resumedAt` 은 `K-1 · ci, K-3 · build` 형식. **대상 repo 는 상태 파일에 기록된 시작 시점 값**을 그대로 쓴다(요청 body 로 못 바꾼다). 기록이 비어 있으면 **전체로 넓히지 않고 거부**한다 |
 | POST | `/api/epics/:key/run/options` | **자동 병합·자동 재시도·자동 충돌 해소·동시 실행 옵션 변경**(실행 중에도 즉시 반영) — body `{autoMerge?, autoMergeAfterMin?, autoRetry?, autoRetryMax?, autoResolveConflict?, conflictAfterMin?, parallelExtra?}`. 생략한 필드는 기존 값 유지, 분은 1~1440·`parallelExtra` 는 0~4 로 clamp. `.state/<EPIC>.epic.opts.json` 에 저장하고 러너가 병합 대기 폴링·빈 슬롯 채우기마다 다시 읽는다 |
 | POST | `/api/epics/:key/run/stop` | **에픽 연속 개발 중지** — `.epic.stop` 플래그를 먼저 쓴 뒤 프로세스 트리를 SIGTERM→6초 후 SIGKILL·락 정리(상태 파일은 남겨 재개 가능). 6초 안에 [이어서 진행]으로 새 러너가 락을 잡았으면(락 pid 가 중지한 pid 와 다르고 살아 있음) 락을 지우지 않는다(`lib.stopLockClearable`) |
+| GET | `/api/sentry/status` | **Sentry 자동 처리 상태** — `{ready:{ok,why}, running, config, epicKey, lastRunAt, lastError, lastCreated, lastRun, tracked, access:{<env>:bool}, dualSlack}`. 접근 정보 내용은 돌려주지 않는다(있는지만) |
+| POST | `/api/sentry/run` | `run-sentry-loop.js` **즉시 1회 실행**(body `{dryRun?}`). 설정 미완료면 이유와 함께 거부, 실행 중이면 거부 |
+| POST | `/api/sentry/access/:env` | 환경 접근 정보 저장 — body `{text}` 를 `env-access/<프로젝트>-<env>.md`(권한 600)로. 빈 본문이면 삭제 |
 | POST | `/api/cards/:key/repos` | 기존 카드의 대상 repo 라벨(`repo_<name>`) 설정(프로젝트 repo 목록과 교집합만 반영) |
 | GET | `/api/cards/:key/prs` | **카드의 모든 PR(1:N) 조회** — 대상 repo 들에서 카드 키로 검색. PR별 `{repo,owner,number,url,title,state,branch,isDraft,author,isBot,mergeable,mergeState,ci,ciFailed[]}` 반환. `ci` 는 `pass`/`fail`/`pending`/`none`(`lib.ciStateOf`), `ciFailed[]` 는 실패한 체크의 `{name,conclusion,url}` — 대시보드가 CI 배지로 표시하고 병합 확인창에서 경고한다. **repo 하나라도 PR 목록 조회에 실패하면 빈 목록 대신 에러를 반환한다**(조회 실패를 'PR 없음'으로 삼키면 승인·CI 게이트가 통째로 건너뛰어진다). `isBot`=봇 계정(GH_TOKEN 사용자)이 만든 자동화 PR 여부, `botLogin` 도 함께 반환 **`?approved=1`** 이면 열린 PR 마다 리뷰 승인 마커(`CLAUDE-REVIEW-APPROVED`) 유무를 `approved` 로 붙인다(PR 당 API 1회라 opt-in). **`?strict=1`** 이면 **브랜치·제목에 그 카드 키가 있는 PR 만** 남긴다 — `gh pr list --search` 가 PR 본문까지 전문 검색해 본문이 이 키를 언급한 **형제 카드의 PR 까지 끌어오기** 때문(에픽 패널의 병합 목록이 사용) |
 | POST | `/api/cards/:key/merge` | PR 병합(`gh pr merge --rebase --delete-branch`). **rebase 병합이 '방식' 때문에 거절되면**(브랜치에 merge 커밋이 있어 "This branch can't be rebased", 또는 repo 가 rebase 병합을 꺼 둔 경우 — `lib.rebaseMergeUnsupported`) **merge commit(`--merge`)으로 한 번 더 시도**한다. 충돌·권한·CI 거절은 재시도하지 않는다. body `{owner,number}` 지정 시 **그 PR 하나만**(사람 PR 포함), 없으면 **자동화(봇) PR 전체**를 병합. **자동화 PR 이 모두 병합되면**(열린 봇 PR 0) 카드 완료 전환 + `claude-pr` 라벨 제거 + **'완료 내역'을 최종 병합 PR 본문으로 갱신** + 처리 이력 `merge/merged` + **clone 디렉토리 삭제**. 응답 `merged`·`doneStatus`·`removed[]`·`prs[]`. **CI 게이트**: CI 가 실패(`fail`)거나 진행 중(`pending`)인 PR 은 병합하지 않고 `errors[]` 에 사유를 넣는다 — 브랜치 보호가 없는 repo 에서는 여기가 유일한 방어선이다. body `force:true` 로만 넘길 수 있고(대시보드가 확인창에서 CI 상태를 알리고 사람이 진행을 고를 때만 붙인다), **자동 병합 경로에는 이 우회로가 없다**. **병합 대상이 하나도 없으면 `message` 에 이유를 담아 응답한다** — 예전엔 `ok:false` 만 돌려보내 호출부가 사유 자리에 상태코드(`HTTP 200`)를 찍었다 |
@@ -717,6 +769,20 @@ CI 가 끝난 뒤 에픽 러너의 '병합만 남음' 알림이 또 와서 그�
 | 상위 카드 표시 이름 | `EPIC_LABEL` | `에픽` | 프로젝트가 에픽 계층을 부르는 이름(에픽 · 워크스트림 …). 대시보드가 이슈 타입 메타에서 뽑아 주입하며, 러너의 로그·Slack·자동 채택 코멘트 문구에만 쓰인다(동작에는 영향 없음) |
 | 에픽 추가 동시 실행 | `EPIC_PARALLEL_EXTRA` (옵션 파일 `parallelExtra`) | `0` | 선행(`is blocked by`)이 없는 하위 카드를 **1 + 이 값** 건까지 함께 진행(0~4, 0 이면 순차). 병합 대기 카드도 슬롯을 차지한다. 패널의 '추가 동시 실행' 입력이 설정하며 실행 중 변경은 다음 슬롯 채우기부터 반영 |
 | 에픽 재개 지점 | `EPIC_RESUME_POINTS` (예전: `EPIC_RESUME_STEP`·`EPIC_RESUME_KEY`) | (없음) | 대시보드 [이어서 진행]/[건너뛰기] 가 주입하는 카드별 재개 단계 JSON `[{key, step}]`. 예전 두 변수도 러너가 계속 읽는다 |
+| Sentry 자동 처리 | (설정 `sentry.enabled`) | (꺼짐) | 켜면 대시보드가 `run-sentry-loop.js` 를 주기 실행([4.3e](#43e-run-sentry-loopjs-sentry-에러-자동-처리)). `sentryToken`·`org`·`projects` 가 모두 있어야 동작 |
+| Sentry 주소 | (설정 `sentry.baseUrl`) | `https://sentry.io` | self-hosted 면 그 서버 주소 |
+| Sentry org | (설정 `sentry.org`) | **(필수)** | Sentry 조직 slug |
+| Sentry 프로젝트 → repo | (설정 `sentry.projects`) | **(필수)** | `[{slug, repo}]` — Sentry 프로젝트 slug 와 처리할 repo 이름(프로젝트 `repos` 의 name) |
+| 감시 환경 | (설정 `sentry.environments`) | `["dev","qa","prod"]` | Sentry environment 이름. 전부 자동 처리·자동 병합 |
+| 카드 기준 | (설정 `sentry.minEvents` · `windowHours` · `fatalImmediate`) | `5` · `24` · `true` | 기간 내 발생 수 기준, fatal 은 즉시 |
+| 확인 주기(분) | (설정 `sentry.intervalMinutes`) | `10` | 1~1440 |
+| 1회 최대 카드 | (설정 `sentry.maxCardsPerRun`) | `5` | 1~50 |
+| 자동 병합 대기(분) | (설정 `sentry.autoMergeAfterMin`) | `5` | Sentry 에픽 연속 개발을 시작할 때 넘기는 `autoMergeAfterMin` |
+| 에픽 제목 | (설정 `sentry.epicSummary`) | `Sentry 작동 업무 처리` | 이 제목의 미완료 에픽을 쓰고, 없으면 만든다 |
+| 접근 정보 폴더 | (설정 `sentry.accessDir`) | `<workDir>/env-access` | `<프로젝트>-<env>.md` (gitignore, 600). 없거나 빈 파일이면 그 환경은 Sentry 정보만으로 처리 |
+| Sentry 토큰 | (자격증명 `sentryToken`) | (없음) | `project:read` · `event:read` · `event:write`(코멘트) |
+| Sentry 채널 웹훅 | (자격증명 `sentrySlackWebhookUrl`) | (없음) | 처리 시작·병합 완료·중단 알림을 `slackWebhookUrl` 과 함께 보낼 곳. Sentry 의 Slack 앱 연동은 웹훅 URL 이 없으므로 그 채널에 Incoming Webhook 을 따로 만든다 |
+| Sentry 조회만 | `SENTRY_DRY_RUN` | (없음) | `1` 이면 카드·알림·에픽 시작 없이 조회만 |
 | 동시 처리 상한 | `MAX_PARALLEL` | `5` | 한 주기에 동시에 처리하는 카드 수 |
 | 대시보드 주소 | `DASHBOARD_URL` | (대시보드가 주입) | 루프가 REST 탐지(`/api/detect`)를 호출할 백엔드 주소. 비면 claude 탐지 사용 |
 | 라이브 리로드 끄기 | `DASHBOARD_NO_LIVERELOAD` | (없음) | `1` 이면 대시보드 라이브 리로드 비활성화 |
@@ -895,6 +961,9 @@ loop-work/                     # (= 저장소 루트)
 ├─ repos/                      # 카드별 clone (gitignore)
 ├─ loop-*.log                  # 루프 로그 (plan/build/review/epic) (gitignore)
 ├─ run-cycle.js                # 한 사이클: 모든 프로젝트 순회 detect→실행 (루프가 호출)
+├─ run-sentry-loop.js          # Sentry 에러 → 에픽 하위 카드 → 연속 개발(1회 실행, 대시보드가 주기 실행)
+├─ lib-sentry.js               # Sentry 자동 처리 순수 로직(필터·카드 본문·라벨·지시문)
+├─ env-access/                 # 환경별 접근 정보 <프로젝트>-<env>.md (gitignore, 600)
 ├─ run-epic-loop.js            # 에픽 연속 개발: 하위 태스크를 Jira 순위순으로(동시 실행 수만큼 함께) (대시보드 패널)
 ├─ lib-project-env.js          # 프로젝트 설정 → 실행 env 구성 (run-cycle·run-epic-loop 공유)
 ├─ lib-attachments.js          # 카드 첨부(이미지·문서) 다운로드 — run-cycle 는 모듈로, 셸은 CLI 로 사용
@@ -915,6 +984,7 @@ loop-work/                     # (= 저장소 루트)
    ├─ test/attachments.test.js # 카드 첨부(이미지·문서) 인식 회귀 테스트 (fetch 스텁, 네트워크 불필요)
    ├─ test/office.test.js      # docx·xlsx·pptx 변환 테스트 (실제 zip 컨테이너를 만들어 검증)
    ├─ test/epic-loop.test.js   # 에픽 연속 개발 순수 로직(단계 판정·다음 태스크·제안 답변 채택) 테스트
+   ├─ test/sentry.test.js      # Sentry 자동 처리 순수 로직 테스트
    ├─ test/slack-actions.test.js # Slack 버튼 블록 생성·payload 디코드·권한 판정 테스트
    ├─ package.json
    ├─ public/index.html        # React 대시보드 (CDN)
@@ -932,6 +1002,8 @@ loop-work/                     # (= 저장소 루트)
   `.gitignore`로 커밋에서 제외됩니다.
 - `credentials.json`은 로컬 평문 저장(권한 600). 공용 PC에서는 사용을 피하세요.
 - 대시보드는 로컬 전용입니다. 포트를 외부에 노출하지 마세요.
+- Sentry 자동 처리의 환경 접근 정보(`env-access/`)는 로컬 평문(권한 600, gitignore)이며 Jira·PR 로 나가지 않습니다. 에이전트에게는
+  '조회·재현만' 을 지시하지만 **프롬프트 지시일 뿐 기술적 차단이 아니므로**, 특히 prod 는 반드시 **읽기 전용 계정**으로 등록하세요.
 - `work.env`는 대상 repo로 복사되므로, 대상 repo의 `.gitignore`가 해당 파일명을 막는지 확인하세요(이중 안전).
 - 추가로 매 실행 시 clone 의 `.git/info/exclude` 에 env 파일명과 `.env` 가 자동 등록되어, 대상 repo `.gitignore` 설정과 무관하게 로컬에서 추적/커밋이 차단됩니다(claude 프롬프트 지시에 의존하지 않는 구조적 방어).
 
@@ -1112,6 +1184,9 @@ approve 가 리뷰 없이 바로 멈췄다(AML-12). 이미 승인된 PR 은 다�
 - **연속 개발 동시 실행은 파일 충돌을 미리 보지 않는다**: 선행 링크가 없으면 같은 파일을 고치는 카드도 함께 돈다. 병합 시 base 충돌은
   병합 대기의 충돌 해소(재푸시·재리뷰)로 수습하지만 비용이 든다 — 겹치는 카드는 `is blocked by` 로 묶어 두는 것이 싸다.
   대시보드 PR·로그 영역은 한 번에 한 카드만 보여준다(진행 카드 칩을 눌러 전환).
+- **Sentry 자동 처리**: 환경 접근의 '조회만' 은 프롬프트 지시라 읽기 전용 자격증명으로만 안전하다. 에픽이 실패로 멈추면(`paused`)
+  자동 재시도가 다루는 사유 외에는 사람이 [이어서 진행]할 때까지 새 Sentry 카드가 쌓이기만 한다. prod 까지 사람 확인 없이 `baseBranch` 에
+  병합되므로 배포 전 확인이 마지막 관문이다. 발생 수 기준은 Sentry API 의 `statsPeriod` 집계를 따른다(지원하지 않는 기간이면 24h 로 재시도).
 - **연속 개발 선행 관계는 Jira 기본 `Blocks` 링크 타입만 인식**: 이름을 바꾼 커스텀 링크 타입(예: `Depends`)은 선행으로 보지 않는다. 선행 판정은 '완료 상태'만 보므로, 선행 카드의 PR 이 병합 전이면 뒤 카드는 계속 대기한다.
 
 ---
