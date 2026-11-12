@@ -37,6 +37,7 @@ function sentryConfig(cfg) {
     autoMergeAfterMin: int(s.autoMergeAfterMin, 5, 1, 1440),
     epicSummary: String(s.epicSummary || DEFAULT_EPIC_SUMMARY).trim(),
     accessDir: String(s.accessDir || "").trim(),
+    securityPatterns: (Array.isArray(s.securityPatterns) ? s.securityPatterns : []).map(String).filter(Boolean),
   };
 }
 
@@ -59,12 +60,24 @@ function eventCount(issue) {
   return Number(issue && issue.count) || 0;
 }
 
+// 보안 사건 의심 패턴(제목·culprit·메시지 정규식, 대소문자 무시). 맞으면 카드 대신 보안 알림 1회.
+function securityMatch(issue, conf) {
+  const hay = [issue && issue.title, issue && issue.culprit, issue && issue.metadata && issue.metadata.value]
+    .filter(Boolean).join("\n");
+  for (const p of conf.securityPatterns || []) {
+    let re; try { re = new RegExp(p, "i"); } catch { continue; }
+    if (re.test(hay)) return p;
+  }
+  return "";
+}
+
 // 카드로 만들 이슈만: 미해결 + (fatal 이면 즉시 | 기간 내 minEvents 이상), 이미 처리한 id 제외.
 function pickIssues(issues, conf, seen) {
   const known = seen || new Set();
   return (issues || []).filter((i) => {
     if (!i || !i.id || known.has(String(i.id))) return false;
     if (i.status && i.status !== "unresolved") return false;
+    if (securityMatch(i, conf)) return false;
     if (conf.fatalImmediate && String(i.level || "").toLowerCase() === "fatal") return true;
     return eventCount(i) >= conf.minEvents;
   });
@@ -206,7 +219,7 @@ function prsFromHistory(lines, key) {
 }
 
 module.exports = {
-  SENTRY_LABEL, DEFAULT_EPIC_SUMMARY, sentryConfig, sentryReady, eventCount, pickIssues,
+  SENTRY_LABEL, DEFAULT_EPIC_SUMMARY, sentryConfig, sentryReady, eventCount, pickIssues, securityMatch,
   idLabel, envLabel, envOfLabels, isSentryCard, cardLabels, cardSummary, eventDigest, cardDescription,
   accessDirOf, accessFileOf, agentInstr, taskRepoNames, notifyUrls, prsFromHistory,
 };

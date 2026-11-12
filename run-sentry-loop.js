@@ -195,6 +195,15 @@ async function collect(epicKey) {
       let issues;
       try { issues = await fetchIssues(p.slug, env); }
       catch (e) { log(`이슈 조회 실패(${p.slug}/${env}): ${e.message}`); STATE.lastError = e.message; continue; }
+      STATE.security = STATE.security || {};
+      for (const issue of issues || []) {
+        const pat = S.securityMatch(issue, conf);
+        if (!pat || STATE.security[String(issue.id)]) continue;
+        STATE.security[String(issue.id)] = { env, slug: p.slug, title: issue.title || "", pattern: pat, at: nowIso() };
+        save();
+        log(`보안 의심 — 카드 만들지 않음: ${p.slug}/${env} #${issue.shortId || issue.id} (${pat})`);
+        await notifyBoth(`🚨 [Sentry][${env}] 보안 사건 의심 에러 — 자동 수정 대상에서 제외했습니다. 사람이 확인해 주세요 · ${issue.title || ""} · <${issue.permalink || ""}|Sentry>`);
+      }
       const picked = S.pickIssues(issues, conf, new Set(Object.keys(STATE.issues)));
       for (const issue of picked) {
         if (made >= conf.maxCardsPerRun) break;
