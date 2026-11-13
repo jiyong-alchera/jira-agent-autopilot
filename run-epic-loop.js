@@ -607,11 +607,10 @@ async function resolveConflictAndReview(task, pr, why) {
 // 자동 병합이 켜져 있으면, 대기 시간이 지나고 열린 PR 이 '모두 리뷰 승인' 된 경우 대신 병합한다.
 async function stepAwaitMerge(task) {
   const waitStartedAt = (WORKERS.get(task.key) || {}).stepStartedAt || nowIso();
-  const o0 = readOpts();
-  await slack(`⏳ [${EPIC_KEY}] ${task.key} PR 병합 대기 중 — 병합하면 다음 태스크로 넘어갑니다.`
-    + (o0.autoMerge ? ` (승인 상태로 ${o0.autoMergeAfterMin}분 경과 시 자동 병합)` : "")
-    + (o0.autoResolveConflict ? ` (base 충돌 시 ${o0.conflictAfterMin}분 뒤 자동 해소·재푸시)` : ""),
-    [{ id: "merge", project: project.id, key: task.key }, ...epicBtn("epic-stop")]);
+  const optNote = (o) => (o.autoMerge ? ` (승인 상태로 ${o.autoMergeAfterMin}분 경과 시 자동 병합)` : "")
+    + (o.autoResolveConflict ? ` (base 충돌 시 ${o.conflictAfterMin}분 뒤 자동 해소·재푸시)` : "");
+  // 진입 안내는 첫 PR 조회 뒤 한 번만 — [병합] 버튼은 '병합만 남음' 알림에만 붙인다(lib.awaitMergeEntryNotice).
+  let entryNotified = false, entryNote = "";
   let autoMergeTried = false, readyNotified = false;
   let conflictSince = null, conflictNotified = false;   // 충돌을 처음 본 시각(대기 시간의 기준) · 알림 1회 제한
   for (;;) {
@@ -629,6 +628,15 @@ async function stepAwaitMerge(task) {
     let openPRs = [], prsErr = "";
     // 매 회 PR 을 본다 — 자동 병합이 꺼져 있어도 '병합만 남음'·'base 충돌' 은 알려야 한다.
     try { openPRs = await cardOpenPRs(task.key); } catch (e) { prsErr = e.message; }
+    if (!entryNotified) {
+      entryNotified = true;
+      const kind = lib.awaitMergeEntryNotice(openPRs, prsErr);
+      if (kind === "waiting") {
+        await slack(`⏳ [${EPIC_KEY}] ${task.key} PR 병합 대기 중 — 리뷰 승인·CI 통과가 확인되면 병합 버튼을 보냅니다.${optNote(opts)}`, epicBtn("epic-stop"));
+      } else {
+        entryNote = optNote(opts);              // 진입 안내를 다음 알림(병합만 남음·충돌)에 합친다
+      }
+    }
 
     // ----- base 충돌 -----
     // 충돌이 사라지면(사람이 직접 해소·병합) 기준 시각을 버려, 다시 충돌났을 때 대기 시간을 처음부터 센다.
@@ -643,9 +651,11 @@ async function stepAwaitMerge(task) {
       const tags = conflicts.map((p) => `${p.owner}#${p.number}`).join(", ");
       log(`${task.key} base 충돌 감지 (${tags})`);
       await slack(`⚠️ [${EPIC_KEY}] ${task.key} — base 충돌로 병합할 수 없습니다 (${tags}).`
-        + (opts.autoResolveConflict ? ` ${opts.conflictAfterMin}분 뒤 자동으로 해소·재푸시합니다.` : " 아래 버튼으로 해소·재푸시할 수 있습니다."),
+        + (opts.autoResolveConflict ? ` ${opts.conflictAfterMin}분 뒤 자동으로 해소·재푸시합니다.` : " 아래 버튼으로 해소·재푸시할 수 있습니다.")
+        + (entryNote && opts.autoMerge ? ` (해소 뒤 승인 상태로 ${opts.autoMergeAfterMin}분 경과 시 자동 병합)` : ""),
         [{ id: "resolve-conflict", project: project.id, key: task.key, owner: c0.owner, number: String(c0.number), epic: EPIC_KEY },
          { url: c0.url, label: "🔗 PR 열기" }, ...epicBtn("epic-stop")]);
+      entryNote = "";
     }
     // 대시보드·Slack 버튼이 남긴 즉시 해소 요청(대기 시간을 건너뛴다)
     const reqd = takeConflictRequest(task.key);
@@ -696,7 +706,8 @@ async function stepAwaitMerge(task) {
       const btns = [{ id: "merge", project: project.id, key: task.key }];
       if (openPRs.length === 1) btns.push({ url: openPRs[0].url, label: "🔗 PR 열기" });
       log(`${task.key} 승인 + CI 통과 → 병합 대기 알림 (PR ${openPRs.length}건)`);
-      await slack(`✅ [${EPIC_KEY}] ${task.key} — 리뷰 승인 + CI 통과. 병합만 남았습니다 (PR ${openPRs.length}건).`, btns);
+      await slack(`✅ [${EPIC_KEY}] ${task.key} — 리뷰 승인 + CI 통과. 병합만 남았습니다 (PR ${openPRs.length}건).${entryNote}`, [...btns, ...epicBtn("epic-stop")]);
+      entryNote = "";
     }
     // 조회 자체가 실패한 회차는 판정하지 않는다 — '못 물어봤다'를 '열린 PR 이 없다'로 읽으면
     // 승인·CI 게이트를 통째로 건너뛰게 된다. 다음 폴링에서 다시 본다.

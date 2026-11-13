@@ -883,3 +883,17 @@ test("skipLine: 하위 출력의 마지막 SKIP 줄 사유(문장 중간 언급�
   assert.equal(lib.skipLine("출력에 SKIP: 이 있으면 skip 처리"), "");
   assert.equal(lib.skipLine(""), "");
 });
+
+test("awaitMergeEntryNotice: 승인·CI 가 끝난 카드는 진입 알림을 따로 보내지 않는다(병합 버튼 알림 1건)", () => {
+  assert.equal(lib.awaitMergeEntryNotice([{ ci: "pass", approved: true }], ""), "skip-ready");
+  assert.equal(lib.awaitMergeEntryNotice([{ ci: "none", approved: true }], ""), "skip-ready");
+});
+test("awaitMergeEntryNotice: 충돌이면 충돌 알림이 진입 안내를 겸한다", () => {
+  assert.equal(lib.awaitMergeEntryNotice([{ mergeable: "CONFLICTING", ci: "pass", approved: true }], ""), "skip-conflict");
+});
+test("awaitMergeEntryNotice: CI 진행·미승인·조회 실패·PR 없음은 버튼 없는 대기 안내", () => {
+  assert.equal(lib.awaitMergeEntryNotice([{ ci: "pending", approved: true }], ""), "waiting");
+  assert.equal(lib.awaitMergeEntryNotice([{ ci: "pass", approved: false }], ""), "waiting");
+  assert.equal(lib.awaitMergeEntryNotice([{ ci: "pass", approved: true }], "gh 실패"), "waiting");
+  assert.equal(lib.awaitMergeEntryNotice([], ""), "waiting");
+});

@@ -840,6 +840,18 @@ function mergeReadyState(openPRs) {
   return "ready";
 }
 const isMergeReady = (openPRs) => mergeReadyState(openPRs) === "ready";
+// 병합 대기에 들어설 때의 첫 알림 종류. [병합] 버튼은 '병합만 남음' 알림 하나에만 붙인다 —
+// 진입 알림에도 붙이면 승인·CI 가 이미 끝난 카드는 몇 초 차이로 버튼 달린 알림이 두 번 나간다.
+//   skip-ready    : 곧바로 '병합만 남음' 알림이 나간다(진입 안내는 거기에 합친다)
+//   skip-conflict : 충돌 알림이 진입 안내를 겸한다
+//   waiting       : 버튼 없는 ⏳ 안내만(조회 실패도 여기 — 모르면 버튼을 주지 않는다)
+function awaitMergeEntryNotice(openPRs, prsErr) {
+  if (prsErr) return "waiting";
+  const s = mergeReadyState(openPRs);
+  if (s === "ready") return "skip-ready";
+  if (s === "conflicting") return "skip-conflict";
+  return "waiting";
+}
 // 병합 대기 중 CI 수정을 돌릴 PR — CI 가 깨진 PR 만. 충돌 PR 은 rebase 해소가 먼저다(해소 뒤 CI 가 다시 돈다).
 function ciFixTargets(openPRs) {
   return (openPRs || []).filter((p) => p.ci === "fail" && !isConflicting(p));
@@ -1059,7 +1071,7 @@ module.exports = {
   EPIC_STEPS, epicChildrenJql, searchEpicChildren, epicBlockers, epicTaskStep, pickEpicTasks, nextEpicTask, epicTaskStates, epicBlockedReason, nextEpicStep, approveReviewTargets, reviewOnResume, stopLockClearable, ALREADY_DONE_MARK, alreadyDoneComment,
   EPIC_PARALLEL_EXTRA_MAX, clampParallelExtra, epicResumePoints, summarizeEpicRuns, runEpicSlots, buildAdoptedAnswerBody, prBelongsToCard,
   EPIC_HIERARCHY_LEVEL, EPIC_LABEL_FALLBACK, topLevelIssueTypes, epicSearchJql, epicTypeLabel,
-  EPIC_AUTO_MERGE_MIN_DEFAULT, EPIC_AUTO_MERGE_MIN_LIMIT, clampAutoMergeMin, shouldAutoMerge, mergeReadyState, isMergeReady, ciFixTargets,
+  EPIC_AUTO_MERGE_MIN_DEFAULT, EPIC_AUTO_MERGE_MIN_LIMIT, clampAutoMergeMin, shouldAutoMerge, mergeReadyState, isMergeReady, awaitMergeEntryNotice, ciFixTargets,
   EPIC_CONFLICT_MIN_DEFAULT, EPIC_CONFLICT_MIN_LIMIT, clampConflictMin, isConflicting, conflictingPRs, shouldAutoResolveConflict,
   REVIEW_SUPERSEDED_CI, REVIEW_SUPERSEDED_CONFLICT, supersededBody,
   EPIC_RETRY_MAX_DEFAULT, EPIC_RETRY_MAX_LIMIT, EPIC_RETRY_BACKOFF_MIN, clampRetryMax,
