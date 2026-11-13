@@ -142,7 +142,7 @@ pkill -f loop-build.sh
 ## 사전 준비 (필수)
 
 - `claude` (Claude Code CLI) 설치 + 로그인
-- `claude mcp add --transport http atlassian https://mcp.atlassian.com/v1/mcp` + `/mcp` 인증
+- Atlassian MCP 연결: claude.ai 커넥터 목록의 Atlassian(v2, `https://mcp.atlassian.com/v2/mcp`)을 추가하거나 `claude mcp add --transport http atlassian https://mcp.atlassian.com/v2/mcp` + `/mcp` 인증
 - `gh auth login` (PR 생성용)
 
 ## 주의사항

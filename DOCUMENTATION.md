@@ -831,7 +831,8 @@ CI 가 끝난 뒤 에픽 러너의 '병합만 남음' 알림이 또 와서 그�
 ### 사전 준비
 
 - **Claude Code CLI** 설치 + 로그인, Atlassian MCP 연결:
-  `claude mcp add --transport http atlassian https://mcp.atlassian.com/v1/mcp` 후 `/mcp` 인증
+  claude.ai 커넥터 목록의 Atlassian(v2) 추가, 또는 `claude mcp add --transport http atlassian https://mcp.atlassian.com/v2/mcp` 후 `/mcp` 인증.
+  v1(`…/v1/mcp`·`…/v1/sse`)은 폐기 예정이다. v2 커넥터는 도구 이름이 `mcp__claude_ai_Atlassian_MCP__*` 이고 일부 도구도 바뀌었다(코멘트 `addOrEditJiraIssueComment`)
 - **GitHub CLI**: `brew install gh && gh auth login` (clone/push/PR)
 - **Node.js ≥ 18** (대시보드)
 
@@ -1068,7 +1069,8 @@ loop-work/                     # (= 저장소 루트)
 | 에픽이 `plan 이 끝났지만 claude-planned 라벨이 없습니다` 로 멈춤. plan 로그에는 `SKIP: … 기록 카드라 건너뜁니다` (PO-148) | 에픽 prepare 가 기록용 카드에도 `claude-work` 를 붙였고, plan 에이전트는 카드 본문의 '작업 대상 아님'을 보고 스스로 건너뛰었다. 러너는 SKIP 을 구분하지 못해 일반 메시지로 멈췄다 | (해결됨) 중단 사유에 SKIP 사유가 그대로 나온다. 작업 대상이 아닌 카드에는 `claude-skip` 라벨을 붙이면 에픽·탐지 모두 건너뛰고, 그 카드만 남았으면 에픽은 완료로 끝난다. 이미 멈췄다면 라벨을 붙이거나 완료 처리한 뒤 [이어서 진행] |
 | 에픽이 `adopt: plan 질문에 '💡 제안:' 답변이 없어 자동 채택할 수 없습니다` 로 멈추고 [이어서 진행]을 눌러도 곧바로 다시 멈춤. 카드에는 plan 의 「질문 없음 — 구현 준비 완료」 코멘트만 있음 (PO-145) | plan 이 질문 없이 끝나면 `claude-answered` 를 사람이 붙이도록 안내만 하는데, 에픽의 adopt 는 제안 답변만 찾아 '답변 없음'으로 판정했다 | (해결됨) adopt 가 「질문 없음」 코멘트(그 뒤 제안 질문 코멘트가 없을 때)를 인식해 `claude-answered` 를 붙이고 build 로 넘어간다(`lib.planHasNoQuestions`) |
 | 실행 중인 에픽이 **'중단됨'으로 보이고, [이어서 진행]을 누를 때마다 1~2초 만에 다시 중단**. 로그에는 카드마다 `SKIP: [KEY] 이미 처리 중(lock)` 과 `build 가 끝났지만 PR 표시(claude-pr 라벨)가 없습니다` 가 반복 (EKYB-951) | 에픽을 **중지한 뒤 6초 안에 [이어서 진행]** 을 누르면, 중지 API 의 6초 강제 정리가 **새 러너의 락까지 지웠다**. 락이 없으니 대시보드는 살아 있는 러너를 중단으로 보고, 재개할 때마다 복제 러너가 떠 카드 락에 막혀 곧장 '중단'을 기록하며 락을 또 지웠다 | (해결됨) 강제 정리는 락 pid 가 중지한 러너이거나 죽은 프로세스일 때만 락을 지운다. 이미 이 상태라면 살아 있는 러너 pid 로 `repos/.state/<EPIC>.epic.lock/` 디렉터리와 `<EPIC>.epic.lock.pid`·`.phase`(`epic`) 를 다시 만들면 '진행 중'으로 돌아온다 |
-| 리뷰 승인 루프가 `⏸ 반영할 새 피드백이 없어 진전 없음, 사람 확인 필요` 로 끝났는데, rework 로그에는 **권한 거부로 반영 실패**(예: `addCommentToJiraIssue` 가 auto mode 분류기에 막힘)가 적혀 있음 (PHYS-411) | 실패를 알리는 문장 속 `NO_REWORK_NEEDED` 언급을 마커로 잡아 무변경(`noop`)으로 분류했다. 엔진은 '비정상 종료'를 종료코드로 표현할 수 없어 실패 신호도 없었다 | (해결됨) 무변경 마커는 줄 전체일 때만 인식하고, 실패는 `REWORK_FAILED: <사유>` 마커로 받아 `failed` 로 분류해 알림에 사유를 싣는다. 권한 거부가 원인이면 `~/.claude/settings.json` 의 `permissions.allow` 에 해당 도구(예: `mcp__claude_ai_Atlassian_Rovo__addCommentToJiraIssue`)를 추가한 뒤 리뷰 루프를 다시 돌린다 |
+| 리뷰 승인 루프가 `⏸ 반영할 새 피드백이 없어 진전 없음, 사람 확인 필요` 로 끝났는데, rework 로그에는 **권한 거부로 반영 실패**(예: `addCommentToJiraIssue` 가 auto mode 분류기에 막힘)가 적혀 있음 (PHYS-411) | 실패를 알리는 문장 속 `NO_REWORK_NEEDED` 언급을 마커로 잡아 무변경(`noop`)으로 분류했다. 엔진은 '비정상 종료'를 종료코드로 표현할 수 없어 실패 신호도 없었다 | (해결됨) 무변경 마커는 줄 전체일 때만 인식하고, 실패는 `REWORK_FAILED: <사유>` 마커로 받아 `failed` 로 분류해 알림에 사유를 싣는다. 권한 거부가 원인이면 `~/.claude/settings.json` 의 `permissions.allow` 에 해당 도구(예: v2 커넥터 `mcp__claude_ai_Atlassian_MCP__addOrEditJiraIssueComment`, v1 은 `…Atlassian_Rovo__addCommentToJiraIssue`)를 추가한 뒤 리뷰 루프를 다시 돌린다 |
+| 에픽이 `중단: <KEY> · build: build 가 답변 대기로 스킵됐습니다` 로 멈췄는데 카드에는 답변(또는 에픽의 제안 채택 코멘트)과 `claude-answered` 라벨이 있음. 빌드 로그에 'Atlassian 연결 인증 필요' (AML-129) | Atlassian 커넥터가 끊긴(재연결·v1→v2 교체 중) 사이에 돈 단계라 에이전트가 Jira 를 못 읽었다. build 는 진입 게이트를 확인할 수 없어 `SKIP: awaiting answers` 로 끝내고, 이 사유는 자동 재시도 대상이 아니다. 같은 시점 plan 은 마지막 `claude-branched` 라벨을 못 달 수 있다 | 커넥터를 다시 인증한 뒤 빠진 라벨을 달고 에픽을 [이어서 진행]한다. 진행 중이던 다른 카드의 Jira 코멘트·전환 누락도 확인한다. 커넥터를 v2 로 바꿨으면 `permissions.allow` 의 도구 이름도 새 이름으로 추가한다 |
 | 리뷰 승인 루프가 **1회차에서 `❌ 리뷰 반영 실패로 중단`**(exit 1). 로그에는 반영할 게 없다는 정상 판단(`PR 없이 종료됨 → 미완료(재시도 대상)`)만 있음 | (해결됨) 직전 회차가 **이미 반영·push 를 끝낸 뒤 재리뷰 전에 루프가 죽은** 상태에서 다시 돌리면, rework 가 고칠 게 없어 PR 을 갱신하지 않는다. 그런데 rework 프롬프트가 "PR 을 하나도 갱신하지 못했으면 비정상 종료"라고만 지시했고 스크립트도 `PR URL 없음 → incomplete` + `exit 1` + `.fail` 증가로 처리해, **정상 무변경이 실패로 둔갑**했다 | 수정됨: rework 프롬프트에 종료 규칙을 둘로 분리(반영할 새 피드백 없음 → `NO_REWORK_NEEDED` 출력 후 **정상 종료** / 반영할 PR 없음·반영 실패 → 비정상 종료), 스크립트는 이를 `noop` 으로 분류(exit 0, `.fail` 초기화), 승인 루프는 무변경 회차를 **재리뷰로 넘겨 판정**하고 **2회 연속**일 때만 사람 확인으로 종료. 오탐으로 쌓인 `repos/.state/<KEY>.fail` 은 삭제하면 됨 |
 | build 완료인데 카드 설명에 '완료 내역' 이 안 기재됨 | (해결됨) ① `set -u` 환경에서 append 단계가 `${JIRA_SITE}` 를 기본값 없이 참조해 변수 미설정 시 그 줄에서 스크립트가 죽음 ② 대시보드 단건 실행(`scriptEnv`)이 `JIRA_SITE`·`ATLASSIAN_EMAIL`·`ATLASSIAN_TOKEN` 을 주입하지 않아 자격증명이 비어 append 가 생략됨 | 수정됨: append 블록의 모든 변수 참조를 `${VAR:-}` 로 안전화 + `scriptEnv`(단건 실행)에도 Jira REST 자격증명 주입. 누락된 과거 카드는 '리뷰 반영(rework)' 재실행으로 요약 재생성·기재 가능 |
 | 대시보드 버튼이 **"정리 중…"·"등록 중…" 상태로 영구 고착**(에러 토스트도 안 뜨고 버튼은 계속 disabled) | (해결됨) 프론트 `api` 헬퍼가 `fetch(...).json()` 을 그대로 반환해, **백엔드가 죽었거나 응답이 JSON 이 아니면 Promise 가 reject** → 호출부의 `await` 가 throw 되어 뒤따르는 `setRefining(false)`·`setCreating(false)` 등이 실행되지 않음 | 수정됨: `request()` 헬퍼가 네트워크 실패·비 JSON 응답을 서버 에러와 같은 `{ ok:false, message }` 로 정규화(**절대 reject 하지 않음**) + 로딩 플래그를 쓰는 핸들러(정리·카드등록·답변등록·상세조회·고도화·반영)를 `try/finally` 로 감쌈. 회귀 테스트 `dashboard/test/frontend-api.test.js` |
@@ -1196,7 +1198,7 @@ CI 실패·미확정이면 **병합 버튼을 붙이지 않는다**(막히는 �
 `ci` 에서 재개한 카드도 같다(`lib.reviewOnResume`). 사람이 CI 를 고치는 커밋을 올리고 ci 에서 재개하면 CI 는 통과해도
 approve 가 리뷰 없이 바로 멈췄다(AML-12). 이미 승인된 PR 은 다시 리뷰하지 않는다.
 평소 흐름(build·ci 직후의 approve)은 이미 리뷰 루프를 거쳤으므로 다시 돌리지 않는다. 카드 생성처럼 자동 모드가 막는 외부 쓰기가
-원인이면 `~/.claude/settings.json` 의 `permissions.allow` 에 해당 MCP 도구(예: `mcp__claude_ai_Atlassian_Rovo__createJiraIssue`)를 먼저 추가한다.
+원인이면 `~/.claude/settings.json` 의 `permissions.allow` 에 해당 MCP 도구(예: `mcp__claude_ai_Atlassian_MCP__createJiraIssue`)를 먼저 추가한다.
 
 ---
 
