@@ -7,7 +7,9 @@
 const express = require("express");
 const fs = require("fs");
 const path = require("path");
+const os = require("os");
 const { spawn, execFile, execFileSync } = require("child_process");
+const monitorLib = require("./lib-monitor");
 
 const app = express();
 app.use(express.json({ limit: "25mb" })); // 이미지(base64) 첨부 페이로드 허용
@@ -1091,6 +1093,57 @@ app.get("/api/epics/:key/run", (req, res) => {
   try { const { cfg } = resolveProject(req); res.json({ ok: true, run: epicRunStatus(cfg, key) }); }
   catch (e) { fail(res, e); }
 });
+// ----- 오토파일럿 부하 모니터: 10초마다 ps 를 떠서 러너(카드) 단위로 합산, 최근 30분만 메모리에 보관 -----
+const MONITOR_INTERVAL_MS = 10000;
+const MONITOR_WINDOW_MS = 30 * 60 * 1000;
+const monitor = { last: null, history: [], busy: false };
+const runText = (bin, args) => new Promise((resolve) => {
+  execFile(bin, args, { maxBuffer: 16 * 1024 * 1024, timeout: 8000 }, (err, out) => resolve(err ? "" : String(out)));
+});
+async function sampleLoad() {
+  if (monitor.busy) return;
+  monitor.busy = true;
+  try {
+    const [psOut, swapOut, memOut] = await Promise.all([
+      runText("ps", ["-axo", "pid=,ppid=,pcpu=,rss=,etime=,command="]),
+      runText("sysctl", ["-n", "vm.swapusage"]),
+      runText("memory_pressure", []),
+    ]);
+    if (!psOut) return;
+    const procs = monitorLib.parsePs(psOut);
+    // 수집에 쓴 ps 자신과 대시보드 서버는 기타로 둔다.
+    const selfPids = [process.pid, ...procs.filter((p) => p.ppid === process.pid && /^ps\s/.test(p.cmd)).map((p) => p.pid)];
+    const { groups, other } = monitorLib.groupProcesses(procs, { selfPids });
+    const cores = os.cpus().length;
+    const [load1, load5, load15] = os.loadavg();
+    const memFreePct = monitorLib.parseMemFree(memOut);
+    const keyToProject = new Map(listProjects().filter((p) => p.projectKey).map((p) => [p.projectKey, p.name || p.id]));
+    for (const g of groups) {
+      const pk = String(g.key).split("-")[0];
+      g.project = keyToProject.get(pk) || (g.kind === "loop" ? "공통" : pk);
+    }
+    const ap = groups.reduce((a, g) => ({ cpu: a.cpu + g.cpu, rss: a.rss + g.rss, count: a.count + g.count }), { cpu: 0, rss: 0, count: 0 });
+    const system = {
+      cores, load1, load5, load15, memFreePct,
+      memTotal: os.totalmem(), swap: monitorLib.parseSwap(swapOut),
+      ...monitorLib.loadLevel({ load1, cores, memFreePct }),
+    };
+    const t = Date.now();
+    monitor.last = { t, system, autopilot: { ...ap, cpu: Math.round(ap.cpu * 10) / 10 }, other, groups };
+    monitorLib.pushHistory(monitor.history, { t, load1: Math.round(load1 * 100) / 100, apCpu: monitor.last.autopilot.cpu, otherCpu: other.cpu, apRss: ap.rss, otherRss: other.rss, memFreePct }, MONITOR_WINDOW_MS);
+  } catch (e) {
+    console.error("[monitor]", e.message);
+  } finally {
+    monitor.busy = false;
+  }
+}
+setInterval(sampleLoad, MONITOR_INTERVAL_MS).unref();
+sampleLoad();
+app.get("/api/monitor/load", async (req, res) => {
+  if (!monitor.last) await sampleLoad();
+  res.json({ ok: true, intervalMs: MONITOR_INTERVAL_MS, windowMs: MONITOR_WINDOW_MS, thresholds: monitorLib.DEFAULT_THRESHOLDS, ...(monitor.last || {}), history: monitor.history });
+});
+
 // Sentry 자동 처리 상태 / 즉시 1회 실행(body.dryRun=true 면 카드·알림 없이 조회만) / 환경 접근 정보 저장
 app.get("/api/sentry/status", (req, res) => {
   try { const { id } = resolveProject(req); res.json({ ok: true, status: sentryStatus(id) }); } catch (e) { fail(res, e); }

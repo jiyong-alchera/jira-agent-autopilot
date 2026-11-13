@@ -1589,6 +1589,173 @@ function sentryTrackTitle(r) {
     t.note,
   ].filter(Boolean).join("\n");
 }
+// ----- 오토파일럿 부하: 러너(카드)별 CPU·메모리, 30분 추이 -----
+const LOAD_COLORS = { ap: "#6366f1", other: "#64748b" };
+const LEVEL_STYLE = {
+  ok: { icon: "●", label: "정상", cls: "bg-emerald-500/15 text-emerald-200 border-emerald-500/40" },
+  warn: { icon: "▲", label: "주의", cls: "bg-amber-500/15 text-amber-200 border-amber-500/40" },
+  crit: { icon: "■", label: "과부하", cls: "bg-red-500/15 text-red-200 border-red-500/40" },
+};
+const gb = (b) => (b == null ? "-" : `${(b / 1073741824).toFixed(1)}GB`);
+const mb = (b) => (b >= 1073741824 ? gb(b) : `${Math.round(b / 1048576)}MB`);
+const coresText = (cpu) => `${(cpu / 100).toFixed(1)}코어`;
+const durText = (s) => (!s ? "-" : s >= 3600 ? `${Math.floor(s / 3600)}시간 ${Math.floor((s % 3600) / 60)}분` : `${Math.floor(s / 60)}분`);
+const PHASE_LABEL = { plan: "plan", build: "build", review: "리뷰·CI", epic: "에픽 러너", sentry: "Sentry 확인", cycle: "사이클" };
+
+function LoadTrend({ history, cores }) {
+  const [hover, setHover] = useState(null);
+  if (!history || history.length < 2) return <p className="text-xs text-slate-500">추이는 수집이 몇 번 쌓이면 보입니다(10초 간격).</p>;
+  const cap = Math.max(1, cores) * 100;
+  const W = 600, H = 120;
+  const t0 = history[0].t, t1 = history[history.length - 1].t, span = Math.max(1, t1 - t0);
+  const x = (t) => ((t - t0) / span) * W;
+  const y = (v) => H - Math.min(1, v / cap) * H;
+  const lower = history.map((p) => [x(p.t), y(p.apCpu)]);
+  const upper = history.map((p) => [x(p.t), y(p.apCpu + p.otherCpu)]);
+  const line = (pts) => pts.map(([a, b], i) => `${i ? "L" : "M"}${a.toFixed(1)},${b.toFixed(1)}`).join("");
+  const area = (top, bottom) => `${line(top)}${bottom.slice().reverse().map(([a, b]) => `L${a.toFixed(1)},${b.toFixed(1)}`).join("")}Z`;
+  const base = history.map((p) => [x(p.t), H]);
+  const onMove = (e) => {
+    const r = e.currentTarget.getBoundingClientRect();
+    const fx = (e.clientX - r.left) / r.width;
+    const t = t0 + fx * span;
+    let best = 0;
+    history.forEach((p, i) => { if (Math.abs(p.t - t) < Math.abs(history[best].t - t)) best = i; });
+    setHover({ i: best, px: (x(history[best].t) / W) * 100 });
+  };
+  const hp = hover ? history[hover.i] : null;
+  const pct = (v) => `${Math.round((v / cap) * 100)}%`;
+  return (
+    <div>
+      <div className="flex items-center gap-4 text-xs text-slate-400 mb-1">
+        <span className="font-semibold text-slate-300">CPU 사용 30분 추이 (전체 용량 대비)</span>
+        <span className="flex items-center gap-1"><span className="inline-block w-3 h-3 rounded-sm" style={{ background: LOAD_COLORS.ap }} />오토파일럿</span>
+        <span className="flex items-center gap-1"><span className="inline-block w-3 h-3 rounded-sm" style={{ background: LOAD_COLORS.other }} />기타</span>
+      </div>
+      <div className="relative" onMouseMove={onMove} onMouseLeave={() => setHover(null)}>
+        <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" className="w-full h-28 block">
+          {[0.25, 0.5, 0.75].map((f) => <line key={f} x1="0" x2={W} y1={H * f} y2={H * f} stroke="#334155" strokeWidth="1" strokeDasharray="3 4" vectorEffect="non-scaling-stroke" />)}
+          <path d={area(upper, lower)} fill={LOAD_COLORS.other} fillOpacity="0.55" />
+          <path d={area(lower, base)} fill={LOAD_COLORS.ap} fillOpacity="0.85" />
+          <path d={line(lower)} fill="none" stroke="#0b1020" strokeWidth="2" vectorEffect="non-scaling-stroke" />
+          {hover && <line x1={x(hp.t)} x2={x(hp.t)} y1="0" y2={H} stroke="#e2e8f0" strokeWidth="1" vectorEffect="non-scaling-stroke" />}
+        </svg>
+        <div className="absolute left-1 top-0 text-[10px] text-slate-500">100%</div>
+        <div className="absolute left-1 bottom-0 text-[10px] text-slate-500">0</div>
+        {hp && (
+          <div className="absolute top-1 pointer-events-none bg-slate-950/95 border border-slate-600 rounded px-2 py-1 text-xs whitespace-nowrap z-10"
+            style={hover.px > 60 ? { right: `${100 - hover.px + 1}%` } : { left: `${hover.px + 1}%` }}>
+            <div className="text-slate-400">{new Date(hp.t).toLocaleTimeString()}</div>
+            <div><span style={{ color: LOAD_COLORS.ap }}>■</span> 오토파일럿 {pct(hp.apCpu)} · {gb(hp.apRss)}</div>
+            <div><span style={{ color: LOAD_COLORS.other }}>■</span> 기타 {pct(hp.otherCpu)} · {gb(hp.otherRss)}</div>
+            <div className="text-slate-400">load {hp.load1} · 메모리 여유 {hp.memFreePct ?? "-"}%</div>
+          </div>
+        )}
+      </div>
+      <div className="flex justify-between text-[10px] text-slate-500 mt-0.5">
+        <span>{new Date(t0).toLocaleTimeString()}</span><span>{new Date(t1).toLocaleTimeString()}</span>
+      </div>
+    </div>
+  );
+}
+
+function LoadMonitor() {
+  const [d, setD] = useState(null);
+  const load = useCallback(async () => { const r = await api.get("/api/monitor/load"); if (r.ok) setD(r); }, []);
+  useEffect(() => { load(); const t = setInterval(load, 5000); return () => clearInterval(t); }, [load]);
+  const sys = d && d.system;
+  const lv = LEVEL_STYLE[(sys && sys.level) || "ok"];
+  const cap = sys ? Math.max(1, sys.cores) * 100 : 100;
+  const groups = (d && d.groups) || [];
+  const nCards = groups.filter((g) => g.kind === "card" && g.runnerAlive).length;
+  const orphans = groups.filter((g) => g.orphanCount > 0);
+  const share = (v) => `${Math.round((v / cap) * 100)}%`;
+  const Tile = ({ label, value, sub }) => (
+    <div className="bg-slate-800/60 border border-slate-700 rounded-lg px-3 py-2 min-w-0">
+      <div className="text-xs text-slate-400">{label}</div>
+      <div className="text-lg font-semibold">{value}</div>
+      {sub && <div className="text-xs text-slate-500 truncate">{sub}</div>}
+    </div>
+  );
+  return (
+    <Section title={`📈 오토파일럿 부하${sys ? ` · ${lv.label}` : ""} · 카드 ${nCards}건`} collapsible defaultOpen
+      right={<span className="text-xs text-slate-500">5초 갱신 · 서버가 10초마다 수집, 최근 30분 보관</span>}>
+      {!sys ? <p className="text-slate-500 text-sm">불러오는 중…</p> : (
+        <div className="space-y-4">
+          {sys.level !== "ok" && (
+            <div className={`text-sm rounded-lg border px-3 py-2 ${lv.cls}`}>
+              {lv.icon} {lv.label} — {sys.reasons.join(" · ")}. 동시 실행 수를 줄이거나 무거운 카드를 확인하세요.
+            </div>
+          )}
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+            <Tile label="시스템 load (1분)" value={<span>{sys.load1.toFixed(1)} <span className="text-sm text-slate-400">/ 코어 {sys.cores}</span></span>}
+              sub={`${sys.ratio}×코어 · 5분 ${sys.load5.toFixed(1)} · 15분 ${sys.load15.toFixed(1)}`} />
+            <Tile label="메모리 여유" value={sys.memFreePct == null ? "-" : `${sys.memFreePct}%`}
+              sub={`전체 ${gb(sys.memTotal)} · 스왑 ${gb(sys.swap.used)} / ${gb(sys.swap.total)}`} />
+            <Tile label="오토파일럿 CPU" value={share(d.autopilot.cpu)}
+              sub={`${coresText(d.autopilot.cpu)} · 기타 ${share(d.other.cpu)}`} />
+            <Tile label="오토파일럿 메모리" value={gb(d.autopilot.rss)}
+              sub={`프로세스 ${d.autopilot.count}개 · 기타 ${gb(d.other.rss)}`} />
+          </div>
+          <LoadTrend history={d.history} cores={sys.cores} />
+          {orphans.length > 0 && (
+            <div className="text-sm rounded-lg border px-3 py-2 bg-amber-500/10 text-amber-200 border-amber-500/40">
+              ▲ 러너 없이 남은 프로세스: {orphans.map((g) => `${g.key} ${g.orphanCount}개(${mb(g.orphanRss)})`).join(", ")} — 테스트 서버가 정리되지 않은 경우가 많습니다. 직접 확인 후 정리하세요.
+            </div>
+          )}
+          {groups.length === 0 ? <p className="text-slate-500 text-sm">지금 돌고 있는 오토파일럿 작업이 없습니다.</p> : (
+            <table className="w-full text-sm table-fixed">
+              <thead><tr className="text-left text-xs text-slate-400 border-b border-slate-700">
+                <th className="py-1 w-32">작업</th><th className="w-24">프로젝트</th><th className="w-28">단계</th>
+                <th className="w-44">CPU</th><th className="w-36">메모리</th><th className="w-16">프로세스</th><th className="w-24">실행 시간</th><th>무거운 프로세스</th>
+              </tr></thead>
+              <tbody>
+                {groups.map((g) => {
+                  const cpuPct = Math.min(100, (g.cpu / cap) * 100);
+                  const memPct = sys.memTotal ? Math.min(100, (g.rss / sys.memTotal) * 100) : 0;
+                  return (
+                    <tr key={g.id} className="border-b border-slate-800 align-top">
+                      <td className="py-1.5 font-mono text-indigo-300">{g.key}</td>
+                      <td className="text-slate-300 truncate">{g.project}</td>
+                      <td className="text-xs text-slate-300">
+                        {g.phases.length ? g.phases.map((p) => PHASE_LABEL[p] || p).join(" · ") : "-"}
+                        {g.orphanOnly && <span className="ml-1 text-amber-300">(러너 종료)</span>}
+                      </td>
+                      <td className="pr-3">
+                        <div className="flex items-center gap-2">
+                          <div className="flex-1 h-2 bg-slate-800 rounded"><div className="h-2 rounded" style={{ width: `${cpuPct}%`, background: LOAD_COLORS.ap }} /></div>
+                          <span className="text-xs text-slate-300 w-14 text-right">{coresText(g.cpu)}</span>
+                        </div>
+                      </td>
+                      <td className="pr-3">
+                        <div className="flex items-center gap-2">
+                          <div className="flex-1 h-2 bg-slate-800 rounded"><div className="h-2 rounded" style={{ width: `${memPct}%`, background: LOAD_COLORS.ap }} /></div>
+                          <span className="text-xs text-slate-300 w-14 text-right">{mb(g.rss)}</span>
+                        </div>
+                      </td>
+                      <td className="text-xs text-slate-300">{g.count}{g.orphanCount ? <span className="text-amber-300"> (고아 {g.orphanCount})</span> : ""}</td>
+                      <td className="text-xs text-slate-300">{durText(g.elapsedSec)}</td>
+                      <td className="text-xs text-slate-400 truncate" title={g.top.map((t) => `${t.label}×${t.count} ${coresText(t.cpu)} ${mb(t.rss)}`).join("\n")}>
+                        {g.top.filter((t) => t.cpu > 0 || t.orphan || t.rss > 50 * 1048576).map((t) => `${t.label}${t.count > 1 ? `×${t.count}` : ""} ${coresText(t.cpu)}·${mb(t.rss)}`).join(", ") || "대기 중"}
+                      </td>
+                    </tr>
+                  );
+                })}
+                <tr className="text-slate-500">
+                  <td className="py-1.5">기타</td><td colSpan="2" className="text-xs">대화형 세션·브라우저·Docker 등</td>
+                  <td className="text-xs pr-3 text-right">{coresText(d.other.cpu)}</td><td className="text-xs pr-3 text-right">{gb(d.other.rss)}</td>
+                  <td className="text-xs">{d.other.count}</td><td colSpan="2" />
+                </tr>
+              </tbody>
+            </table>
+          )}
+          <p className="text-xs text-slate-500">CPU 는 코어 단위(1.0코어 = 코어 하나를 꽉 씀)이고 막대는 전체 {sys.cores}코어 대비입니다. 메모리는 RSS 합이라 공유 메모리가 중복으로 셀 수 있고, Docker 컨테이너 안의 부하는 「기타」의 Docker VM 으로 잡힙니다.</p>
+        </div>
+      )}
+    </Section>
+  );
+}
+
 function SentryOverview({ onOpen, flash }) {
   const [data, setData] = useState(null);
   const [busy, setBusy] = useState("");
@@ -2271,6 +2438,7 @@ function App() {
 
       {/* 진행 중인 에픽 개요 + 연속 개발 (전역) */}
       {projects.length > 0 && <EpicRunsOverview onOpen={openEpic} jiraUrlFor={jiraUrlFor} />}
+      <LoadMonitor />
       {projects.length > 0 && <SentryOverview onOpen={openEpic} flash={flash} />}
       {projects.length > 0 && <EpicPanel projects={projects} flash={flash} jump={epicJump} />}
 
