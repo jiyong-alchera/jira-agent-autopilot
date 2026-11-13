@@ -107,3 +107,43 @@ test("pushHistory: 창 밖의 오래된 점을 밀어낸다", () => {
   M.pushHistory(h, { t: 160 }, 100);
   assert.deepEqual(h.map((x) => x.t), [160]);
 });
+
+test("orphanTargets: 러너 없는 카드의 작업 폴더 프로세스와 그 자손을 고른다", () => {
+  const ps = M.parsePs(PS + `\n  301   300   0.0  20000   10:00 /usr/local/bin/postgres -D /tmp/pg`);
+  const r = M.orphanTargets(ps, "AML-104");
+  assert.equal(r.runnerAlive, false);
+  assert.deepEqual(r.targets.map((t) => t.pid).sort(), [300, 301]);
+  assert.equal(r.targets.find((t) => t.pid === 301).label, "PostgreSQL");
+});
+
+test("orphanTargets: 같은 카드 러너가 살아 있으면 비운다", () => {
+  const ps = M.parsePs(PS + `\n  299     1   0.0  20000   10:00 /opt/jdk/bin/java -jar ${W}/repos/aml-lite-AML-110/target/app.jar`);
+  const r = M.orphanTargets(ps, "AML-110");
+  assert.equal(r.runnerAlive, true);
+  assert.deepEqual(r.targets, []);
+});
+
+test("orphanTargets: 종료 직전 러너(excludePids)는 러너로 치지 않는다", () => {
+  const ps = M.parsePs([
+    `  700     1   0.0   1000   10:00 bash ${W}/run-jira-agent.sh AML-130 build`,
+    `  701     1   9.0  90000   09:00 /opt/jdk/bin/java -jar ${W}/repos/aml-lite-AML-130/target/app.jar`,
+    `  702   700   0.0  30000   00:01 node ${W}/cleanup-orphans.js AML-130`,
+  ].join("\n"));
+  assert.equal(M.orphanTargets(ps, "AML-130").runnerAlive, true);
+  const r = M.orphanTargets(ps, "AML-130", { excludePids: [700, 702] });
+  assert.equal(r.runnerAlive, false);
+  assert.deepEqual(r.targets.map((t) => t.pid), [701]);
+});
+
+test("orphanTargets: 다른 카드·작업 폴더 밖 프로세스는 건드리지 않는다", () => {
+  const r = M.orphanTargets(M.parsePs(PS), "AML-999");
+  assert.deepEqual(r.targets, []);
+  const r2 = M.orphanTargets(M.parsePs(PS), "AML-104");
+  assert.ok(!r2.targets.some((t) => t.pid === 400 || t.pid === 600));
+});
+
+test("groupProcesses: 고아 그룹에 정리 확인용 orphans 목록을 싣는다", () => {
+  const { groups } = M.groupProcesses(M.parsePs(PS));
+  const g = groups.find((x) => x.id === "card:AML-104");
+  assert.deepEqual(g.orphans.map((o) => o.pid), [300]);
+});

@@ -1659,9 +1659,22 @@ function LoadTrend({ history, cores }) {
   );
 }
 
-function LoadMonitor() {
+function LoadMonitor({ flash }) {
   const [d, setD] = useState(null);
+  const [cleaning, setCleaning] = useState("");
   const load = useCallback(async () => { const r = await api.get("/api/monitor/load"); if (r.ok) setD(r); }, []);
+  const cleanup = async (g) => {
+    const list = (g.orphans || []).map((o) => `· ${o.label} (pid ${o.pid}, ${mb(o.rss)})`).join("\n");
+    if (!window.confirm(`${g.key} 작업 폴더에서 러너 없이 남은 프로세스를 종료할까요?\n\n${list}\n\n· SIGTERM 을 보내고 5초 뒤 남은 것만 강제 종료합니다(자식 프로세스 포함).\n· ${g.key} 러너가 다시 돌고 있으면 정리하지 않습니다.`)) return;
+    setCleaning(g.key);
+    try {
+      const r = await api.post(`/api/monitor/orphans/${g.key}/cleanup`);
+      flash && flash(r.ok ? (r.killed.length ? `${g.key} 고아 프로세스 ${r.killed.length}개 정리` : `${g.key} 정리할 프로세스가 없습니다`) : (r.message || "정리 실패"));
+    } finally {
+      setCleaning("");
+      setTimeout(load, 6500);
+    }
+  };
   useEffect(() => { load(); const t = setInterval(load, 5000); return () => clearInterval(t); }, [load]);
   const sys = d && d.system;
   const lv = LEVEL_STYLE[(sys && sys.level) || "ok"];
@@ -1700,7 +1713,18 @@ function LoadMonitor() {
           <LoadTrend history={d.history} cores={sys.cores} />
           {orphans.length > 0 && (
             <div className="text-sm rounded-lg border px-3 py-2 bg-amber-500/10 text-amber-200 border-amber-500/40">
-              ▲ 러너 없이 남은 프로세스: {orphans.map((g) => `${g.key} ${g.orphanCount}개(${mb(g.orphanRss)})`).join(", ")} — 테스트 서버가 정리되지 않은 경우가 많습니다. 직접 확인 후 정리하세요.
+              <div>▲ 러너 없이 남은 프로세스 — 테스트 서버가 정리되지 않은 경우가 많습니다. 러너가 끝날 때·병합 뒤 작업 폴더를 지울 때 자동 정리되고, 남은 것은 여기서 정리합니다.</div>
+              <div className="flex flex-wrap gap-2 mt-2">
+                {orphans.map((g) => (
+                  <span key={g.id} className="inline-flex items-center gap-2 bg-slate-900/60 border border-amber-500/30 rounded px-2 py-1 text-xs">
+                    <span className="font-mono">{g.key}</span>
+                    <span className="text-amber-100/80">{(g.orphans || []).map((o) => o.label).filter((v, i, a) => a.indexOf(v) === i).join("·")} {g.orphanCount}개 · {mb(g.orphanRss)}</span>
+                    {g.orphanOnly
+                      ? <button disabled={cleaning === g.key} onClick={() => cleanup(g)} className="px-2 py-0.5 rounded bg-amber-600 hover:bg-amber-500 disabled:opacity-50 text-white">{cleaning === g.key ? "정리 중…" : "정리"}</button>
+                      : <span className="text-slate-400" title="같은 카드의 러너가 돌고 있어, 진행 중인 테스트가 띄운 프로세스일 수 있습니다">러너 실행 중 — 끝나면 자동 정리</span>}
+                  </span>
+                ))}
+              </div>
             </div>
           )}
           {groups.length === 0 ? <p className="text-slate-500 text-sm">지금 돌고 있는 오토파일럿 작업이 없습니다.</p> : (
@@ -2438,7 +2462,7 @@ function App() {
 
       {/* 진행 중인 에픽 개요 + 연속 개발 (전역) */}
       {projects.length > 0 && <EpicRunsOverview onOpen={openEpic} jiraUrlFor={jiraUrlFor} />}
-      <LoadMonitor />
+      <LoadMonitor flash={flash} />
       {projects.length > 0 && <SentryOverview onOpen={openEpic} flash={flash} />}
       {projects.length > 0 && <EpicPanel projects={projects} flash={flash} jump={epicJump} />}
 

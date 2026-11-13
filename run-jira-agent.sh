@@ -208,7 +208,15 @@ release_lock() {
   rmdir "${LOCK_DIR}" 2>/dev/null || true
   rm -f "${LOCK_DIR}.phase" "${LOCK_DIR}.pid" 2>/dev/null || true
 }
-trap release_lock EXIT
+# 끝날 때 이 카드 작업 폴더에서 러너 없이 남은 프로세스(테스트로 띄운 서버 등)를 정리한다.
+# 같은 카드의 다른 러너(리뷰 루프 등)가 살아 있으면 cleanup-orphans.js 가 건너뛴다.
+cleanup_orphans() {
+  [[ -f "${SELF_DIR}/cleanup-orphans.js" ]] || return 0
+  command -v node >/dev/null 2>&1 || return 0
+  node "${SELF_DIR}/cleanup-orphans.js" "${ISSUE_KEY}" --exclude-pid "$$" 2>/dev/null || true
+}
+on_exit() { release_lock; cleanup_orphans; }
+trap on_exit EXIT
 
 # ===== 대상 repo 목록 파싱 (CARD_REPOS: name\turl\tbaseBranch\tenvSrc\tenvDest; 없으면 REPO_URL 단일) =====
 declare -a R_NAME R_URL R_BRANCH R_ENVSRC R_ENVDEST

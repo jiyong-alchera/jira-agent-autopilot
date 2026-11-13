@@ -399,11 +399,29 @@ async function repoPRReviews(repo, key, cred) {
   return out;
 }
 
+// 카드 작업 폴더에서 러너 없이 남은 프로세스를 정리(SIGTERM, 5초 뒤 남은 것만 SIGKILL).
+// 같은 카드의 러너가 살아 있으면 건너뛴다(lib-monitor.orphanTargets).
+function cleanupOrphans(key) {
+  let psOut = "";
+  try { psOut = execFileSync("ps", ["-axo", "pid=,ppid=,pcpu=,rss=,etime=,command="], { encoding: "utf8", maxBuffer: 16 << 20 }); }
+  catch (e) { return { ok: false, message: `ps 실패: ${e.message}`, killed: [] }; }
+  const { runnerAlive, targets } = monitorLib.orphanTargets(monitorLib.parsePs(psOut), key, { excludePids: [process.pid] });
+  if (runnerAlive) return { ok: false, runnerAlive: true, message: `${key} 러너가 실행 중이라 정리하지 않습니다`, killed: [] };
+  const sent = monitorLib.killTargets(targets, "SIGTERM");
+  if (sent.length) {
+    console.log(`[orphans] ${key} 정리: ${targets.map((t) => `${t.label}(${t.pid})`).join(", ")}`);
+    setTimeout(() => monitorLib.killTargets(targets.filter((t) => monitorLib.pidAlive(t.pid)), "SIGKILL"), 5000).unref();
+  }
+  return { ok: true, killed: targets.filter((t) => sent.includes(t.pid)) };
+}
+
 // 병합 완료된 카드의 clone 디렉토리(<repo이름>-<KEY>) 제거 — 작업 종료 후 디스크 정리. base 바로 아래 dir 만 안전 삭제.
+// 지우기 전에 그 폴더에서 돌던 고아 프로세스(테스트 서버 등)부터 정리한다 — 폴더가 사라지면 경로로 찾을 근거만 남는다.
 function removeCardClones(cfg, key) {
   const base = cfg.cloneBase || path.join(cfg.workDir || SCRIPTS_DIR, "repos");
   const removed = [], errors = [];
   if (fs.existsSync(path.join(base, ".state", `${key}.lock`))) return { removed, errors: ["처리 중(lock) — clone 제거 생략"] };
+  try { cleanupOrphans(key); } catch (e) { console.warn(`[orphans] ${key} 정리 실패:`, e.message); }
   let entries = [];
   try { entries = fs.readdirSync(base, { withFileTypes: true }); } catch { return { removed, errors }; }
   for (const ent of entries) {
@@ -1139,6 +1157,13 @@ async function sampleLoad() {
 }
 setInterval(sampleLoad, MONITOR_INTERVAL_MS).unref();
 sampleLoad();
+app.post("/api/monitor/orphans/:key/cleanup", (req, res) => {
+  const key = String(req.params.key || "");
+  if (!/^[A-Z][A-Z0-9]*-[0-9]+$/.test(key)) return res.status(400).json({ ok: false, message: "이슈 키 형식 오류" });
+  const r = cleanupOrphans(key);
+  setTimeout(sampleLoad, 6000).unref();   // SIGKILL 이후 상태가 화면에 바로 반영되게
+  res.json(r);
+});
 app.get("/api/monitor/load", async (req, res) => {
   if (!monitor.last) await sampleLoad();
   res.json({ ok: true, intervalMs: MONITOR_INTERVAL_MS, windowMs: MONITOR_WINDOW_MS, thresholds: monitorLib.DEFAULT_THRESHOLDS, ...(monitor.last || {}), history: monitor.history });

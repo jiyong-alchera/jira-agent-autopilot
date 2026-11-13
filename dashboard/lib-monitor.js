@@ -119,7 +119,8 @@ function groupProcesses(procs, { selfPids = [] } = {}) {
     const top = [...agg.values()].sort((a, b) => (b.cpu - a.cpu) || (b.rss - a.rss)).slice(0, 3)
       .map((a) => ({ ...a, cpu: round1(a.cpu) }));
     const { procs: _p, ...rest } = g;
-    return { ...rest, cpu: round1(g.cpu), orphanOnly: !g.runnerAlive && g.orphanCount > 0, top };
+    const orphans = g.procs.filter((q) => q.orphan).slice(0, 10).map((q) => ({ pid: q.pid, label: q.label, rss: q.rss }));
+    return { ...rest, cpu: round1(g.cpu), orphanOnly: !g.runnerAlive && g.orphanCount > 0, top, orphans };
   }).sort((a, b) => (b.cpu - a.cpu) || (b.rss - a.rss));
 
   return { groups: list, other: { ...other, cpu: round1(other.cpu) } };
@@ -163,4 +164,39 @@ function pushHistory(hist, point, windowMs) {
   return hist;
 }
 
-module.exports = { parsePs, matchRunner, etimeSec, procLabel, groupProcesses, parseSwap, parseMemFree, loadLevel, pushHistory, DEFAULT_THRESHOLDS };
+// 카드의 고아 프로세스(러너 조상 없이 작업 폴더 경로로만 잡힌 것)와 그 자손.
+// 같은 카드의 러너가 살아 있으면 비운다 — 진행 중인 테스트가 띄운 데몬일 수 있다.
+// excludePids: 러너로 치지 않을 pid(종료 직전인 자기 자신 등).
+function orphanTargets(procs, key, { excludePids = [] } = {}) {
+  const ex = new Set(excludePids.map(Number));
+  const view = procs.map((p) => (ex.has(p.pid) ? { ...p, cmd: "" } : p));
+  const { groups } = groupProcesses(view);
+  const g = groups.find((x) => x.id === `card:${key}`);
+  if (!g) return { runnerAlive: false, targets: [] };
+  if (g.runnerAlive) return { runnerAlive: true, targets: [] };
+  const roots = view.filter((p) => {
+    const w = p.cmd.match(WORKTREE_RE);
+    return w && w[1] === key;
+  });
+  const kids = new Map();
+  for (const p of view) { if (!kids.has(p.ppid)) kids.set(p.ppid, []); kids.get(p.ppid).push(p); }
+  const seen = new Set(), out = [];
+  const walk = (p) => {
+    if (seen.has(p.pid) || ex.has(p.pid)) return;
+    seen.add(p.pid);
+    out.push({ pid: p.pid, label: procLabel(p.cmd), rss: p.rss });
+    for (const c of kids.get(p.pid) || []) walk(c);
+  };
+  roots.forEach(walk);
+  return { runnerAlive: false, targets: out };
+}
+
+function pidAlive(pid) { try { process.kill(pid, 0); return true; } catch { return false; } }
+// 신호를 보낸 pid 목록을 돌려준다(이미 없는 pid 는 조용히 넘긴다).
+function killTargets(targets, signal) {
+  const done = [];
+  for (const t of targets) { try { process.kill(t.pid, signal); done.push(t.pid); } catch {} }
+  return done;
+}
+
+module.exports = { orphanTargets, pidAlive, killTargets, parsePs, matchRunner, etimeSec, procLabel, groupProcesses, parseSwap, parseMemFree, loadLevel, pushHistory, DEFAULT_THRESHOLDS };
