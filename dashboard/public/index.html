@@ -2443,7 +2443,7 @@ function App() {
       <LoadMonitor flash={flash} />
 
       {/* 루프 제어 (전역) */}
-      <Section title="루프 제어 (전 프로젝트 공통)" right={<div className="flex gap-2"><Btn color="green" onClick={syncMerged}>병합 동기화</Btn><Btn color="slate" onClick={loadProjects}>새로고침</Btn></div>}>
+      <Section title="루프 제어 (전 프로젝트 공통)" collapsible defaultOpen right={<div className="flex gap-2"><Btn color="green" onClick={syncMerged}>병합 동기화</Btn><Btn color="slate" onClick={loadProjects}>새로고침</Btn></div>}>
         <div className="grid grid-cols-3 gap-4">
           {["plan", "build", "review"].map((type) => {
             const running = status[type]?.running;
