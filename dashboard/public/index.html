@@ -1941,6 +1941,13 @@ function EpicPanel({ projects, flash, jump }) {
   const [autoConflict, setAutoConflict] = useState(false);    // base 충돌 자동 해소·재푸시
   const [conflictMin, setConflictMin] = useState("15");       // 대기(분)
   const [parallelExtra, setParallelExtra] = useState("0");    // 추가 동시 실행 수(0 = 순차)
+  // 입력 중인 숫자 칸은 5초 폴링이 서버 값으로 덮지 않는다(덮이면 blur 때 옛 값이 다시 저장된다).
+  const editingRef = React.useRef(new Set());
+  const editProps = (name, save) => ({
+    onFocus: () => editingRef.current.add(name),
+    onBlur: () => { editingRef.current.delete(name); save(); },
+    onKeyDown: (e) => { if (e.key === "Enter") e.currentTarget.blur(); },
+  });
   // 동시 실행 중 PR·로그를 볼 카드. 비우면 대표 카드(run.current). 폴링 콜백에서도 읽어야 해 ref 를 같이 둔다.
   const [focusKey, setFocusKeyState] = useState("");
   const focusRef = React.useRef("");
@@ -1980,10 +1987,11 @@ function EpicPanel({ projects, flash, jump }) {
     // 진행 중이거나 중단된 실행은 '그 실행이 실제로 쓰는 repo' 가 진실 — 기본값(전체 선택)으로 덮어쓰지 않는다.
     // (이걸 안 하면 3개만 골라 돌려도 패널엔 5개 전부 체크된 것처럼 보인다)
     if (st.opts) {
-      setAutoMerge(!!st.opts.autoMerge); setAutoMergeMin(String(st.opts.autoMergeAfterMin || 60));
-      setAutoRetry(!!st.opts.autoRetry); setAutoRetryMax(String(st.opts.autoRetryMax || 5));
-      setAutoConflict(!!st.opts.autoResolveConflict); setConflictMin(String(st.opts.conflictAfterMin || 15));
-      setParallelExtra(String(st.opts.parallelExtra || 0));
+      const ed = editingRef.current;
+      setAutoMerge(!!st.opts.autoMerge); if (!ed.has("autoMergeMin")) setAutoMergeMin(String(st.opts.autoMergeAfterMin || 60));
+      setAutoRetry(!!st.opts.autoRetry); if (!ed.has("autoRetryMax")) setAutoRetryMax(String(st.opts.autoRetryMax || 5));
+      setAutoConflict(!!st.opts.autoResolveConflict); if (!ed.has("conflictMin")) setConflictMin(String(st.opts.conflictAfterMin || 15));
+      if (!ed.has("parallelExtra")) setParallelExtra(String(st.opts.parallelExtra || 0));
     }
     // 승인까지 리뷰 루프는 build 단계 '안에서' 도는 별도 프로세스라 에픽 상태 파일에 안 나온다.
     // 이걸 안 보여주면 build 가 30분 넘게 멈춘 것처럼 보인다(실제로는 리뷰 회차가 진행 중).
@@ -2224,7 +2232,7 @@ function EpicPanel({ projects, flash, jump }) {
                 대기
                 <input type="number" min="1" max="1440" value={autoMergeMin} disabled={!autoMerge}
                   onChange={(e) => setAutoMergeMin(e.target.value)}
-                  onBlur={() => saveAutoMerge({ autoMerge, min: autoMergeMin })}
+                  {...editProps("autoMergeMin", () => saveAutoMerge({ autoMerge, min: autoMergeMin }))}
                   className="w-20 bg-slate-800 border border-slate-600 rounded px-2 py-1 text-sm disabled:opacity-40 focus:outline-none focus:border-indigo-400" />
                 분
               </label>
@@ -2250,7 +2258,7 @@ function EpicPanel({ projects, flash, jump }) {
                 최대
                 <input type="number" min="1" max="20" value={autoRetryMax} disabled={!autoRetry}
                   onChange={(e) => setAutoRetryMax(e.target.value)}
-                  onBlur={() => saveOpts({ autoRetry, autoRetryMax: parseInt(autoRetryMax, 10) || 5 }, "자동 재시도")}
+                  {...editProps("autoRetryMax", () => saveOpts({ autoRetry, autoRetryMax: parseInt(autoRetryMax, 10) || 5 }, "자동 재시도"))}
                   className="w-16 bg-slate-800 border border-slate-600 rounded px-2 py-1 text-sm disabled:opacity-40 focus:outline-none focus:border-indigo-400" />
                 회
               </label>
@@ -2268,7 +2276,7 @@ function EpicPanel({ projects, flash, jump }) {
                 대기
                 <input type="number" min="1" max="1440" value={conflictMin} disabled={!autoConflict}
                   onChange={(e) => setConflictMin(e.target.value)}
-                  onBlur={() => saveAutoConflict({ on: autoConflict, min: conflictMin })}
+                  {...editProps("conflictMin", () => saveAutoConflict({ on: autoConflict, min: conflictMin }))}
                   className="w-20 bg-slate-800 border border-slate-600 rounded px-2 py-1 text-sm disabled:opacity-40 focus:outline-none focus:border-indigo-400" />
                 분
               </label>
@@ -2286,7 +2294,7 @@ function EpicPanel({ projects, flash, jump }) {
                 추가 동시 실행
                 <input type="number" min="0" max="4" value={parallelExtra}
                   onChange={(e) => setParallelExtra(e.target.value)}
-                  onBlur={() => saveOpts({ parallelExtra: Math.max(0, Math.min(4, parseInt(parallelExtra, 10) || 0)) }, "동시 실행")}
+                  {...editProps("parallelExtra", () => saveOpts({ parallelExtra: Math.max(0, Math.min(4, parseInt(parallelExtra, 10) || 0)) }, "동시 실행"))}
                   className="w-16 bg-slate-800 border border-slate-600 rounded px-2 py-1 text-sm focus:outline-none focus:border-indigo-400" />
                 개
                 <InfoTip title="추가 동시 실행" text={"선행 카드(Jira 'is blocked by')가 남지 않은 하위 태스크를 여러 장 함께 개발합니다.\n\n· 0 이면 지금처럼 한 장씩 순차로 진행합니다. 최대 4(= 동시에 5장).\n· 순위순으로 빈 슬롯을 채웁니다. 선행 카드가 진행 중인 카드는 그 카드가 완료(병합)될 때까지 기다립니다.\n· 병합 대기 중인 카드도 슬롯을 차지합니다 — 열린 PR 수가 동시 실행 수로 제한됩니다.\n· 한 카드가 중단되면 새 카드는 시작하지 않고, 돌던 카드가 끝나면 전체가 멈춥니다. [이어서 진행]은 카드마다 멈춘 단계부터 재개합니다.\n· 실행 중에 바꾸면 다음에 슬롯을 채울 때부터 반영됩니다(줄여도 돌던 카드는 끝까지 갑니다).\n· 같은 repo 를 고치는 카드끼리는 병합 시 base 충돌이 날 수 있고, 사용량(토큰)이 동시 실행 수만큼 빨리 소진됩니다."} />
