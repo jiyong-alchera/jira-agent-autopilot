@@ -1500,13 +1500,23 @@ function EpicRunsOverview({ onOpen, jiraUrlFor }) {
   const [runs, setRuns] = useState(null);
   const load = useCallback(async () => { const r = await api.get("/api/epics/runs"); if (r.ok) setRuns(r.runs || []); }, []);
   useEffect(() => { load(); const t = setInterval(load, 5000); return () => clearInterval(t); }, [load]);
-  const list = runs || [];
+  // 멈춘 에픽 숨기기 — 브라우저별로 기억한다. 숨길 때의 updatedAt 과 달라지면(재개·재시도 등) 다시 보인다.
+  const HIDE_KEY = "epicRunsHidden";
+  const [hidden, setHidden] = useState(() => { try { return JSON.parse(localStorage.getItem(HIDE_KEY) || "{}"); } catch { return {}; } });
+  const saveHidden = (h) => { setHidden(h); try { localStorage.setItem(HIDE_KEY, JSON.stringify(h)); } catch {} };
+  const rid = (r) => `${r.project}:${r.epic}`;
+  const all = runs || [];
+  const isHidden = (r) => !r.running && rid(r) in hidden && hidden[rid(r)] === (r.updatedAt || "");
+  const list = all.filter((r) => !isHidden(r));
+  const nHidden = all.length - list.length;
   const nRun = list.filter((r) => r.running).length;
   return (
     <Section title={`진행 중인 에픽 (전 프로젝트) · 실행 ${nRun}건${list.length > nRun ? ` · 멈춤 ${list.length - nRun}건` : ""}`} collapsible defaultOpen
-      right={<span className="text-xs text-slate-500">5초 자동 갱신 · [열기] 로 아래 연속 개발 패널에서 로그·PR·조작</span>}>
+      right={<span className="text-xs text-slate-500">
+        {nHidden > 0 && <button onClick={() => saveHidden({})} className="mr-2 underline text-slate-400 hover:text-slate-200" title="숨긴 멈춘 에픽을 다시 표시합니다">숨김 {nHidden}건 다시 보기</button>}
+        5초 자동 갱신 · [열기] 로 아래 연속 개발 패널에서 로그·PR·조작</span>}>
       {runs === null ? <p className="text-slate-500 text-sm">불러오는 중…</p>
-        : list.length === 0 ? <p className="text-slate-500 text-sm">돌고 있거나 멈춘 연속 개발이 없습니다.</p>
+        : list.length === 0 ? <p className="text-slate-500 text-sm">{nHidden ? "표시할 연속 개발이 없습니다(멈춘 에픽은 숨김)." : "돌고 있거나 멈춘 연속 개발이 없습니다."}</p>
         : (
           <div className="space-y-2">
             {list.map((r) => {
@@ -1524,14 +1534,18 @@ function EpicRunsOverview({ onOpen, jiraUrlFor }) {
                       <span className="ml-2">
                         {r.running
                           ? <span className="text-indigo-200">▶ 진행 중{r.stopping ? " · 중지 요청됨" : ""} · 완료 {r.index}/{r.total || "?"}</span>
-                          : <span className="text-amber-200">⏸ {r.status === "stopped" ? "중지됨" : "중단됨"} — {r.reason || "사유 없음"}</span>}
+                          : <span className="text-amber-200" title={r.reason || ""}>⏸ {r.status === "stopped" ? "중지됨" : "중단됨"} — {(r.reason || "사유 없음").length > 140 ? `${r.reason.slice(0, 140)}…` : (r.reason || "사유 없음")}</span>}
                       </span>
                       {!r.running && r.retry && r.retry.willRetry && (
                         <span className="ml-2 text-xs text-emerald-300">🔄 자동 재시도 {r.retry.attempt + 1}/{r.retry.max}{r.retry.at ? ` · ${new Date(r.retry.at).toLocaleTimeString()}` : ""}</span>
                       )}
                       {r.updatedAt && <span className="ml-2 text-xs text-slate-500">갱신 {sinceText(r.updatedAt)} 전</span>}
                     </div>
-                    <Btn color="slate" onClick={() => onOpen(r.project, r.epic)}>열기</Btn>
+                    <div className="flex gap-2 shrink-0">
+                      {!r.running && <span title="이 목록에서만 숨깁니다(실행 기록·재개는 그대로). 다시 돌기 시작하면 자동으로 다시 보입니다.">
+                        <Btn color="slate" onClick={() => saveHidden({ ...hidden, [rid(r)]: r.updatedAt || "" })}>숨기기</Btn></span>}
+                      <Btn color="slate" onClick={() => onOpen(r.project, r.epic)}>열기</Btn>
+                    </div>
                   </div>
                   {r.workers.length > 0 && (
                     <table className="w-full text-sm table-fixed mt-2">
