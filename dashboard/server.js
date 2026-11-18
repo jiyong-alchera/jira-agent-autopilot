@@ -1008,6 +1008,8 @@ async function retryPausedEpics() {
       const key = f.replace(/\.epic\.json$/, "");
       let st;
       try { st = epicRunStatus(cfg, key); } catch { continue; }
+      // 프로젝트끼리 상태 폴더를 공유하면 남의 에픽도 보인다 — 실행 기록의 프로젝트로만 다시 띄운다.
+      if (!lib.epicOwnedBy(st, cfg.id)) continue;
       if (st.running) continue;                    // 돌고 있으면 둔다(카운터는 signature 로만 리셋)
       if (st.status !== "paused") {
         if (st.status === "done" || st.status === "stopped") clearEpicRetry(cfg, key);

@@ -549,6 +549,11 @@ function epicResumePoints(st, skip) {
 // 프로젝트들이 cloneBase(.state)를 공유하면 같은 상태 파일이 프로젝트마다 잡히므로 에픽 키로 한 번만 —
 // 상태 파일에 적힌 project 와 맞는 쪽을 쓴다.
 const EPIC_RUN_VISIBLE = ["running", "paused", "stopped"];
+// 에픽 실행 기록이 이 프로젝트 것인지. 기록에 프로젝트가 없으면(옛 기록) 어느 프로젝트에서 봐도 내 것으로 친다.
+function epicOwnedBy(st, projectId) {
+  return !(st && st.project) || st.project === projectId;
+}
+
 function summarizeEpicRuns(entries) {
   const byEpic = new Map();
   for (const e of entries || []) {
@@ -1059,6 +1064,7 @@ function rebaseMergeUnsupported(stderr) {
 }
 
 module.exports = {
+  epicOwnedBy,
   DEFAULT_CREDS, readJson, writeJson, slugify, triggerClause, detectJql,
   adfToText, adfSegments, toADF, mdInline, mdToADF, buildReplyADF, maskCreds, applyCreds, createStore, doneStatusList, effectiveDoneStatuses,
   REPO_LABEL_PREFIX, repoNameFromUrl, normalizeRepos, cardRepos, epicPrepareLabelDiff, REVIEW_APPROVED_MARKER,

@@ -897,3 +897,10 @@ test("awaitMergeEntryNotice: CI 진행·미승인·조회 실패·PR 없음은 �
   assert.equal(lib.awaitMergeEntryNotice([{ ci: "pass", approved: true }], "gh 실패"), "waiting");
   assert.equal(lib.awaitMergeEntryNotice([], ""), "waiting");
 });
+
+test("epicOwnedBy: 상태 폴더를 공유하는 다른 프로젝트의 에픽은 내 것이 아니다", () => {
+  const lib = require("../lib");
+  assert.equal(lib.epicOwnedBy({ project: "physicalai" }, "physicalai"), true);
+  assert.equal(lib.epicOwnedBy({ project: "physicalai" }, "ekyb"), false);
+  assert.equal(lib.epicOwnedBy({}, "ekyb"), true);
+});
