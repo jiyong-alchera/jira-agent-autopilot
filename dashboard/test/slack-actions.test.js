@@ -2,7 +2,7 @@ const test = require("node:test");
 const assert = require("node:assert");
 const path = require("path");
 const lib = require("../lib");
-const { handleInteractive, resultLine } = require("../slack-socket");
+const { handleInteractive, resultLine, decisionSummary } = require("../slack-socket");
 
 const act = (o) => ({ id: "merge", project: "ekyb", key: "EKYB-1", owner: "Org/repo", number: 7, ...o });
 
@@ -211,4 +211,30 @@ test("같은 동작 버튼이 여럿이어도 action_id 가 겹치지 않는다(
   const ids = m.blocks.flatMap((b) => (b.elements || []).map((e) => e.action_id)).filter(Boolean);
   assert.strictEqual(new Set(ids).size, ids.length);
   assert.ok(ids.every((id) => id.startsWith(lib.SLACK_ACTION_PREFIX)));
+});
+
+test("선택 성공 뒤 Slack 에는 질문·고른 것·코멘트·다음 진행만 남는다", () => {
+  const t = decisionSummary("AML-208", { ok: true, option: "b", label: "후속 카드로 나누기", question: "틀 전환을 어디서?", posted: ["Org/r#145", "AML-208"], retry: { ok: true, message: "러너에 넘겼습니다 — 1분 안에 AML-208 를 approve 단계부터 다시 시작합니다." } }, "U1");
+  assert.match(t, /^🗳 \[AML-208\] 결정 \(b\) — 후속 카드로 나누기 · <@U1>/);
+  assert.match(t, /• 질문: 틀 전환을 어디서\?/);
+  assert.match(t, /• 결정 코멘트: Org\/r#145, AML-208/);
+  assert.match(t, /• 다음: 러너에 넘겼습니다/);
+  assert.match(decisionSummary("K-1", { ok: true, option: "a", posted: [], retry: { ok: false, message: "멈춘 카드가 아닙니다" } }, "U1"), /⚠️ 다시 시도는 하지 않았습니다 — 멈춘 카드가 아닙니다/);
+});
+
+test("handleInteractive: 선택 버튼 성공이면 원본을 결정 요약으로 바꾼다", async () => {
+  const sent = [];
+  const realFetch = global.fetch;
+  global.fetch = async (url, o) => { sent.push(JSON.parse(o.body)); return { ok: true, text: async () => "" }; };
+  try {
+    const value = lib.encodeSlackAction({ id: "decide", project: "p", key: "AML-208", epic: "AML-164", step: "b" });
+    await handleInteractive({ type: "block_actions", response_url: "https://hooks/x", user: { id: "U1" }, actions: [{ action_id: "jaa:decide", value }] }, {
+      getProjectCreds: () => ({ slackAllowUsers: "U1" }), baseUrl: "http://x",
+      runAction: async () => ({ ok: true, option: "b", label: "나누기", question: "q?", posted: ["AML-208"], retry: { ok: true, message: "다시 시도" } }),
+    });
+  } finally { global.fetch = realFetch; }
+  const last = sent[sent.length - 1];
+  assert.match(last.text, /^🗳 \[AML-208\] 결정 \(b\) — 나누기/);
+  assert.strictEqual(last.replace_original, true);
+  assert.strictEqual(last.blocks, undefined);   // 버튼은 사라진다(중복 선택 방지)
 });

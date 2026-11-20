@@ -1345,7 +1345,7 @@ async function applyDecision(cfg, cred, projectId, key, optionId, o) {
   try { fs.unlinkSync(file); } catch {}
   const epic = String(opt0.epic || d.epic || "");
   const retry = /^[A-Z][A-Z0-9]+-[0-9]+$/.test(epic) ? epicCardRetry(cfg, projectId, epic, key, false) : { ok: false, message: "에픽 정보가 없어 다시 시도는 하지 않았습니다." };
-  return { ok: true, option: opt.id, label: opt.label, posted, retry, message: `결정 (${opt.id})${opt0.auto ? " · 자동" : ""} 코멘트를 남겼습니다(${posted.join(", ")}). ${retry.message || ""}`.trim() };
+  return { ok: true, option: opt.id, label: opt.label, question: d.question || "", posted, retry, message: `결정 (${opt.id})${opt0.auto ? " · 자동" : ""} 코멘트를 남겼습니다(${posted.join(", ")}). ${retry.message || ""}`.trim() };
 }
 app.post("/api/cards/:key/decide", async (req, res) => {
   const key = req.params.key;

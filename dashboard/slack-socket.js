@@ -59,6 +59,21 @@ function resultLine(actId, r) {
   }
 }
 
+// [선택] 성공 뒤 원본 자리에 남길 글 — 무엇을 물었고 무엇을 골랐고, 그래서 무엇이 진행되는지만 남긴다.
+// 선택지 목록·원인 요약은 결정 코멘트(PR·Jira)에 그대로 있으니 Slack 에는 결과만.
+function decisionSummary(key, r, userId) {
+  const retry = r.retry || {};
+  const next = retry.ok === false
+    ? `⚠️ 다시 시도는 하지 않았습니다 — ${retry.message || "사유 없음"}. 대시보드에서 [이어서 진행] 하세요.`
+    : (retry.message || "카드를 다시 시도합니다.");
+  return [
+    `🗳 [${key}] 결정 (${r.option}) — ${r.label || ""} · <@${userId}>`,
+    ...(r.question ? [`• 질문: ${r.question}`] : []),
+    `• 결정 코멘트: ${(r.posted || []).join(", ") || "(없음)"}`,
+    `• 다음: ${next}`,
+  ].join("\n");
+}
+
 // 원본 메시지를 결과로 교체한다 — 버튼이 사라지므로 중복 클릭·이중 병합이 막힌다.
 async function respond(responseUrl, text, replaceOriginal, blocks) {
   if (!responseUrl) return;
@@ -107,7 +122,8 @@ async function handleInteractive(payload, deps) {
   const failed = !r || r.ok === false;
   // 실패 → 버튼을 살려둬 다시 누를 수 있게, 성공 → 결과로 교체해 이중 실행을 막는다.
   const keep = failed ? blocksWithNote(original, `${line} · <@${userId}>`) : null;
-  await respond(responseUrl, `[${act.key}] ${label} · <@${userId}>\n${line}`, true, keep);
+  const done = !failed && act.id === "decide" ? decisionSummary(act.key, r, userId) : `[${act.key}] ${label} · <@${userId}>\n${line}`;
+  await respond(responseUrl, done, true, keep);
   return r;
 }
 
@@ -138,4 +154,4 @@ function startSlackSocket(deps) {
   return { clients };
 }
 
-module.exports = { startSlackSocket, handleInteractive, runAction, resultLine };
+module.exports = { startSlackSocket, handleInteractive, runAction, resultLine, decisionSummary };
