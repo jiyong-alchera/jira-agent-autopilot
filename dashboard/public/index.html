@@ -1941,6 +1941,8 @@ function EpicPanel({ projects, flash, jump }) {
   const [autoConflict, setAutoConflict] = useState(false);    // base 충돌 자동 해소·재푸시
   const [conflictMin, setConflictMin] = useState("15");       // 대기(분)
   const [parallelExtra, setParallelExtra] = useState("0");    // 추가 동시 실행 수(0 = 순차)
+  const [autoDecide, setAutoDecide] = useState(false);        // 결정 대기 시 권장안으로 자동 결정
+  const [decideMin, setDecideMin] = useState("60");           // 대기(분)
   // 입력 중인 숫자 칸은 5초 폴링이 서버 값으로 덮지 않는다(덮이면 blur 때 옛 값이 다시 저장된다).
   const editingRef = React.useRef(new Set());
   const editProps = (name, save) => ({
@@ -1992,6 +1994,7 @@ function EpicPanel({ projects, flash, jump }) {
       setAutoRetry(!!st.opts.autoRetry); if (!ed.has("autoRetryMax")) setAutoRetryMax(String(st.opts.autoRetryMax || 5));
       setAutoConflict(!!st.opts.autoResolveConflict); if (!ed.has("conflictMin")) setConflictMin(String(st.opts.conflictAfterMin || 15));
       if (!ed.has("parallelExtra")) setParallelExtra(String(st.opts.parallelExtra || 0));
+      setAutoDecide(!!st.opts.autoDecide); if (!ed.has("decideMin")) setDecideMin(String(st.opts.autoDecideAfterMin || 60));
     }
     // 승인까지 리뷰 루프는 build 단계 '안에서' 도는 별도 프로세스라 에픽 상태 파일에 안 나온다.
     // 이걸 안 보여주면 build 가 30분 넘게 멈춘 것처럼 보인다(실제로는 리뷰 회차가 진행 중).
@@ -2035,6 +2038,7 @@ function EpicPanel({ projects, flash, jump }) {
       autoRetry, autoRetryMax: parseInt(autoRetryMax, 10) || 5,
       autoResolveConflict: autoConflict, conflictAfterMin: parseInt(conflictMin, 10) || 15,
       parallelExtra: parseInt(parallelExtra, 10) || 0,
+      autoDecide, autoDecideAfterMin: parseInt(decideMin, 10) || 60,
     });
     if (r.ok) { setNewRunMode(false); repoTouched.current = false; }
     return r;
@@ -2261,6 +2265,23 @@ function EpicPanel({ projects, flash, jump }) {
                   {...editProps("autoRetryMax", () => saveOpts({ autoRetry, autoRetryMax: parseInt(autoRetryMax, 10) || 5 }, "자동 재시도"))}
                   className="w-16 bg-slate-800 border border-slate-600 rounded px-2 py-1 text-sm disabled:opacity-40 focus:outline-none focus:border-indigo-400" />
                 회
+              </label>
+            </div>
+
+            {/* 결정 대기 자동 결정 — 에이전트가 선택지를 내고 멈췄는데 아무도 고르지 않으면 권장안으로 정한다 */}
+            <div className="flex items-center gap-3 flex-wrap mt-2 pt-2 border-t border-slate-700/70">
+              <label className="inline-flex items-center gap-1.5 text-sm text-slate-300">
+                <input type="checkbox" checked={autoDecide}
+                  onChange={(e) => { setAutoDecide(e.target.checked); saveOpts({ autoDecide: e.target.checked, autoDecideAfterMin: parseInt(decideMin, 10) || 60 }, "결정 대기 자동 결정"); }} />
+                결정 대기 시 자동 결정
+                <InfoTip title="결정 대기 시 자동 결정" text={"리뷰 반영 중 에이전트가 '담당자가 정해야 한다'며 선택지(a·b …)를 내고 멈췄을 때, 정한 시간 안에 아무도 고르지 않으면 에이전트 권장안으로 대신 정합니다.\n\n· 권장안은 에이전트가 서비스 안정성(운영 중단·데이터 손상·회귀 위험이 가장 작고 되돌리기 쉬운 쪽)을 최우선으로 고른 것입니다. Slack 알림에 ★ 와 '(권장)' 으로 표시됩니다.\n· 시간은 중단 알림을 보낸 때부터 셉니다. 그 전에 Slack 에서 고르면 그 선택이 우선합니다.\n· 자동 결정도 PR·Jira 에 '[결정 (b) · 자동]' 코멘트를 남기고 그 카드를 다시 시도합니다. 결과는 Slack 으로 알립니다.\n· 권장안이 없는 선택지는 자동으로 정하지 않습니다. 선택지에 사람만 할 수 있는 일(후속 카드 만들기 등)이 있으면 그 일은 여전히 사람이 해야 합니다.\n· 대시보드가 켜져 있어야 동작합니다."} />
+              </label>
+              <label className={`inline-flex items-center gap-1.5 text-sm ${autoDecide ? "text-slate-300" : "text-slate-600"}`}>
+                <input type="number" min="5" max="1440" value={decideMin} disabled={!autoDecide}
+                  onChange={(e) => setDecideMin(e.target.value)}
+                  {...editProps("decideMin", () => saveOpts({ autoDecide, autoDecideAfterMin: parseInt(decideMin, 10) || 60 }, "결정 대기 자동 결정"))}
+                  className="w-20 bg-slate-800 border border-slate-600 rounded px-2 py-1 text-sm disabled:opacity-40 focus:outline-none focus:border-indigo-400" />
+                분 뒤
               </label>
             </div>
 

@@ -107,6 +107,7 @@ const DEFAULT_OPTS = {
   autoResolveConflict: process.env.EPIC_AUTO_RESOLVE_CONFLICT === "1",
   conflictAfterMin: lib.clampConflictMin(process.env.EPIC_CONFLICT_AFTER_MIN),
   parallelExtra: lib.clampParallelExtra(process.env.EPIC_PARALLEL_EXTRA),
+  autoDecide: false, autoDecideAfterMin: lib.EPIC_DECIDE_MIN_DEFAULT,
 };
 function readOpts() {
   try {
@@ -115,6 +116,7 @@ function readOpts() {
       autoMerge: !!o.autoMerge, autoMergeAfterMin: lib.clampAutoMergeMin(o.autoMergeAfterMin),
       autoResolveConflict: !!o.autoResolveConflict, conflictAfterMin: lib.clampConflictMin(o.conflictAfterMin),
       parallelExtra: o.parallelExtra === undefined ? DEFAULT_OPTS.parallelExtra : lib.clampParallelExtra(o.parallelExtra),
+      autoDecide: !!o.autoDecide, autoDecideAfterMin: lib.clampDecideMin(o.autoDecideAfterMin),
     };
   } catch { return DEFAULT_OPTS; }
 }
@@ -778,14 +780,21 @@ async function failureNotice(r, tail) {
   const btns = [];
   try { fs.unlinkSync(decisionFile(r.key)); } catch {}
   if (dg.decision) {
-    lines.push(`*결정 필요* ${dg.decision.question}`, ...dg.decision.options.map((o) => `• ${o.id}) ${o.label}`));
+    const rec = dg.decision.recommended;
+    const opts = readOpts();
+    const mark = (o) => (rec && rec.id === o.id ? " (권장)" : "");
+    lines.push(`*결정 필요* ${dg.decision.question}`, ...dg.decision.options.map((o) => `• ${o.id}) ${o.label}${mark(o)}`));
+    if (rec && rec.why) lines.push(`권장 이유(서비스 안정성 우선): ${rec.why}`);
     lines.push("선택지를 누르면 PR·Jira 에 결정 코멘트를 남기고 이 카드를 다시 시도합니다.");
+    if (opts.autoDecide && rec) lines.push(`⏱ ${opts.autoDecideAfterMin}분 안에 고르지 않으면 권장안 ${rec.id}) 로 자동 결정합니다.`);
+    else if (opts.autoDecide) lines.push("⏱ 권장안이 없어 자동 결정은 하지 않습니다 — 직접 골라 주세요.");
     try {
       fs.writeFileSync(decisionFile(r.key), JSON.stringify({
         card: r.key, epic: EPIC_KEY, project: project.id, question: dg.decision.question, options: dg.decision.options,
+        recommended: dg.decision.recommended || null,
         owner: pr ? pr.owner : "", number: pr ? String(pr.number) : "", at: nowIso(),
       }, null, 2));
-      for (const o of dg.decision.options) btns.push({ id: "decide", project: project.id, key: r.key, epic: EPIC_KEY, step: o.id, label: `${o.id}) ${o.label}` });
+      for (const o of dg.decision.options) btns.push({ id: "decide", project: project.id, key: r.key, epic: EPIC_KEY, step: o.id, label: `${o.id}) ${mark(o) ? "★ " : ""}${o.label}` });
     } catch {}
   }
   if (tail) lines.push(tail);

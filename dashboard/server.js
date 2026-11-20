@@ -808,6 +808,7 @@ function readEpicOpts(cfg, key) {
       autoRetry: !!o.autoRetry, autoRetryMax: lib.clampRetryMax(o.autoRetryMax),
       autoResolveConflict: !!o.autoResolveConflict, conflictAfterMin: lib.clampConflictMin(o.conflictAfterMin),
       parallelExtra: lib.clampParallelExtra(o.parallelExtra),
+      autoDecide: !!o.autoDecide, autoDecideAfterMin: lib.clampDecideMin(o.autoDecideAfterMin),
     };
   } catch {
     return {
@@ -815,6 +816,7 @@ function readEpicOpts(cfg, key) {
       autoRetry: false, autoRetryMax: lib.EPIC_RETRY_MAX_DEFAULT,
       autoResolveConflict: false, conflictAfterMin: lib.EPIC_CONFLICT_MIN_DEFAULT,
       parallelExtra: 0,
+      autoDecide: false, autoDecideAfterMin: lib.EPIC_DECIDE_MIN_DEFAULT,
     };
   }
 }
@@ -824,6 +826,7 @@ function writeEpicOpts(cfg, key, next) {
     autoRetry: !!next.autoRetry, autoRetryMax: lib.clampRetryMax(next.autoRetryMax),
     autoResolveConflict: !!next.autoResolveConflict, conflictAfterMin: lib.clampConflictMin(next.conflictAfterMin),
     parallelExtra: lib.clampParallelExtra(next.parallelExtra),
+    autoDecide: !!next.autoDecide, autoDecideAfterMin: lib.clampDecideMin(next.autoDecideAfterMin),
   };
   try { fs.mkdirSync(stateDirOf(cfg), { recursive: true }); fs.writeFileSync(epicOptsPath(cfg, key), JSON.stringify(o, null, 2)); } catch {}
   return o;
@@ -1239,6 +1242,7 @@ app.post("/api/epics/:key/run", async (req, res) => {
     const opts = writeEpicOpts(cfg, key, {
       autoMerge: b.autoMerge, autoMergeAfterMin: b.autoMergeAfterMin, autoRetry: b.autoRetry, autoRetryMax: b.autoRetryMax,
       autoResolveConflict: b.autoResolveConflict, conflictAfterMin: b.conflictAfterMin, parallelExtra: b.parallelExtra,
+      autoDecide: b.autoDecide, autoDecideAfterMin: b.autoDecideAfterMin,
     });
     try { fs.unlinkSync(epicConflictPath(cfg, key)); } catch {}   // 이전 실행에 남은 충돌 해소 요청은 버린다
     clearEpicRetry(cfg, key);   // 새 실행이므로 재시도 카운터 초기화
@@ -1316,36 +1320,75 @@ app.post("/api/epics/:key/run/card", (req, res) => {
     res.json(epicCardRetry(cfg, id, key, card, !!(req.body || {}).skip));
   } catch (e) { fail(res, e); }
 });
-// 에이전트가 낸 선택지 중 하나를 고른다(Slack [선택] 버튼). 결정 코멘트를 PR·Jira 에 남긴 뒤 그 카드를 다시 시도한다.
-// 선택지는 러너가 중단 알림을 보낼 때 남긴 <KEY>.decision.json 에서 읽는다 — 버튼 value 에는 선택지 id 만 싣는다.
+// 에이전트가 낸 선택지 중 하나를 고른다(Slack [선택] 버튼 · 결정 대기 자동 결정 공용). 결정 코멘트를 PR·Jira 에 남긴 뒤
+// 그 카드를 다시 시도한다. 선택지는 러너가 중단 알림을 보낼 때 남긴 <KEY>.decision.json 에서 읽는다 — 버튼 value 에는 선택지 id 만 싣는다.
+const decisionPath = (cfg, key) => path.join(stateDirOf(cfg), `${key}.decision.json`);
+async function applyDecision(cfg, cred, projectId, key, optionId, o) {
+  const opt0 = o || {};
+  const file = decisionPath(cfg, key);
+  const d = lib.readJson(file, null);
+  if (!d || !Array.isArray(d.options)) return { ok: false, message: "고를 선택지가 없습니다(이미 골랐거나 카드가 다시 시작됨)." };
+  const opt = d.options.find((x) => x.id === String(optionId || ""));
+  if (!opt) return { ok: false, message: "알 수 없는 선택지입니다." };
+  const body = lib.decisionComment(d, opt, opt0.auto || null);
+  const posted = [];
+  if (d.owner && d.number) {
+    const tmp = path.join(stateDirOf(cfg), `${key}.decision-comment.md`);
+    fs.writeFileSync(tmp, body);
+    const r = await gh(["pr", "comment", String(d.number), "--repo", d.owner, "--body-file", tmp], cred);
+    try { fs.unlinkSync(tmp); } catch {}
+    if (!r.ok) return { ok: false, message: `PR 코멘트 실패: ${(r.stderr || "").slice(0, 160)}` };
+    posted.push(`${d.owner}#${d.number}`);
+  }
+  try { await jiraReq("POST", `/rest/api/3/issue/${encodeURIComponent(key)}/comment`, { body: mdToADF(body) }, cfg, cred); posted.push(key); }
+  catch (e) { return { ok: false, message: `Jira 코멘트 실패: ${String(e.message || e).slice(0, 160)}`, posted }; }
+  try { fs.unlinkSync(file); } catch {}
+  const epic = String(opt0.epic || d.epic || "");
+  const retry = /^[A-Z][A-Z0-9]+-[0-9]+$/.test(epic) ? epicCardRetry(cfg, projectId, epic, key, false) : { ok: false, message: "에픽 정보가 없어 다시 시도는 하지 않았습니다." };
+  return { ok: true, option: opt.id, label: opt.label, posted, retry, message: `결정 (${opt.id})${opt0.auto ? " · 자동" : ""} 코멘트를 남겼습니다(${posted.join(", ")}). ${retry.message || ""}`.trim() };
+}
 app.post("/api/cards/:key/decide", async (req, res) => {
   const key = req.params.key;
   if (!/^[A-Z][A-Z0-9]+-[0-9]+$/.test(key)) return res.status(400).json({ ok: false, message: "이슈 키 형식 오류" });
   try {
     const { id, cfg, cred } = resolveProject(req);
-    const file = path.join(stateDirOf(cfg), `${key}.decision.json`);
-    const d = lib.readJson(file, null);
-    if (!d || !Array.isArray(d.options)) return res.json({ ok: false, message: "고를 선택지가 없습니다(이미 골랐거나 카드가 다시 시작됨)." });
-    const opt = d.options.find((o) => o.id === String((req.body || {}).option || ""));
-    if (!opt) return res.json({ ok: false, message: "알 수 없는 선택지입니다." });
-    const body = lib.decisionComment(d, opt);
-    const posted = [];
-    if (d.owner && d.number) {
-      const tmp = path.join(stateDirOf(cfg), `${key}.decision-comment.md`);
-      fs.writeFileSync(tmp, body);
-      const r = await gh(["pr", "comment", String(d.number), "--repo", d.owner, "--body-file", tmp], cred);
-      try { fs.unlinkSync(tmp); } catch {}
-      if (!r.ok) return res.json({ ok: false, message: `PR 코멘트 실패: ${(r.stderr || "").slice(0, 160)}` });
-      posted.push(`${d.owner}#${d.number}`);
-    }
-    try { await jiraReq("POST", `/rest/api/3/issue/${encodeURIComponent(key)}/comment`, { body: mdToADF(body) }, cfg, cred); posted.push(key); }
-    catch (e) { return res.json({ ok: false, message: `Jira 코멘트 실패: ${String(e.message || e).slice(0, 160)}` }); }
-    try { fs.unlinkSync(file); } catch {}
-    const epic = String((req.body || {}).epic || d.epic || "");
-    const retry = /^[A-Z][A-Z0-9]+-[0-9]+$/.test(epic) ? epicCardRetry(cfg, id, epic, key, false) : { ok: false, message: "에픽 정보가 없어 다시 시도는 하지 않았습니다." };
-    res.json({ ok: true, option: opt.id, posted, retry, message: `결정 (${opt.id}) 코멘트를 남겼습니다(${posted.join(", ")}). ${retry.message || ""}`.trim() });
+    res.json(await applyDecision(cfg, cred, id, key, (req.body || {}).option, { epic: (req.body || {}).epic }));
   } catch (e) { fail(res, e); }
 });
+// 결정 대기 자동 결정 — 에픽 옵션 autoDecide 가 켜져 있고, 선택지가 나온 뒤 autoDecideAfterMin 분이 지나도
+// 아무도 고르지 않았으면 에이전트 권장안(DECISION_DEFAULT, 서비스 안정성 우선)으로 정한다. 러너는 멈추면 끝나므로 여기서 본다.
+// 한 선택지는 한 번만 시도한다(autoTriedAt) — 코멘트가 실패하면 사람이 보도록 Slack 으로 알리고 손을 뗀다.
+async function autoDecidePending(now) {
+  const seen = new Set();
+  for (const p of listProjects()) {
+    if (!lib.projectEnabled(p)) continue;
+    const cfg = getProject(p.id);
+    const dir = stateDirOf(cfg);
+    let files = [];
+    try { files = fs.readdirSync(dir).filter((f) => f.endsWith(".decision.json")); } catch { continue; }
+    for (const f of files) {
+      const file = path.join(dir, f);
+      if (seen.has(file)) continue;
+      const d = lib.readJson(file, null);
+      if (!d || !d.card || !d.epic || (d.project && d.project !== p.id)) continue;   // 상태 폴더를 공유하는 남의 선택지는 건너뜀
+      seen.add(file);
+      const opts = readEpicOpts(cfg, d.epic);
+      const due = lib.autoDecisionDue(d, opts, now);
+      if (!due.due) continue;
+      try { fs.writeFileSync(file, JSON.stringify({ ...d, autoTriedAt: new Date().toISOString() }, null, 2)); } catch { continue; }
+      const cred = getProjectCreds(p.id);
+      const r = await applyDecision(cfg, cred, p.id, d.card, d.recommended.id, { auto: { afterMin: opts.autoDecideAfterMin }, epic: d.epic });
+      const opt = (d.options || []).find((x) => x.id === d.recommended.id) || {};
+      console.log(`[auto-decide] ${p.id} ${d.card}: ${r.ok ? `(${d.recommended.id}) 자동 결정` : `실패 — ${r.message}`}`);
+      if (cred.slackWebhookUrl) {
+        const text = r.ok
+          ? `🤖 [${d.epic}] ${d.card} — ${opts.autoDecideAfterMin}분 동안 결정이 없어 서비스 안정성 우선 권장안 ${d.recommended.id}) 로 자동 결정했습니다.\n• ${opt.label || ""}${d.recommended.why ? `\n• 이유: ${d.recommended.why}` : ""}\n${(r.retry && r.retry.message) || ""}`
+          : `⚠️ [${d.epic}] ${d.card} — 결정 대기 자동 결정 실패: ${r.message}. 직접 골라 주세요.`;
+        try { await fetch(cred.slackWebhookUrl, { method: "POST", headers: { "Content-type": "application/json" }, body: JSON.stringify({ text }), signal: AbortSignal.timeout(10000) }); } catch {}
+      }
+    }
+  }
+}
 // 자동 병합 옵션 변경 — 실행 중에도 즉시 반영된다(러너가 await-merge 폴링마다 옵션 파일을 다시 읽음).
 // body { autoMerge, autoMergeAfterMin, autoRetry, autoRetryMax, autoResolveConflict, conflictAfterMin, parallelExtra } — 준 것만 바꾼다.
 // parallelExtra 는 러너가 빈 슬롯을 채울 때마다 다시 읽는다(줄이면 돌던 카드는 끝까지, 새 카드만 덜 띄운다).
@@ -1364,6 +1407,8 @@ app.post("/api/epics/:key/run/options", (req, res) => {
       autoResolveConflict: b.autoResolveConflict === undefined ? cur.autoResolveConflict : !!b.autoResolveConflict,
       conflictAfterMin: b.conflictAfterMin === undefined ? cur.conflictAfterMin : b.conflictAfterMin,
       parallelExtra: b.parallelExtra === undefined ? cur.parallelExtra : b.parallelExtra,
+      autoDecide: b.autoDecide === undefined ? cur.autoDecide : !!b.autoDecide,
+      autoDecideAfterMin: b.autoDecideAfterMin === undefined ? cur.autoDecideAfterMin : b.autoDecideAfterMin,
     });
     // 재시도 설정을 바꾸면 예정 시각을 다시 계산하도록 기록을 비운다
     if (b.autoRetry !== undefined || b.autoRetryMax !== undefined) clearEpicRetry(cfg, key);
@@ -1371,6 +1416,7 @@ app.post("/api/epics/:key/run/options", (req, res) => {
       opts.autoMerge ? `자동 병합 켜짐(승인 후 ${opts.autoMergeAfterMin}분)` : "자동 병합 꺼짐",
       opts.autoRetry ? `자동 재시도 켜짐(최대 ${opts.autoRetryMax}회)` : "자동 재시도 꺼짐",
       opts.autoResolveConflict ? `자동 충돌 해소 켜짐(${opts.conflictAfterMin}분)` : "자동 충돌 해소 꺼짐",
+      opts.autoDecide ? `결정 대기 자동 결정 켜짐(${opts.autoDecideAfterMin}분)` : "결정 대기 자동 결정 꺼짐",
       opts.parallelExtra ? `동시 실행 ${1 + opts.parallelExtra}개` : "순차 실행",
     ].join(" · ");
     res.json({ ok: true, opts, message: msg });
@@ -2124,6 +2170,9 @@ app.listen(PORT, () => {
   setInterval(scanRetries, EPIC_RETRY_SCAN_MS).unref?.();
   setTimeout(scanRetries, 12000).unref?.();
   console.log(`  에픽 자동 재시도 감시: ${EPIC_RETRY_SCAN_MS / 1000}s 주기`);
+  const scanDecisions = async () => { try { await autoDecidePending(); } catch (e) { console.warn("[auto-decide] 스캔 오류:", e.message); } };
+  setInterval(scanDecisions, 60000).unref?.();
+  console.log("  결정 대기 자동 결정 감시: 60s 주기");
   // Sentry 에러 자동 처리 — 프로젝트별 intervalMinutes 주기(판정은 1분마다)
   setInterval(() => { try { scanSentry(); } catch (e) { console.warn("[sentry] 스캔 오류:", e.message); } }, 60000).unref?.();
   setTimeout(() => { try { scanSentry(); } catch {} }, 20000).unref?.();

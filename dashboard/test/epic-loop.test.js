@@ -1003,3 +1003,33 @@ test("failureDigest: '**멈춘 이유:** 문장' 과 그 아래 항목도 원인
   ].join("\n")]);
   assert.deepEqual(d.lines, ["멈춘 이유: 1번을 정해야 나머지 반영 범위가 결정됩니다.", "틀 전환은 옛 index.html 약 5,000행을 옮기는 일입니다.", "리뷰 반영 실패: 틀 전환을 이 PR에서 할지 나눌지 담당자 결정이 필요함"]);
 });
+
+// ----- 결정 대기 자동 결정 -----
+test("parseDecision: DECISION_DEFAULT 는 선택지에 있는 id 일 때만 권장안으로", () => {
+  const ok = lib.parseDecision("DECISION: q\nDECISION_OPTION a: A\nDECISION_OPTION b: B\nDECISION_DEFAULT: b — 회귀 위험이 작다");
+  assert.deepEqual(ok.recommended, { id: "b", why: "회귀 위험이 작다" });
+  const bad = lib.parseDecision("DECISION: q\nDECISION_OPTION a: A\nDECISION_OPTION b: B\nDECISION_DEFAULT: z — 없는 선택지");
+  assert.equal(bad.recommended, null);
+});
+
+test("autoDecisionDue: 켜짐·권장안·시간 경과가 모두 맞을 때만, 한 번만", () => {
+  const d = { at: "2026-11-20T06:00:00Z", recommended: { id: "b" } };
+  const t0 = Date.parse("2026-11-20T06:00:00Z");
+  const on = { autoDecide: true, autoDecideAfterMin: 30 };
+  assert.equal(lib.autoDecisionDue(d, { autoDecide: false }, t0 + 3600e3).reason, "off");
+  assert.equal(lib.autoDecisionDue({ ...d, recommended: null }, on, t0 + 3600e3).reason, "no-recommendation");
+  assert.equal(lib.autoDecisionDue(d, on, t0 + 29 * 60e3).reason, "waiting");
+  assert.equal(lib.autoDecisionDue(d, on, t0 + 30 * 60e3).due, true);
+  assert.equal(lib.autoDecisionDue({ ...d, autoTriedAt: "x" }, on, t0 + 3600e3).reason, "already");
+  assert.equal(lib.clampDecideMin(1), 5);
+  assert.equal(lib.clampDecideMin("abc"), lib.EPIC_DECIDE_MIN_DEFAULT);
+});
+
+test("decisionComment: 자동 결정은 표시·대기 시간·권장 이유를 적는다", () => {
+  const d = { question: "q", options: [{ id: "a", label: "A" }, { id: "b", label: "B" }], recommended: { id: "b", why: "되돌리기 쉽다" } };
+  const auto = lib.decisionComment(d, d.options[1], { afterMin: 60 });
+  assert.match(auto, /^\[결정 \(b\) · 자동\] B/);
+  assert.match(auto, /60분 동안 담당자 결정이 없어/);
+  assert.match(auto, /권장 이유: 되돌리기 쉽다/);
+  assert.match(lib.decisionComment(d, d.options[0]), /^\[결정 \(a\)\] A/);
+});

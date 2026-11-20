@@ -700,12 +700,17 @@ function parseDecision(text) {
     const line = raw.replace(/^[\s*`>-]+/, "");
     let m = line.match(/^DECISION:\s*(.+)$/);
     if (m) { cur = { question: clip(mdStrip(m[1]), 300), options: [] }; last = cur; continue; }
+    m = line.match(/^DECISION_DEFAULT:?\s*([a-z0-9]{1,8})\b\s*[—–:\-]*\s*(.*)$/i);
+    if (m && cur) { cur.recommendedRaw = { id: m[1].toLowerCase(), why: clip(mdStrip(m[2]), 300) }; continue; }
     m = line.match(/^DECISION_OPTION\s+([a-z0-9]{1,8})\s*[:：]\s*(.+)$/i);
     if (m && cur && cur.options.length < DECISION_MAX_OPTIONS && !cur.options.some((o) => o.id === m[1].toLowerCase())) {
       cur.options.push({ id: m[1].toLowerCase(), label: clip(mdStrip(m[2]), 200) });
     }
   }
-  return last && last.options.length >= 2 ? last : null;
+  if (!last || last.options.length < 2) return null;
+  // 권장안은 선택지에 있는 id 일 때만 — 없는 id 로 자동 결정하면 아무 선택지도 아닌 결정이 남는다.
+  const rec = last.recommendedRaw && last.options.some((o) => o.id === last.recommendedRaw.id) ? last.recommendedRaw : null;
+  return { question: last.question, options: last.options, recommended: rec };
 }
 // 에이전트 출력들(최근 것부터 아무 순서) → { lines: [원인 요약 줄], decision }
 // 뽑는 것: REWORK_FAILED 사유, '다음에 할 일', '반영하지 못한 이유'·'남은 문제' 아래 항목.
@@ -742,16 +747,39 @@ function failureDigest(texts, max) {
   }
   return { lines, decision };
 }
+// 결정 대기 자동 결정 — 담당자가 정한 시간 안에 고르지 않으면 권장안(DECISION_DEFAULT)으로 정한다.
+const EPIC_DECIDE_MIN_DEFAULT = 60;
+const EPIC_DECIDE_MIN_LIMIT = 1440;
+function clampDecideMin(v) {
+  const n = parseInt(v, 10);
+  if (!Number.isFinite(n) || n <= 0) return EPIC_DECIDE_MIN_DEFAULT;
+  return Math.min(Math.max(n, 5), EPIC_DECIDE_MIN_LIMIT);
+}
+// → { due, at(ms), reason }. reason: off | no-recommendation | already | waiting | due
+function autoDecisionDue(d, opts, nowMs) {
+  if (!opts || !opts.autoDecide) return { due: false, reason: "off" };
+  if (!d || !d.recommended || !d.recommended.id) return { due: false, reason: "no-recommendation" };
+  if (d.autoTriedAt) return { due: false, reason: "already" };
+  const start = Date.parse(d.at || "");
+  if (!Number.isFinite(start)) return { due: false, reason: "no-recommendation" };
+  const at = start + clampDecideMin(opts.autoDecideAfterMin) * 60000;
+  return (nowMs == null ? Date.now() : nowMs) >= at ? { due: true, at, reason: "due" } : { due: false, at, reason: "waiting" };
+}
 // [선택] 버튼으로 고른 결정 → PR·Jira 코멘트 본문. 리뷰어·에이전트가 같은 글을 읽고 이어서 판단한다.
-function decisionComment(d, opt) {
+function decisionComment(d, opt, auto) {
+  const head = auto
+    ? [`[결정 (${opt.id}) · 자동] ${opt.label}`, "",
+       `${auto.afterMin}분 동안 담당자 결정이 없어, 서비스 안정성을 최우선으로 한 에이전트 권장안으로 자동 결정했습니다.`,
+       ...(d.recommended && d.recommended.why ? [`권장 이유: ${d.recommended.why}`] : []), ""]
+    : [`[결정 (${opt.id})] ${opt.label}`, ""];
   return [
-    `[결정 (${opt.id})] ${opt.label}`,
-    "",
+    ...head,
     `질문: ${d.question}`,
     "",
     ...(d.options || []).map((o) => `- ${o.id}) ${o.label}${o.id === opt.id ? " ← 선택" : ""}`),
     "",
-    "담당자가 Slack 에서 고른 결정입니다. 이 결정을 기준으로 반영·재리뷰해 주세요.",
+    auto ? "다른 선택이 필요하면 담당자가 이 코멘트 아래에 새 결정을 남겨 주세요. 이 결정을 기준으로 반영·재리뷰해 주세요."
+      : "담당자가 Slack 에서 고른 결정입니다. 이 결정을 기준으로 반영·재리뷰해 주세요.",
     "선택지에 사람이 할 일(후속 카드 만들기·범위 줄이기 등)이 들어 있으면 담당자가 따로 처리합니다.",
   ].join("\n");
 }
@@ -1185,7 +1213,7 @@ module.exports = {
   ciCheckState, ciStateOf, ciStateWithRuns, failedChecks, latestChecks, runIdFromCheckUrl,
   CI_LOOP_MAX_DEFAULT, CI_LOOP_MAX_LIMIT, clampCiLoopMax,
   SUGGEST_MARK, parseSuggestedAnswers, planHasNoQuestions, skipLine, projectRulesInstr,
-  epicRetryStep, parseDecision, failureDigest, decisionComment, DECISION_MARK,
+  epicRetryStep, parseDecision, failureDigest, decisionComment, DECISION_MARK, EPIC_DECIDE_MIN_DEFAULT, clampDecideMin, autoDecisionDue,
   EPIC_STEPS, epicChildrenJql, searchEpicChildren, epicBlockers, epicTaskStep, pickEpicTasks, nextEpicTask, epicTaskStates, epicBlockedReason, nextEpicStep, approveReviewTargets, reviewOnResume, stopLockClearable, ALREADY_DONE_MARK, alreadyDoneComment,
   EPIC_PARALLEL_EXTRA_MAX, clampParallelExtra, epicResumePoints, summarizeEpicRuns, runEpicSlots, buildAdoptedAnswerBody, prBelongsToCard,
   EPIC_HIERARCHY_LEVEL, EPIC_LABEL_FALLBACK, topLevelIssueTypes, epicSearchJql, epicTypeLabel,

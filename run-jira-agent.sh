@@ -388,6 +388,8 @@ ${FEEDBACK_INSTR}
    DECISION: <담당자에게 묻는 질문 한 줄>
    DECISION_OPTION a: <선택지 한 줄>
    DECISION_OPTION b: <선택지 한 줄>
+   DECISION_DEFAULT: <권장 선택지 id> — <이유 한 줄>
+   DECISION_DEFAULT 는 담당자가 정해진 시간 안에 고르지 않으면 자동으로 적용되는 권장안입니다. 서비스 안정성을 최우선 기준으로 고르세요 — 운영 중단·데이터 손상·회귀 위험이 가장 작고, 되돌리기 쉽고, 한 번에 검증할 수 있는 범위인 쪽입니다. 사람만 할 수 있는 일(카드 만들기·범위 결정 등)이 필요한 선택지라도 그 일을 선택지 설명에 적어 두면 됩니다.
 완료 후 갱신한 PR URL 들을 출력하세요."
 elif [[ -n "${CI_FIX:-}" ]]; then
   echo ">> [${ISSUE_KEY}] [CI-FIX] CI 실패 원인 파악 + 수정${REWORK_ONLY_OWNER:+ · 대상 PR ${REWORK_ONLY_OWNER}#${REWORK_ONLY_NUM:-}}"
