@@ -763,10 +763,13 @@ const TASK_START = new Map();   // key → 이번 실행에서 그 카드를 띄
 const NOTIFIED_FAIL = new Set();   // 진행 중에 이미 중단 알림(원인·버튼)을 보낸 카드 — 에픽이 멈출 때 또 보내지 않는다
 async function failureNotice(r, tail) {
   const texts = [r.lastError || ""];
-  const rework = path.join(STATE_DIR, `${r.key}.reviewloop.rework.out`);
-  try {
-    if (fs.statSync(rework).mtimeMs >= (TASK_START.get(r.key) || 0)) texts.push(fs.readFileSync(rework, "utf8"));
-  } catch {}
+  // 리뷰 루프는 끝날 때 rework 출력을 지운다 — 남는 건 run-jira-agent.sh 의 마지막 엔진 출력(<KEY>.build.out)이다.
+  for (const f of [`${r.key}.reviewloop.rework.out`, `${r.key}.build.out`]) {
+    const file = path.join(STATE_DIR, f);
+    try {
+      if (fs.statSync(file).mtimeMs >= (TASK_START.get(r.key) || 0)) texts.push(fs.readFileSync(file, "utf8"));
+    } catch {}
+  }
   const dg = lib.failureDigest(texts);
   let pr = null;
   try { const prs = await cardOpenPRs(r.key); pr = prs.find((p) => !p.approved) || prs[0] || null; } catch {}

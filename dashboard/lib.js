@@ -709,7 +709,7 @@ function parseDecision(text) {
 }
 // 에이전트 출력들(최근 것부터 아무 순서) → { lines: [원인 요약 줄], decision }
 // 뽑는 것: REWORK_FAILED 사유, '다음에 할 일', '반영하지 못한 이유'·'남은 문제' 아래 항목.
-const CAUSE_HEADS = /^(반영하지 못한 이유|남은 문제[^*]*|막힌 이유|중단 이유)$/;
+const CAUSE_HEADS = /^(반영하지 못한 이유|남은 문제[^*]*|멈춘 이유|막힌 이유|중단 이유)$/;
 function failureDigest(texts, max) {
   const limit = max || 5;
   const lines = [];
@@ -726,14 +726,18 @@ function failureDigest(texts, max) {
       if (m) { add(`리뷰 반영 실패: ${m[1]}`); continue; }
       m = row.match(/\*\*다음에 할 일:?\*\*:?\s*(.+)$/);
       if (m) { add(`다음에 할 일: ${m[1]}`); continue; }
-      const head = mdStrip(row).replace(/[:：]$/, "");
-      if (/^\*\*.+\*\*:?$/.test(row.trim()) && CAUSE_HEADS.test(head)) {
+      // 원인 제목 아래 목록 항목(최대 3개). 제목 줄에 문장이 이어 붙은 꼴('**멈춘 이유:** …')도 받는다.
+      const bullets = () => {
         for (let j = i + 1, n = 0; j < rows.length && n < 3; j++) {
           const b = rows[j].match(/^\s*[-*]\s+(.+)$/);
           if (!b) { if (rows[j].trim()) break; continue; }
           add(b[1]); n += 1;
         }
-      }
+      };
+      m = row.match(/\*\*(멈춘 이유|막힌 이유|중단 이유):?\*\*:?\s*(.+)$/);
+      if (m) { add(`${m[1]}: ${m[2]}`); bullets(); continue; }
+      const head = mdStrip(row).replace(/[:：]$/, "");
+      if (/^\*\*.+\*\*:?$/.test(row.trim()) && CAUSE_HEADS.test(head)) bullets();
     }
   }
   return { lines, decision };

@@ -994,3 +994,12 @@ test("parseDecision: 마지막 묶음만, 선택지 2개 미만·중복 id 는 �
   assert.equal(d.question, "새 질문");
   assert.deepEqual(d.options, [{ id: "a", label: "하나" }, { id: "c", label: "셋" }]);
 });
+
+test("failureDigest: '**멈춘 이유:** 문장' 과 그 아래 항목도 원인으로 뽑는다(AML-208 모양)", () => {
+  const d = lib.failureDigest([[
+    "**멈춘 이유:** 1번을 정해야 나머지 반영 범위가 결정됩니다.",
+    "- 틀 전환은 옛 index.html 약 5,000행을 옮기는 일입니다.",
+    "REWORK_FAILED: 틀 전환을 이 PR에서 할지 나눌지 담당자 결정이 필요함",
+  ].join("\n")]);
+  assert.deepEqual(d.lines, ["멈춘 이유: 1번을 정해야 나머지 반영 범위가 결정됩니다.", "틀 전환은 옛 index.html 약 5,000행을 옮기는 일입니다.", "리뷰 반영 실패: 틀 전환을 이 PR에서 할지 나눌지 담당자 결정이 필요함"]);
+});

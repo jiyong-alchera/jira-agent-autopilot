@@ -945,7 +945,7 @@ tail -f loop-plan.log loop-build.log
 
 **카드 중단 알림(원인 요약 · 선택지)** — 단계 사유(`리뷰 승인이 남았습니다` 등)는 증상일 뿐이라, 러너(`failureNotice`)가
 이번 실행의 에이전트 출력에서 원인을 뽑아 `*원인 요약*` 으로 붙인다(`lib.failureDigest`, 최대 5줄).
-- 읽는 곳: 실패한 단계의 출력 끝부분(`lastError`)과 `.state/<KEY>.reviewloop.rework.out`(이번 실행에서 그 카드를 띄운 뒤에 쓰인 것만).
+- 읽는 곳: 실패한 단계의 출력 끝부분(`lastError`)과 `.state/<KEY>.reviewloop.rework.out`·`.state/<KEY>.build.out`(이번 실행에서 그 카드를 띄운 뒤에 쓰인 것만). 리뷰 루프는 끝날 때 rework 출력을 지우므로, 실제로는 마지막 엔진 출력인 `build.out` 에서 읽힌다.
   리뷰 승인 루프는 반영에 실패해도 0 으로 끝나 build 가 '성공'하므로, 진짜 원인은 rework 출력에만 남는다(AML-210).
 - 뽑는 것: `REWORK_FAILED:` 사유, `**다음에 할 일:**`, `**반영하지 못한 이유**`·`**남은 문제**` 아래 항목.
 - **선택지**: rework 에이전트가 담당자의 결정이 필요해 멈출 때는 실패 마커 앞에 `DECISION: <질문>` 과
