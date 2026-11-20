@@ -597,11 +597,15 @@ function epicBlockedReason(tasks, cfg) {
 //   h.startStep(task)        시작 단계(재개 지점 반영). h.preferKeys() 는 먼저 고를 카드 키
 //   h.onStart(task, step, { active, total }) / h.onEnd(r, { active, doneCount }) / h.onFetchError(e, active)
 //   h.onTasks(children, activeKeys, total)   목록·진행 상태 갱신
+//   h.takeRetries()          멈춘 카드 다시 시도 요청 [{ key, skip }] (Slack·대시보드 → 러너, 읽으면 비움)
+//   h.retryStep(task, step)  다시 시도 시작 단계 보정(재리뷰 표시 등). h.onRetry(req, { ok, step, why })
 // 규칙: 실패가 하나라도 나오면 새 카드는 안 띄우고, 돌던 카드가 다 끝나면 paused. 병합 대기도 슬롯을 차지한다
-// (runTask 가 병합까지 끝나야 돌아오므로).
+// (runTask 가 병합까지 끝나야 돌아오므로). 다른 카드가 도는 동안 멈춘 카드는 takeRetries 로 그 카드만 다시
+// 띄울 수 있다 — 실패 목록에서 빠지므로 남은 실패가 없으면 새 카드도 다시 시작한다.
 // 반환 { outcome: "done"|"blocked"|"paused"|"stopped"|"fetch-failed", doneCount, failures, blocked, error }
 async function runEpicSlots(h) {
   const active = new Map();
+  const seen = new Map();   // key → 마지막으로 띄운 task(다시 시도할 때 같은 카드 정보로)
   const failures = [];
   let doneCount = 0, stopping = false, wake = null;
   const pollMs = h.pollMs == null ? 60000 : h.pollMs;
@@ -613,8 +617,30 @@ async function runEpicSlots(h) {
     if (h.onEnd) h.onEnd(r, { active: [...active.keys()], doneCount });
     if (wake) { const w = wake; wake = null; w(); }
   };
+  const launch = (t, step) => {
+    const key = t.key;
+    seen.set(key, t);
+    const p = Promise.resolve()
+      .then(() => h.runTask(t, step))
+      .catch((e) => ({ ok: false, step, reason: `오류: ${String((e && e.message) || e)}` }))
+      .then((r) => settle({ ...(r || { ok: false, step, reason: "결과 없음" }), key }));
+    active.set(key, p);
+  };
   for (;;) {
     if (h.stopRequested && h.stopRequested()) stopping = true;
+    if (!stopping && failures.length && h.takeRetries) {
+      for (const req of h.takeRetries() || []) {
+        const i = failures.findIndex((f) => f.key === req.key);
+        if (i < 0) { if (h.onRetry) h.onRetry(req, { ok: false, why: "not-failed" }); continue; }
+        const step = epicRetryStep(failures[i].step, req.skip);
+        if (!step) { if (h.onRetry) h.onRetry(req, { ok: false, why: "last-step" }); continue; }
+        failures.splice(i, 1);
+        const t = seen.get(req.key) || { key: req.key };
+        const s = h.retryStep ? h.retryStep(t, step) : step;
+        if (h.onRetry) h.onRetry(req, { ok: true, step: s });
+        launch(t, s);
+      }
+    }
     const cap = Math.max(1, h.capacity ? h.capacity() : 1);
     if (!stopping && !failures.length && active.size < cap) {
       let children = null;
@@ -629,12 +655,7 @@ async function runEpicSlots(h) {
         for (const t of picks) {
           const step = h.startStep ? h.startStep(t) : t.step;
           if (h.onStart) h.onStart(t, step, { active: [...active.keys()], total, cap });
-          const key = t.key;
-          const p = Promise.resolve()
-            .then(() => h.runTask(t, step))
-            .catch((e) => ({ ok: false, step, reason: `오류: ${String((e && e.message) || e)}` }))
-            .then((r) => settle({ ...(r || { ok: false, step, reason: "결과 없음" }), key }));
-          active.set(key, p);
+          launch(t, step);
         }
         if (h.onTasks) h.onTasks(children, [...active.keys()], total);
         if (!active.size) {
@@ -655,6 +676,80 @@ async function runEpicSlots(h) {
 function nextEpicStep(step) {
   const i = EPIC_STEPS.indexOf(step);
   return (i < 0 || i >= EPIC_STEPS.length - 1) ? null : EPIC_STEPS[i + 1];
+}
+// 멈춘 카드 한 장을 다시 띄울 단계 — 그 단계부터, 또는 건너뛰면 다음 단계부터(마지막 단계면 null).
+function epicRetryStep(step, skip) {
+  if (!EPIC_STEPS.includes(step)) return null;
+  return skip ? nextEpicStep(step) : step;
+}
+
+// ----- 카드 중단 알림: 원인 요약 + 사람이 고를 선택지 -----
+// 단계 실패 사유('리뷰 승인이 남았습니다' 등)는 증상일 뿐이라, 에이전트 출력에서 진짜 원인을 뽑아 붙인다.
+// 에이전트가 사람의 결정을 요구하며 멈추면 아래 형식으로 선택지를 낸다(run-jira-agent.sh 종료 규칙):
+//   DECISION: <질문 한 줄>
+//   DECISION_OPTION a: <선택지 한 줄>
+const DECISION_MARK = "DECISION";
+const DECISION_MAX_OPTIONS = 4;
+const mdStrip = (s) => String(s || "").replace(/\*\*/g, "").replace(/`/g, "").replace(/\s+/g, " ").trim();
+const clip = (s, n) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
+// 마지막 DECISION 묶음 → { question, options: [{ id, label }] } | null (선택지 2개 미만이면 null)
+function parseDecision(text) {
+  const lines = String(text || "").split(/\r?\n/);
+  let cur = null, last = null;
+  for (const raw of lines) {
+    const line = raw.replace(/^[\s*`>-]+/, "");
+    let m = line.match(/^DECISION:\s*(.+)$/);
+    if (m) { cur = { question: clip(mdStrip(m[1]), 300), options: [] }; last = cur; continue; }
+    m = line.match(/^DECISION_OPTION\s+([a-z0-9]{1,8})\s*[:：]\s*(.+)$/i);
+    if (m && cur && cur.options.length < DECISION_MAX_OPTIONS && !cur.options.some((o) => o.id === m[1].toLowerCase())) {
+      cur.options.push({ id: m[1].toLowerCase(), label: clip(mdStrip(m[2]), 200) });
+    }
+  }
+  return last && last.options.length >= 2 ? last : null;
+}
+// 에이전트 출력들(최근 것부터 아무 순서) → { lines: [원인 요약 줄], decision }
+// 뽑는 것: REWORK_FAILED 사유, '다음에 할 일', '반영하지 못한 이유'·'남은 문제' 아래 항목.
+const CAUSE_HEADS = /^(반영하지 못한 이유|남은 문제[^*]*|막힌 이유|중단 이유)$/;
+function failureDigest(texts, max) {
+  const limit = max || 5;
+  const lines = [];
+  const add = (s) => { const t = clip(mdStrip(s), 220); if (t && !lines.includes(t) && lines.length < limit) lines.push(t); };
+  let decision = null;
+  for (const text of texts || []) {
+    const src = String(text || "");
+    if (!src.trim()) continue;
+    decision = decision || parseDecision(src);
+    const rows = src.split(/\r?\n/);
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
+      let m = row.match(/^[\s*`]*REWORK_FAILED:\s*(.+)$/);
+      if (m) { add(`리뷰 반영 실패: ${m[1]}`); continue; }
+      m = row.match(/\*\*다음에 할 일:?\*\*:?\s*(.+)$/);
+      if (m) { add(`다음에 할 일: ${m[1]}`); continue; }
+      const head = mdStrip(row).replace(/[:：]$/, "");
+      if (/^\*\*.+\*\*:?$/.test(row.trim()) && CAUSE_HEADS.test(head)) {
+        for (let j = i + 1, n = 0; j < rows.length && n < 3; j++) {
+          const b = rows[j].match(/^\s*[-*]\s+(.+)$/);
+          if (!b) { if (rows[j].trim()) break; continue; }
+          add(b[1]); n += 1;
+        }
+      }
+    }
+  }
+  return { lines, decision };
+}
+// [선택] 버튼으로 고른 결정 → PR·Jira 코멘트 본문. 리뷰어·에이전트가 같은 글을 읽고 이어서 판단한다.
+function decisionComment(d, opt) {
+  return [
+    `[결정 (${opt.id})] ${opt.label}`,
+    "",
+    `질문: ${d.question}`,
+    "",
+    ...(d.options || []).map((o) => `- ${o.id}) ${o.label}${o.id === opt.id ? " ← 선택" : ""}`),
+    "",
+    "담당자가 Slack 에서 고른 결정입니다. 이 결정을 기준으로 반영·재리뷰해 주세요.",
+    "선택지에 사람이 할 일(후속 카드 만들기·범위 줄이기 등)이 들어 있으면 담당자가 따로 처리합니다.",
+  ].join("\n");
 }
 // build 가 '이미 base 에 반영돼 바꿀 코드가 없다'(ALREADY_IMPLEMENTED 마커)로 끝났을 때 남기는 Jira 코멘트.
 // 카드를 자동 완료하므로 근거(커밋·테스트)를 남겨 사람이 나중에 판단을 되짚을 수 있게 한다.
@@ -1007,6 +1102,11 @@ const SLACK_ACTIONS = {
   "epic-resume": { label: "▶️ 이어서 진행",  style: "primary", api: (a) => `/api/epics/${a.key}/run/resume`,       body: () => ({}) },
   "epic-skip":   { label: "⏭ 건너뛰기",      style: undefined, api: (a) => `/api/epics/${a.key}/run/resume`,       body: () => ({ skip: true }) },
   "epic-stop":   { label: "⏹ 중지",          style: "danger",  api: (a) => `/api/epics/${a.key}/run/stop`,         body: () => ({}) },
+  // 에픽 안에서 멈춘 카드 한 장만 — 다른 카드가 도는 중이면 러너에 요청을 넘기고, 에픽이 멈춰 있으면 재개한다.
+  "card-retry":  { label: "🔁 이 카드 다시 시도", style: "primary", api: (a) => `/api/epics/${a.epic || "-"}/run/card`, body: (a) => ({ card: a.key }) },
+  "card-skip":   { label: "⏭ 이 카드 다음 단계로", style: undefined, api: (a) => `/api/epics/${a.epic || "-"}/run/card`, body: (a) => ({ card: a.key, skip: true }) },
+  // 에이전트가 낸 선택지 고르기 — 결정 코멘트(PR·Jira) 후 그 카드를 다시 시도한다. 선택지 id 는 step 칸에 싣는다.
+  "decide":      { label: "선택",            style: undefined, api: (a) => `/api/cards/${a.key}/decide`,          body: (a) => ({ epic: a.epic || "", option: a.step || "" }) },
 };
 const SLACK_ACTION_PREFIX = "jaa:";   // action_id 접두사 — 우리 버튼만 골라낸다
 
@@ -1024,7 +1124,9 @@ function decodeSlackAction(value) {
   return { id: o.a, project: String(o.p || ""), key: String(o.k), owner: String(o.o || ""), number: String(o.n || ""), step: String(o.s || ""), epic };
 }
 
-// 알림 1건 → Slack payload. actions 는 [{ id, project, key, owner, number, step }] 또는 { url, label } 링크.
+const SLACK_BUTTONS_PER_ROW = 5;
+const SLACK_BUTTONS_MAX = 10;
+// 알림 1건 → Slack payload. actions 는 [{ id, project, key, owner, number, step, label? }] 또는 { url, label } 링크.
 function slackMessage(text, actions) {
   const body = String(text || "");
   const blocks = [{ type: "section", text: { type: "mrkdwn", text: body.slice(0, 2900) } }];
@@ -1037,14 +1139,17 @@ function slackMessage(text, actions) {
     const def = SLACK_ACTIONS[a.id];
     if (!def) continue;
     const btn = {
-      type: "button", text: { type: "plain_text", text: a.label || def.label, emoji: true },
+      type: "button", text: { type: "plain_text", text: clip(String(a.label || def.label), 75), emoji: true },
       action_id: SLACK_ACTION_PREFIX + a.id, value: encodeSlackAction(a),
     };
     if (def.style) btn.style = def.style;
     elements.push(btn);
-    if (elements.length >= 5) break;   // Slack actions 블록 상한
+    if (elements.length >= SLACK_BUTTONS_MAX) break;
   }
-  if (elements.length) blocks.push({ type: "actions", elements });
+  // 한 줄 5개씩 — 선택지 버튼과 진행 버튼이 함께 붙으면 두 줄이 된다.
+  for (let i = 0; i < elements.length; i += SLACK_BUTTONS_PER_ROW) {
+    blocks.push({ type: "actions", elements: elements.slice(i, i + SLACK_BUTTONS_PER_ROW) });
+  }
   return { text: body, blocks };
 }
 
@@ -1074,6 +1179,7 @@ module.exports = {
   ciCheckState, ciStateOf, ciStateWithRuns, failedChecks, latestChecks, runIdFromCheckUrl,
   CI_LOOP_MAX_DEFAULT, CI_LOOP_MAX_LIMIT, clampCiLoopMax,
   SUGGEST_MARK, parseSuggestedAnswers, planHasNoQuestions, skipLine, projectRulesInstr,
+  epicRetryStep, parseDecision, failureDigest, decisionComment, DECISION_MARK,
   EPIC_STEPS, epicChildrenJql, searchEpicChildren, epicBlockers, epicTaskStep, pickEpicTasks, nextEpicTask, epicTaskStates, epicBlockedReason, nextEpicStep, approveReviewTargets, reviewOnResume, stopLockClearable, ALREADY_DONE_MARK, alreadyDoneComment,
   EPIC_PARALLEL_EXTRA_MAX, clampParallelExtra, epicResumePoints, summarizeEpicRuns, runEpicSlots, buildAdoptedAnswerBody, prBelongsToCard,
   EPIC_HIERARCHY_LEVEL, EPIC_LABEL_FALLBACK, topLevelIssueTypes, epicSearchJql, epicTypeLabel,

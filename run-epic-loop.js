@@ -32,6 +32,8 @@
 //   <EPIC>.epic.json                진행 상태(대시보드 폴링)
 //   <EPIC>.epic.stop                중지 요청 플래그
 //   <EPIC>.epic.conflict.json       충돌 즉시 해소 요청(대시보드·Slack 버튼 → 러너)
+//   <EPIC>.epic.card.json           멈춘 카드 한 장 다시 시도 요청 [{key, skip}](대시보드·Slack 버튼 → 러너)
+//   <KEY>.decision.json             에이전트가 낸 선택지(중단 알림의 [선택] 버튼이 읽는다)
 //   <EPIC>.epic-design.md           에픽 설명(설계안) — 하위 태스크 프롬프트에 주입
 //
 // env: PROJECT_ID(필수), EPIC_REPOS(쉼표 구분 repo name), REVIEW_LOOP_MAX,
@@ -87,6 +89,18 @@ const DESIGN_FILE = path.join(STATE_DIR, `${EPIC_KEY}.epic-design.md`);
 const OPTS_FILE = path.join(STATE_DIR, `${EPIC_KEY}.epic.opts.json`);
 // 대시보드·Slack 버튼이 '지금 이 PR 충돌을 해소하라'고 남기는 요청 — 러너가 병합 대기 폴링에서 읽고 지운다.
 const CONFLICT_REQ_FILE = path.join(STATE_DIR, `${EPIC_KEY}.epic.conflict.json`);
+// 다른 카드가 도는 동안 멈춘 카드 한 장만 다시 띄우라는 요청 [{key, skip}] — Slack·대시보드 버튼 → 러너.
+const CARD_REQ_FILE = path.join(STATE_DIR, `${EPIC_KEY}.epic.card.json`);
+function takeCardRequests() {
+  let list;
+  try { list = JSON.parse(fs.readFileSync(CARD_REQ_FILE, "utf8")); } catch { return []; }
+  try { fs.unlinkSync(CARD_REQ_FILE); } catch {}
+  return (Array.isArray(list) ? list : [list])
+    .filter((r) => r && /^[A-Z][A-Z0-9]+-[0-9]+$/.test(String(r.key || "")))
+    .map((r) => ({ key: String(r.key), skip: !!r.skip }));
+}
+// 에이전트가 낸 선택지 — Slack [선택] 버튼이 이 파일을 보고 결정 코멘트를 쓴다(버튼 value 에는 선택지 id 만).
+const decisionFile = (key) => path.join(STATE_DIR, `${key}.decision.json`);
 const DEFAULT_OPTS = {
   autoMerge: process.env.EPIC_AUTO_MERGE === "1",
   autoMergeAfterMin: lib.clampAutoMergeMin(process.env.EPIC_AUTO_MERGE_AFTER_MIN),
@@ -235,13 +249,14 @@ const stopRequested = () => fs.existsSync(STOP_FILE);
 try { fs.mkdirSync(LOCK_DIR); }
 catch { console.log(`SKIP: [${EPIC_KEY}] ${EPIC_LABEL} 연속 개발이 이미 실행 중입니다(lock)`); process.exit(0); }
 try { fs.unlinkSync(STOP_FILE); } catch {}
+try { fs.unlinkSync(CARD_REQ_FILE); } catch {}   // 지난 실행에 남은 요청은 새 실행의 재개 지점과 섞이지 않게 버린다
 try { fs.writeFileSync(`${LOCK_DIR}.phase`, "epic"); fs.writeFileSync(`${LOCK_DIR}.pid`, String(process.pid)); } catch {}
 
 let cleaned = false;
 function cleanup(keepStatus) {
   if (cleaned) return; cleaned = true;
   try { fs.rmSync(LOCK_DIR, { recursive: true, force: true }); } catch {}
-  for (const f of [`${LOCK_DIR}.phase`, `${LOCK_DIR}.pid`, STOP_FILE, CONFLICT_REQ_FILE]) { try { fs.unlinkSync(f); } catch {} }
+  for (const f of [`${LOCK_DIR}.phase`, `${LOCK_DIR}.pid`, STOP_FILE, CONFLICT_REQ_FILE, CARD_REQ_FILE]) { try { fs.unlinkSync(f); } catch {} }
   if (!keepStatus) { try { fs.unlinkSync(STATUS_FILE); } catch {} }
 }
 // paused/done/stopped 는 상태 파일을 남긴다 — 대시보드가 사유를 보여주고 재개 버튼을 띄운다.
@@ -741,6 +756,44 @@ async function stepAwaitMerge(task) {
 }
 const STEP_FN = { prepare: stepPrepare, plan: stepPlan, adopt: stepAdopt, build: stepBuild, ci: stepCi, approve: stepApprove, "await-merge": stepAwaitMerge };
 
+// ----- 카드 중단 알림 -----
+// 단계 사유는 증상('리뷰 승인이 남았습니다')이라, 이번 실행의 에이전트 출력에서 원인과 선택지를 뽑아 붙인다.
+// 리뷰 루프는 반영에 실패해도 0 으로 끝나 build 가 '성공'하므로, 원인은 rework 출력 파일에만 남는다.
+const TASK_START = new Map();   // key → 이번 실행에서 그 카드를 띄운 시각(ms). 지난 실행의 출력 파일을 섞지 않으려고
+const NOTIFIED_FAIL = new Set();   // 진행 중에 이미 중단 알림(원인·버튼)을 보낸 카드 — 에픽이 멈출 때 또 보내지 않는다
+async function failureNotice(r, tail) {
+  const texts = [r.lastError || ""];
+  const rework = path.join(STATE_DIR, `${r.key}.reviewloop.rework.out`);
+  try {
+    if (fs.statSync(rework).mtimeMs >= (TASK_START.get(r.key) || 0)) texts.push(fs.readFileSync(rework, "utf8"));
+  } catch {}
+  const dg = lib.failureDigest(texts);
+  let pr = null;
+  try { const prs = await cardOpenPRs(r.key); pr = prs.find((p) => !p.approved) || prs[0] || null; } catch {}
+  const lines = [`⏸ [${EPIC_KEY}] ${r.key} · ${r.step} 에서 중단 — ${r.reason}`];
+  if (dg.lines.length) lines.push("*원인 요약*", ...dg.lines.map((l) => `• ${l}`));
+  const btns = [];
+  try { fs.unlinkSync(decisionFile(r.key)); } catch {}
+  if (dg.decision) {
+    lines.push(`*결정 필요* ${dg.decision.question}`, ...dg.decision.options.map((o) => `• ${o.id}) ${o.label}`));
+    lines.push("선택지를 누르면 PR·Jira 에 결정 코멘트를 남기고 이 카드를 다시 시도합니다.");
+    try {
+      fs.writeFileSync(decisionFile(r.key), JSON.stringify({
+        card: r.key, epic: EPIC_KEY, project: project.id, question: dg.decision.question, options: dg.decision.options,
+        owner: pr ? pr.owner : "", number: pr ? String(pr.number) : "", at: nowIso(),
+      }, null, 2));
+      for (const o of dg.decision.options) btns.push({ id: "decide", project: project.id, key: r.key, epic: EPIC_KEY, step: o.id, label: `${o.id}) ${o.label}` });
+    } catch {}
+  }
+  if (tail) lines.push(tail);
+  btns.push({ id: "card-retry", project: project.id, key: r.key, epic: EPIC_KEY });
+  if (lib.nextEpicStep(r.step)) btns.push({ id: "card-skip", project: project.id, key: r.key, epic: EPIC_KEY });
+  if (pr) btns.push({ url: pr.url, label: "🔗 PR 열기" });
+  btns.push({ url: `https://${cfg.jiraSite}/browse/${r.key}`, label: "🔗 Jira 열기" });
+  btns.push(...epicBtn("epic-stop"));
+  await slack(lines.join("\n"), btns);
+}
+
 // ----- 메인 -----
 (async () => {
   // 에픽 설명(설계안)을 파일로 저장 → 하위 태스크 프롬프트에 주입
@@ -781,6 +834,7 @@ const STEP_FN = { prepare: stepPrepare, plan: stepPlan, adopt: stepAdopt, build:
   // 함께 돌던 카드들의 처리는 스케줄러(lib.runEpicSlots)가 정한다.
   async function runTask(task0, startStep) {
     let task = task0, step = startStep;
+    TASK_START.set(task.key, Date.now());
     // 어느 단계에서 시작하든 라벨부터 이번 실행 기준으로 맞춘다(prepare 를 건너뛰는 카드 포함).
     try {
       const sync = await syncTaskLabels(task);
@@ -810,6 +864,22 @@ const STEP_FN = { prepare: stepPrepare, plan: stepPlan, adopt: stepAdopt, build:
     stopRequested,
     runTask,
     preferKeys: () => [...resumePoints.keys()],
+    takeRetries: takeCardRequests,
+    // ci·approve 에서 다시 시도하면 [이어서 진행]과 같이 미승인 PR 에 리뷰 루프를 한 번 다시 태운다.
+    retryStep: (t, step) => { if (lib.reviewOnResume(step)) REVIEW_ON_RESUME.add(t.key); return step; },
+    onRetry: (req, res) => {
+      if (!res.ok) {
+        const why = res.why === "last-step" ? "마지막 단계라 건너뛸 수 없습니다" : "멈춘 카드가 아닙니다(이미 다시 시작됐거나 끝남)";
+        log(`다시 시도 요청 무시: ${req.key} — ${why}`);
+        notify(`ℹ️ [${EPIC_KEY}] ${req.key} 다시 시도 요청을 처리하지 않았습니다 — ${why}`);
+        return;
+      }
+      try { fs.unlinkSync(decisionFile(req.key)); } catch {}
+      NOTIFIED_FAIL.delete(req.key);
+      log(`다시 시도: ${req.key} · ${res.step}${req.skip ? " (건너뛰기)" : ""}`);
+      notify(`🔁 [${EPIC_KEY}] ${req.key} · ${res.step} 부터 다시 시도합니다${req.skip ? " (멈춘 단계 건너뜀)" : ""}`);
+      setWorker(req.key, { step: res.step, stepStartedAt: nowIso(), status: "running", reason: "", ...AWAIT_RESET });
+    },
     startStep: (t) => {
       const resumed = resumePoints.get(t.key) || legacyStep;
       const step = resumed || t.step;
@@ -829,8 +899,12 @@ const STEP_FN = { prepare: stepPrepare, plan: stepPlan, adopt: stepAdopt, build:
         setWorker(r.key, { status: "failed", step: r.step, reason: r.reason });
         log(`중단: ${r.key} · ${r.step}: ${r.reason}`);
         history(r.key, "paused");
+        // 함께 돌던 카드가 없으면 곧 에픽이 멈추며 아래 paused 처리에서 알린다(같은 알림 두 번 방지).
         if (active.length) {
-          notify(`⏸ [${EPIC_KEY}] ${r.key} · ${r.step} 에서 중단 — ${r.reason}\n새 태스크는 시작하지 않고, 진행 중인 ${active.length}건(${active.join(", ")})이 끝나면 멈춥니다.`);
+          NOTIFIED_FAIL.add(r.key);
+          const p = failureNotice(r, `새 태스크는 시작하지 않고, 진행 중인 ${active.length}건(${active.join(", ")})이 끝나면 멈춥니다. 그 전에 이 카드만 다시 시도할 수 있습니다.`)
+            .catch(() => {}).finally(() => sent.delete(p));
+          sent.add(p);
         }
         return;
       }
@@ -861,8 +935,13 @@ const STEP_FN = { prepare: stepPrepare, plan: stepPlan, adopt: stepAdopt, build:
   if (res.outcome === "paused") {
     // 실패 카드만 남아 있다(WORKERS) — 각자 멈춘 단계가 재개 지점이다.
     const fs0 = res.failures;
-    await slack(`⏸ [${EPIC_KEY}] ${fs0.map((f) => `${f.key} · ${f.step}`).join(", ")} 에서 중단 — ${fs0.map((f) => f.reason).join(" / ")}`,
-      epicBtn("epic-resume", "epic-skip", "epic-stop"));
+    // 카드마다 원인·선택지를 따로 보낸다. 이미 '진행 중 카드가 끝나면 멈춤' 알림을 받은 카드는 다시 보내지 않는다.
+    const fresh = fs0.filter((f) => !NOTIFIED_FAIL.has(f.key));
+    for (const f of fresh) await failureNotice(f, `${EPIC_LABEL} 연속 개발이 멈췄습니다. 다시 시도하면 이어서 진행됩니다.`).catch(() => {});
+    if (fs0.length > 1 || !fresh.length) {
+      await slack(`⏸ [${EPIC_KEY}] ${fs0.map((f) => `${f.key} · ${f.step}`).join(", ")} 에서 중단 — ${fs0.map((f) => f.reason).join(" / ")}`,
+        epicBtn("epic-resume", "epic-skip", "epic-stop"));
+    }
     finish("paused", fs0.map((f) => `${f.key} · ${f.step}: ${f.reason}`).join(" / "), 1, { lastError: fs0[0].lastError || "", pausedAt: nowIso() });
   }
   if (res.outcome === "blocked") {

@@ -168,6 +168,8 @@ Jira 카드를 자동으로 탐지해 **Claude가 개발 → PR 생성 → 카�
 
 사람이 하는 일은 **PR 병합 하나**입니다(질문 답변은 plan 의 제안 답변으로 자동 채택).
 어느 단계든 실패하면 멈추고 알림을 보내며, 대시보드에서 **[이어서 진행]** 으로 그 지점부터 재개합니다.
+중단 알림에는 에이전트 출력에서 뽑은 **원인 요약**과, 에이전트가 사람의 결정을 요구했으면 **선택지 버튼**이 붙습니다.
+다른 카드가 아직 도는 중이어도 Slack **[🔁 이 카드 다시 시도]·[⏭ 이 카드 다음 단계로]** 로 멈춘 카드만 다시 띄울 수 있습니다([7.5](#75-slack-알림-버튼으로-원격-조작)).
 동시 실행 중 한 카드가 실패하면 **새 카드는 시작하지 않고, 돌던 카드가 끝까지 간 뒤** 전체가 멈춥니다
 ([이어서 진행]은 카드마다 멈춘 단계부터).
 
@@ -242,7 +244,7 @@ Sentry 가 잡은 에러를 **「Sentry 작동 업무 처리」 에픽의 하위
 - **자기 중첩 방지 가드**: `REWORK=1` 이거나 `IN_REVIEW_LOOP=1` 이면 `REVIEW_LOOP_AFTER=1` 이어도 루프를 띄우지 않는다. 이 플래그는 대시보드가 **최상위 build 프로세스 env** 에 넣는 값이라 자손이 그대로 상속하는데, 루프가 회차마다 부르는 rework 실행이 이를 물려받아 루프를 또 띄우면 중첩 실행이 루프 락에 막혀 `SKIP` 을 남기고 부모 루프가 그 줄을 반영 실패로 오인해 멈춘다(4.3c 의 '연쇄 플래그 차단'과 한 쌍).
 - `REVIEW_AFTER`(rework 후 1회 재리뷰)와는 **배타적**이다 — 대시보드는 rework·충돌 해소가 아닌 순수 build 단건 실행에만 이 옵션을 붙인다.
 
-**결과 분류**: `success`(PR 생성) · `rework`(기존 PR 갱신) · **`noop`(rework 인데 반영할 새 피드백이 없어 무변경 — 정상, exit 0·실패 카운터 초기화)** · `skip`(답변 대기 등) · **`already-done`(build 인데 요구 변경이 이미 base 에 있어 바꿀 코드가 없음 — 엔진이 마지막 줄에 `ALREADY_IMPLEMENTED: <repo>@<커밋> · <확인한 테스트>` 를 출력. 정상 종료, `.fail` 초기화 후 대시보드 `POST /api/cards/:key/already-done` 으로 근거 코멘트 + 완료 상태 전환 + `claude-failed` 제거. 전환이 실패하면 카드는 그대로 두고 Slack 으로 사람 확인을 요청)** · `incomplete`(build/rework 인데 PR 도 무변경 마커도 없음 → 재시도 대상) · `failed`. `noop` 은 엔진이 마지막 줄에 `NO_REWORK_NEEDED` 를 출력해 알린다(rework 프롬프트의 '종료 규칙'). **줄 전체가 마커일 때만** 인식한다(강조 `**`·백틱 허용). rework 가 권한 거부 등으로 **반영에 실패**하면 엔진은 종료코드를 바꿀 수 없으므로 마지막 줄에 `REWORK_FAILED: <사유>` 를 출력하고, 스크립트는 이를 `failed`(exit 1, `.fail` 증가)로 분류하며 `리뷰 반영 실패: <사유>` 를 찍는다 — 승인 루프는 이 사유를 중단 메시지·Slack 알림에 싣는다. 이 구분이 없을 때는 무변경 rework 가 `incomplete`+exit 1 로 처리돼 승인 루프가 **반영 실패로 오인 중단**했다(11 트러블슈팅).
+**결과 분류**: `success`(PR 생성) · `rework`(기존 PR 갱신) · **`noop`(rework 인데 반영할 새 피드백이 없어 무변경 — 정상, exit 0·실패 카운터 초기화)** · `skip`(답변 대기 등) · **`already-done`(build 인데 요구 변경이 이미 base 에 있어 바꿀 코드가 없음 — 엔진이 마지막 줄에 `ALREADY_IMPLEMENTED: <repo>@<커밋> · <확인한 테스트>` 를 출력. 정상 종료, `.fail` 초기화 후 대시보드 `POST /api/cards/:key/already-done` 으로 근거 코멘트 + 완료 상태 전환 + `claude-failed` 제거. 전환이 실패하면 카드는 그대로 두고 Slack 으로 사람 확인을 요청)** · `incomplete`(build/rework 인데 PR 도 무변경 마커도 없음 → 재시도 대상) · `failed`. `noop` 은 엔진이 마지막 줄에 `NO_REWORK_NEEDED` 를 출력해 알린다(rework 프롬프트의 '종료 규칙'). **줄 전체가 마커일 때만** 인식한다(강조 `**`·백틱 허용). rework 가 권한 거부 등으로 **반영에 실패**하면 엔진은 종료코드를 바꿀 수 없으므로 마지막 줄에 `REWORK_FAILED: <사유>` 를 출력하고, 스크립트는 이를 `failed`(exit 1, `.fail` 증가)로 분류하며 `리뷰 반영 실패: <사유>` 를 찍는다 — 승인 루프는 이 사유를 중단 메시지·Slack 알림에 싣는다. 반영에 담당자의 결정이 먼저 필요하면 엔진은 실패 마커 앞에 `DECISION: <질문>` 과 `DECISION_OPTION a: <선택지>`(2~4개)를 낸다 — 에픽 러너가 이를 Slack 선택지 버튼으로 바꾼다([7.5](#75-slack-알림-버튼으로-원격-조작)). 이 구분이 없을 때는 무변경 rework 가 `incomplete`+exit 1 로 처리돼 승인 루프가 **반영 실패로 오인 중단**했다(11 트러블슈팅).
 
 매 실행 종료 시 결과(성공/스킵/실패 + PR URL·브랜치)를 `HISTORY_FILE`(기본 `history.jsonl`)에 JSONL 로 기록한다. **성공/rework 시 생성된 PR 이 여러 개면(멀티 repo) PR 마다 한 줄씩** 기록해 처리 이력에 개별 행으로 보이게 한다(PR 없는 skip 은 1줄). **브랜치명은 각 PR URL 로 `gh pr view --json headRefName` 을 조회해 PR 의 실제 head 브랜치를 사용**하므로 `feat/`·`fix/` 등 접두사에 무관하게 정확히 기록된다(조회 실패 시 claude 출력에서 접두사 포괄 추출로 폴백). 대시보드 병합(`/api/cards/:key/merge`)도 동일하게 병합된 PR 의 head 브랜치를 이력에 남긴다.
 
@@ -629,6 +631,8 @@ CI 가 끝난 뒤 에픽 러너의 '병합만 남음' 알림이 또 와서 그�
 | GET | `/api/epics/:key/children` | 상위 카드의 **내게 할당된 미완료 하위 태스크(Jira 순위순, `assignee = currentUser()` — 남의·미할당 카드 제외)** + 각 카드의 시작 단계(`step`) · **선행 카드 `blockedBy[]`(`{key,status,done}`)와 미완료 선행 키 `waitingOn[]`**. Rank 정렬 실패 시 생성순, `parent` 절 실패 시 `"Epic Link"` 로 폴백(`lib.searchEpicChildren`). 각 태스크에 **`assignedToMe`**(내 accountId 와 assignee 비교, `/myself` 판별) · `assignee`(표시명) · `url`(Jira 링크)를 함께 반환 — 연속 개발 패널에서 태스크를 펼쳐 카드 상세를 볼 때 '답변 등록' 노출 여부를 가른다 |
 | GET | `/api/epics/:key/run` | **에픽 연속 개발 상태**(대시보드 5초 폴링) — `{running,pid,status,reason,step,index,total,current,tasks,repos}`. 락 PID 생존 확인 + 스테일 락 정리, 락 없이 `running` 인 상태 파일은 `paused` 로 정규화(크래시 복구). 중단 상태면 `retry`(`{attempt,max,willRetry,at,kind,label,why,source}`)로 **자동 재시도 예정/미실행 사유**를 함께 준다 |
 | POST | `/api/epics/:key/run` | **에픽 연속 개발 시작** — body `{repos:[name], reviewLoopMax?, autoMerge?, autoMergeAfterMin?, autoRetry?, autoRetryMax?, autoResolveConflict?, conflictAfterMin?, parallelExtra?}`. `run-epic-loop.js` 를 detached 로 띄워 하위 태스크를 Jira 순위순으로 처리(`parallelExtra` 0~4 — 선행 없는 카드를 1+N 건까지 함께)([4.3d](#43d-run-epic-loopjs-에픽-연속-개발--하위-태스크-순차-자동화)). 에픽당 1개만 실행. repo 미선택이면 거부 |
+| POST | `/api/epics/:key/run/card` | **멈춘 카드 한 장만 다시 시도** — body `{card, skip?}`. 러너가 돌고 있으면(다른 카드 진행 중) 그 카드가 `workers[]` 에서 `failed` 일 때만 요청 파일(`.state/<EPIC>.epic.card.json`)로 넘기고 `queued:true`·`step` 을 준다(러너가 최대 1분 안에 처리). 진행 중인 카드·마지막 단계 건너뛰기는 거부. 에픽이 `paused`/`stopped` 면 그 카드의 재개 지점만 바꿔(`skip` 이면 다음 단계) 재개한다 — 나머지 카드는 각자 멈춘 단계 그대로 |
+| POST | `/api/cards/:key/decide` | **에이전트 선택지 고르기**(Slack `[a) …]` 버튼) — body `{epic, option}`. `.state/<KEY>.decision.json` 의 선택지로 `[결정 (id)] …` 코멘트를 PR(`gh pr comment`)·Jira 에 남기고 파일을 지운 뒤, `epic` 이 있으면 `/run/card` 와 같은 경로로 그 카드를 다시 시도한다. 응답 `posted`·`retry` |
 | POST | `/api/epics/:key/run/resume` | **멈춘 지점부터 이어서 진행** — body `{skip?}`. `skip:true` 면 멈춘 단계를 건너뛰고 다음 단계부터(동시 실행이면 멈춘 카드 전부 각자). `paused`/`stopped` 상태에서만 수용하며, 재개 단계는 멈췄던 그 카드에만 적용(카드별 `EPIC_RESUME_POINTS`). 응답 `resumedAt` 은 `K-1 · ci, K-3 · build` 형식. **대상 repo 는 상태 파일에 기록된 시작 시점 값**을 그대로 쓴다(요청 body 로 못 바꾼다). 기록이 비어 있으면 **전체로 넓히지 않고 거부**한다 |
 | POST | `/api/epics/:key/run/options` | **자동 병합·자동 재시도·자동 충돌 해소·동시 실행 옵션 변경**(실행 중에도 즉시 반영) — body `{autoMerge?, autoMergeAfterMin?, autoRetry?, autoRetryMax?, autoResolveConflict?, conflictAfterMin?, parallelExtra?}`. 생략한 필드는 기존 값 유지, 분은 1~1440·`parallelExtra` 는 0~4 로 clamp. `.state/<EPIC>.epic.opts.json` 에 저장하고 러너가 병합 대기 폴링·빈 슬롯 채우기마다 다시 읽는다 |
 | POST | `/api/epics/:key/run/stop` | **에픽 연속 개발 중지** — `.epic.stop` 플래그를 먼저 쓴 뒤 프로세스 트리를 SIGTERM→6초 후 SIGKILL·락 정리(상태 파일은 남겨 재개 가능). 6초 안에 [이어서 진행]으로 새 러너가 락을 잡았으면(락 pid 가 중지한 pid 와 다르고 살아 있음) 락을 지우지 않는다(`lib.stopLockClearable`) |
@@ -933,10 +937,27 @@ tail -f loop-plan.log loop-build.log
 |------|------|--------------|
 | `✅ 리뷰 승인 완료 · CI 통과` / `✅ PR 리뷰 승인 · CI 통과` (**CI 확정 후 발송** — [4.3f](#43f-리뷰-승인-알림의-ci-게이트-lib-notifysh)) | `🔀 병합` · `🔗 PR 열기` | `POST /api/cards/:key/merge` |
 | `⏸ 상한 도달·진전 없음 — 사람 확인 필요` | `🔁 재리뷰 루프` · `🔀 병합` · `🔗 PR` | `POST /api/cards/:key/review-loop` |
-| `⏸ 에픽 중단(paused)` | `▶️ 이어서 진행` · `⏭ 건너뛰기` · `⏹ 중지` | `POST /api/epics/:key/run/resume{,skip}` · `/run/stop` |
+| `⏸ 에픽 중단(paused)` — 멈춘 카드가 여럿일 때 | `▶️ 이어서 진행` · `⏭ 건너뛰기` · `⏹ 중지` | `POST /api/epics/:key/run/resume{,skip}` · `/run/stop` |
+| `⏸ [에픽] 카드 · 단계 에서 중단` — 카드마다 1건(다른 카드가 도는 중이든, 에픽이 멈췄든) | (선택지가 있으면) `a) …` · `b) …` + `🔁 이 카드 다시 시도` · `⏭ 이 카드 다음 단계로` · `🔗 PR 열기` · `🔗 Jira 열기` · `⏹ 중지` | `POST /api/cards/:key/decide` · `POST /api/epics/:epic/run/card{,skip}` |
 | `⏳ PR 병합 대기 중` | `🔀 병합` · `⏹ 중지` | `POST /api/cards/:key/merge` |
 | `❌ 카드 처리 실패` | `🔁 다시 실행` | `POST /api/cards/:key/run` |
 | `⚠️ base 충돌로 병합할 수 없습니다` | `⚠️ 충돌 해소·재푸시` · `🔗 PR 열기` · `⏹ 중지` | `POST /api/cards/:key/resolve-conflict` |
+
+**카드 중단 알림(원인 요약 · 선택지)** — 단계 사유(`리뷰 승인이 남았습니다` 등)는 증상일 뿐이라, 러너(`failureNotice`)가
+이번 실행의 에이전트 출력에서 원인을 뽑아 `*원인 요약*` 으로 붙인다(`lib.failureDigest`, 최대 5줄).
+- 읽는 곳: 실패한 단계의 출력 끝부분(`lastError`)과 `.state/<KEY>.reviewloop.rework.out`(이번 실행에서 그 카드를 띄운 뒤에 쓰인 것만).
+  리뷰 승인 루프는 반영에 실패해도 0 으로 끝나 build 가 '성공'하므로, 진짜 원인은 rework 출력에만 남는다(AML-210).
+- 뽑는 것: `REWORK_FAILED:` 사유, `**다음에 할 일:**`, `**반영하지 못한 이유**`·`**남은 문제**` 아래 항목.
+- **선택지**: rework 에이전트가 담당자의 결정이 필요해 멈출 때는 실패 마커 앞에 `DECISION: <질문>` 과
+  `DECISION_OPTION a: <선택지>`(2~4개)를 낸다(`run-jira-agent.sh` 종료 규칙, `lib.parseDecision`). 알림에 선택지마다 버튼이 붙고,
+  선택지는 `.state/<KEY>.decision.json` 에 남는다(버튼 value 에는 선택지 id 만). 누르면 `[결정 (b)] …` 코멘트(`lib.decisionComment`)를
+  PR·Jira 에 남기고 그 카드를 다시 시도한다 — ci·approve 에서 다시 시도하면 미승인 PR 에 리뷰 루프가 한 번 다시 돈다.
+  선택지에 사람이 할 일(후속 카드 만들기·범위 줄이기)이 들어 있으면 그 일은 담당자가 따로 한다.
+- **카드 한 장 다시 시도**: 다른 카드가 도는 중이면 요청을 `.state/<EPIC>.epic.card.json` 으로 러너에 넘기고, 러너가 다음 폴링(최대 1분)에서
+  그 카드를 멈춘 단계(건너뛰기면 다음 단계)부터 다시 띄운다(`lib.runEpicSlots` 의 `takeRetries`). 실패 목록에서 빠지므로 남은 실패가 없으면
+  새 카드도 다시 시작한다. 에픽이 이미 멈춰 있으면 그 카드만 지정 단계로 바꿔 재개한다.
+- 진행 중에 보낸 카드 알림은 에픽이 멈출 때 다시 보내지 않는다. 멈춘 카드가 여럿이면 에픽 전체 버튼(`이어서 진행` 등) 알림을 한 건 더 보낸다.
+- 버튼은 한 줄 5개씩, 한 알림에 최대 10개까지 붙는다. 버튼 글자는 75자에서 자른다.
 
 **안전장치**
 - **허용 사용자 화이트리스트**: `slackAllowUsers` 에 없는 사람이 누르면 실행되지 않고 거부 안내만 뜬다.
@@ -1017,7 +1038,7 @@ loop-work/                     # (= 저장소 루트)
    ├─ test/office.test.js      # docx·xlsx·pptx 변환 테스트 (실제 zip 컨테이너를 만들어 검증)
    ├─ test/epic-loop.test.js   # 에픽 연속 개발 순수 로직(단계 판정·다음 태스크·제안 답변 채택) 테스트
    ├─ test/sentry.test.js      # Sentry 자동 처리 순수 로직 테스트
-   ├─ test/slack-actions.test.js # Slack 버튼 블록 생성·payload 디코드·권한 판정 테스트
+   ├─ test/slack-actions.test.js # Slack 버튼 블록 생성(한 줄 5개·최대 10개)·payload 디코드·권한 판정·카드 다시 시도/선택 버튼 테스트
    ├─ package.json
    ├─ public/index.html        # React 대시보드 (CDN)
    ├─ projects.json            # 프로젝트 목록(설정) (gitignore)
@@ -1190,6 +1211,18 @@ CI 실패·미확정이면 **병합 버튼을 붙이지 않는다**(막히는 �
 구버전 코드라 반영되지 않는다 — **중지 후 [이어서 진행]** 하면 `await-merge` 에서 CI 실패를 감지해 수정을 시작한다.
 
 ---
+### 11.x 에픽 카드가 멈췄는데 Slack 에는 '리뷰 승인이 남았습니다' 한 줄뿐이고, 다른 카드가 끝날 때까지 손쓸 수 없다 (해결)
+
+증상: AML-210 이 `approve · 리뷰 승인이 남았습니다` 로 멈췄다. Slack 알림은 그 한 줄뿐이었고, 진짜 원인(리뷰가 카드 범위를 (a)/(b) 중 고르라고 요구했고
+에이전트는 담당자 결정 없이 반영할 수 없다고 판단)은 rework 출력에만 있었다. AML-208 build 가 도는 중이라 에픽이 아직 실행 중이어서 [이어서 진행]도 누를 수 없었다.
+
+원인: ① 리뷰 승인 루프는 반영 실패에도 0 으로 끝나 build·ci 가 통과하고, approve 는 승인 마커만 보므로 사유가 증상만 남는다.
+② 진행 중 카드가 있을 때의 중단 알림에는 버튼이 없었고, 재개는 에픽 전체가 멈춘 뒤에만 됐다. ③ 에이전트가 고르라고 한 선택지를 받을 길이 없었다.
+
+해결: 중단 알림에 원인 요약과 선택지 버튼을 붙이고(`failureNotice`·`lib.failureDigest`·`lib.parseDecision`), 카드 한 장만 다시 시도하는 경로
+(`/api/epics/:key/run/card`, 러너 요청 파일 `.epic.card.json`)와 선택지 결정 경로(`/api/cards/:key/decide`)를 더했다([7.5](#75-slack-알림-버튼으로-원격-조작)).
+선택지는 에이전트가 `DECISION:` 형식으로 냈을 때만 붙는다 — 이전 출력처럼 산문으로만 쓴 경우에는 원인 요약과 다시 시도 버튼만 온다.
+
 ### 11.x 리뷰 미승인으로 멈춘 에픽을 [이어서 진행]해도 2초 만에 다시 멈춘다
 
 증상: `approve` 에서 `리뷰 승인이 남았습니다` 로 멈춘 에픽을 [이어서 진행]하면 `· approve …` 직후 같은 사유로 다시 중단된다

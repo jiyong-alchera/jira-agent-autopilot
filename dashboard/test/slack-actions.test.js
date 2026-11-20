@@ -50,9 +50,38 @@ test("링크 버튼은 url 만 갖고 인터랙션 대상이 아니다", () => {
   assert.strictEqual(el.value, undefined);
 });
 
-test("Slack actions 블록 상한(5개)을 넘지 않는다", () => {
-  const many = ["merge", "review-loop", "card-run", "epic-resume", "epic-skip", "epic-stop"].map((id) => act({ id }));
-  assert.strictEqual(lib.slackMessage("t", many).blocks[1].elements.length, 5);
+test("버튼은 한 줄 5개씩, 최대 10개까지만 붙는다", () => {
+  const six = ["merge", "review-loop", "card-run", "epic-resume", "epic-skip", "epic-stop"].map((id) => act({ id }));
+  const m = lib.slackMessage("t", six);
+  assert.deepStrictEqual(m.blocks.slice(1).map((b) => b.elements.length), [5, 1]);
+  const many = Array.from({ length: 12 }, () => act({ id: "epic-stop" }));
+  assert.deepStrictEqual(lib.slackMessage("t", many).blocks.slice(1).map((b) => b.elements.length), [5, 5]);
+});
+
+test("카드 다시 시도·건너뛰기·선택 버튼은 에픽 키와 선택지 id 를 실어 보낸다", () => {
+  const m = lib.slackMessage("t", [
+    act({ id: "decide", key: "AML-210", epic: "AML-164", step: "b", label: `b) ${"아주 긴 선택지 설명 ".repeat(10)}` }),
+    act({ id: "card-retry", key: "AML-210", epic: "AML-164" }),
+    act({ id: "card-skip", key: "AML-210", epic: "AML-164" }),
+  ]);
+  const [dec, retry, skip] = m.blocks[1].elements;
+  assert.ok(dec.text.text.length <= 75);                       // Slack 버튼 글자 상한
+  const d = lib.decodeSlackAction(dec.value);
+  assert.deepStrictEqual([d.id, d.key, d.epic, d.step], ["decide", "AML-210", "AML-164", "b"]);
+  const def = lib.SLACK_ACTIONS;
+  assert.strictEqual(def.decide.api(d), "/api/cards/AML-210/decide");
+  assert.deepStrictEqual(def.decide.body(d), { epic: "AML-164", option: "b" });
+  const r = lib.decodeSlackAction(retry.value);
+  assert.strictEqual(def["card-retry"].api(r), "/api/epics/AML-164/run/card");
+  assert.deepStrictEqual(def["card-retry"].body(r), { card: "AML-210" });
+  assert.deepStrictEqual(def["card-skip"].body(lib.decodeSlackAction(skip.value)), { card: "AML-210", skip: true });
+  assert.strictEqual(def["card-retry"].api({ key: "AML-210" }), "/api/epics/-/run/card");
+});
+
+test("카드 다시 시도·선택 결과 줄", () => {
+  assert.match(resultLine("card-retry", { ok: true, message: "러너에 넘겼습니다" }), /🔁 러너에 넘겼습니다/);
+  assert.match(resultLine("decide", { ok: true, message: "결정 (b)", retry: { ok: false } }), /결정 \(b\).*다시 시도는 안 됨/);
+  assert.match(resultLine("card-skip", { ok: false, message: "마지막 단계" }), /실패 — 마지막 단계/);
 });
 
 test("모르는 동작 id·깨진 JSON·잘못된 이슈 키는 디코드되지 않는다", () => {
@@ -113,7 +142,8 @@ test("결과 문구는 라우트별 응답 모양을 흡수한다", () => {
 
 test("SLACK_ACTIONS 의 모든 동작이 대시보드 API 경로로 매핑된다", () => {
   for (const [id, def] of Object.entries(lib.SLACK_ACTIONS)) {
-    const url = def.api({ key: "EKYB-1" });
+    // 카드 단위 에픽 동작은 에픽 키로 간다 — 테스트에선 같은 키를 준다. 에픽 키가 없으면 형식 오류(400)로 막힌다.
+    const url = def.api({ key: "EKYB-1", epic: "EKYB-1" });
     assert.match(url, /^\/api\/(cards|epics)\/EKYB-1\//, `${id} 경로 오류: ${url}`);
     assert.strictEqual(typeof def.body({ owner: "o", number: "1" }), "object");
   }

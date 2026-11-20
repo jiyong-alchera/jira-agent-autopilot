@@ -904,3 +904,93 @@ test("epicOwnedBy: 상태 폴더를 공유하는 다른 프로젝트의 에픽�
   assert.equal(lib.epicOwnedBy({ project: "physicalai" }, "ekyb"), false);
   assert.equal(lib.epicOwnedBy({}, "ekyb"), true);
 });
+
+// ----- 멈춘 카드 한 장만 다시 시도(takeRetries) -----
+test("runEpicSlots: 다른 카드가 도는 동안 멈춘 카드만 다시 시도 — 성공하면 새 카드도 다시 시작", async () => {
+  let k1Runs = 0;
+  const done = new Set();
+  const started = [];
+  const reqs = [];
+  const retried = [];
+  const h = {
+    cfg: CFG, pollMs: 5, capacity: () => 2, stopRequested: () => false,
+    fetchChildren: async () => ["K-1", "K-2", "K-3"].filter((k) => !done.has(k)).map((key) => ({ key, labels: [], blockedBy: [] })),
+    runTask: async (t, step) => {
+      started.push(`${t.key}:${step}`);
+      if (t.key === "K-1" && k1Runs++ === 0) return { ok: false, step: "approve", reason: "리뷰 승인이 남았습니다" };
+      if (t.key === "K-2") { reqs.push({ key: "K-1" }); await new Promise((r) => setTimeout(r, 30)); }
+      done.add(t.key);
+      return { ok: true };
+    },
+    takeRetries: () => reqs.splice(0),
+    retryStep: (t, step) => { retried.push(`${t.key}:${step}`); return step; },
+  };
+  const r = await lib.runEpicSlots(h);
+  assert.equal(r.outcome, "done");
+  assert.equal(r.doneCount, 3);
+  assert.deepEqual(retried, ["K-1:approve"]);
+  assert.ok(started.includes("K-1:approve"), "멈춘 단계(approve)부터 다시");
+  assert.ok(started.includes("K-3:prepare"), "실패가 풀리면 새 카드도 시작");
+});
+
+test("runEpicSlots: 멈춘 카드가 아니거나 마지막 단계 건너뛰기는 거절", async () => {
+  const reqs = [{ key: "K-9" }];
+  const seenRetry = [];
+  const h = {
+    cfg: CFG, pollMs: 5, capacity: () => 2, stopRequested: () => false,
+    fetchChildren: async () => [{ key: "K-1", labels: [], blockedBy: [] }, { key: "K-2", labels: [], blockedBy: [] }],
+    runTask: async (t) => {
+      if (t.key === "K-1") return { ok: false, step: "await-merge", reason: "자동 병합 실패" };
+      reqs.push({ key: "K-1", skip: true });
+      await new Promise((r) => setTimeout(r, 20));
+      return { stop: true, step: "build" };
+    },
+    takeRetries: () => reqs.splice(0),
+    onRetry: (req, res) => seenRetry.push(`${req.key}:${res.ok ? res.step : res.why}`),
+  };
+  const r = await lib.runEpicSlots(h);
+  assert.equal(r.outcome, "stopped");
+  assert.ok(seenRetry.includes("K-9:not-failed"));
+  assert.ok(seenRetry.includes("K-1:last-step"));
+});
+
+test("epicRetryStep: 그 단계부터, 건너뛰면 다음 단계, 마지막 단계 건너뛰기는 null", () => {
+  assert.equal(lib.epicRetryStep("approve", false), "approve");
+  assert.equal(lib.epicRetryStep("approve", true), "await-merge");
+  assert.equal(lib.epicRetryStep("await-merge", true), null);
+  assert.equal(lib.epicRetryStep("엉뚱함", false), null);
+});
+
+// AML-210 때 실제 rework 출력 모양 — 단계 사유는 '리뷰 승인이 남았습니다' 뿐이었다.
+const REWORK_SAMPLE = [
+  "PR #144의 새 리뷰를 확인했고, 지금은 반영할지 판단하고 있습니다.",
+  "",
+  "**반영하지 못한 이유**",
+  "- (b)는 담당자가 정해야 합니다. 자동화가 대신 결정하거나, 카드 범위를 줄이거나, 후속 카드를 만들 수 없습니다.",
+  "- (a)는 한 번의 실행으로 끝낼 수 없는 양입니다.",
+  "",
+  "**다음에 할 일:** 담당자가 Jira AML-210에 (a)나 (b) 중 하나를 '[결정 …]' 코멘트로 남겨야 합니다.",
+  "",
+  "DECISION: AML-210 남은 일을 어떻게 처리할까요?",
+  "DECISION_OPTION a: 남은 일 약 3,900줄을 이 PR 에 이어 넣기",
+  "DECISION_OPTION b: 이 PR 을 1단계로 받고 후속 카드로 나누기",
+  "REWORK_FAILED: 남은 리뷰 지적(카드 범위)은 담당자의 결정이 Jira에 없어 반영할 수 없음",
+].join("\n");
+
+test("failureDigest: rework 출력에서 실패 사유·막힌 이유·다음 할 일·선택지를 뽑는다", () => {
+  const d = lib.failureDigest(["", REWORK_SAMPLE]);
+  assert.ok(d.lines[0].startsWith("(b)는 담당자가 정해야"));
+  assert.ok(d.lines.some((l) => l.startsWith("다음에 할 일: 담당자가 Jira AML-210")));
+  assert.ok(d.lines.some((l) => l.startsWith("리뷰 반영 실패: 남은 리뷰 지적")));
+  assert.ok(d.lines.length <= 5);
+  assert.equal(d.decision.question, "AML-210 남은 일을 어떻게 처리할까요?");
+  assert.deepEqual(d.decision.options.map((o) => o.id), ["a", "b"]);
+});
+
+test("parseDecision: 마지막 묶음만, 선택지 2개 미만·중복 id 는 버린다", () => {
+  assert.equal(lib.parseDecision("DECISION: q\nDECISION_OPTION a: 하나뿐"), null);
+  const d = lib.parseDecision("DECISION: 옛 질문\nDECISION_OPTION a: x\nDECISION_OPTION b: y\n**DECISION:** 새 질문\n- DECISION_OPTION A: 하나\nDECISION_OPTION a: 중복\nDECISION_OPTION c: 셋");
+  // 굵게·목록 표시가 붙어도 읽고, 마지막 묶음만 쓴다. 대소문자가 다른 같은 id 는 한 번만.
+  assert.equal(d.question, "새 질문");
+  assert.deepEqual(d.options, [{ id: "a", label: "하나" }, { id: "c", label: "셋" }]);
+});

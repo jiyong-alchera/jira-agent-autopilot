@@ -1273,6 +1273,79 @@ app.post("/api/epics/:key/run/resume", (req, res) => {
     res.json({ ...runEpicLoop(key, id, { repos: cur.repos || [], reviewLoopMax, resumePoints, epicLabel: cur.label, ...opts }), resumedAt, opts });
   } catch (e) { fail(res, e); }
 });
+// ----- 에픽 안에서 멈춘 카드 한 장만 다시 시도 -----
+// 러너가 돌고 있으면(다른 카드 진행 중) 요청 파일로 넘기고, 에픽이 멈춰 있으면 그 카드만 지정 단계로 재개한다.
+const epicCardReqPath = (cfg, key) => path.join(stateDirOf(cfg), `${key}.epic.card.json`);
+function epicCardRetry(cfg, projectId, epicKey, card, skip) {
+  const cur = epicRunStatus(cfg, epicKey);
+  const w = (cur.workers || []).find((x) => x && x.key === card)
+    || (cur.current && cur.current.key === card ? { key: card, step: cur.step, status: "failed" } : null);
+  if (!w || !w.step) return { ok: false, message: `${card} 는 ${epicKey} 실행에서 멈춘 카드가 아닙니다.` };
+  if (cur.running) {
+    if (w.status !== "failed") return { ok: false, message: `${card} 는 지금 ${w.step} 단계를 진행 중입니다.` };
+    if (skip && !lib.nextEpicStep(w.step)) return { ok: false, message: `${card} 는 마지막 단계(${w.step})라 건너뛸 수 없습니다.` };
+    let list = [];
+    try { list = JSON.parse(fs.readFileSync(epicCardReqPath(cfg, epicKey), "utf8")); } catch {}
+    list = (Array.isArray(list) ? list : []).filter((r) => r && r.key !== card);
+    list.push({ key: card, skip: !!skip, at: new Date().toISOString() });
+    try { fs.mkdirSync(stateDirOf(cfg), { recursive: true }); fs.writeFileSync(epicCardReqPath(cfg, epicKey), JSON.stringify(list, null, 2)); }
+    catch (e) { return { ok: false, message: `요청 파일 기록 실패: ${e.message}` }; }
+    const step = lib.epicRetryStep(w.step, skip);
+    return { ok: true, queued: true, step, message: `러너에 넘겼습니다 — 1분 안에 ${card} 를 ${step} 단계부터 다시 시작합니다.` };
+  }
+  if (!["paused", "stopped"].includes(cur.status)) return { ok: false, message: `이어서 진행할 수 있는 상태가 아닙니다(${cur.status}).` };
+  if (!(cur.repos || []).length) return { ok: false, message: "이전 실행의 대상 repo 기록이 없습니다." };
+  const resumePoints = lib.epicResumePoints(cur)
+    .map((p) => (p.key === card ? { key: p.key, step: lib.epicRetryStep(p.step, skip) } : p))
+    .filter((p) => p.step);
+  const opts = readEpicOpts(cfg, epicKey);
+  const r = runEpicLoop(epicKey, projectId, { repos: cur.repos, reviewLoopMax: clampReviewLoopMax(null, cfg), resumePoints, epicLabel: cur.label, ...opts });
+  const pt = resumePoints.find((p) => p.key === card);
+  return { ...r, resumed: true, step: pt ? pt.step : "", message: r.ok ? `${epicKey} 를 이어서 진행합니다 — ${card} 는 ${pt ? `${pt.step} 단계부터` : "단계를 다시 판정해"} 시작합니다.` : r.message };
+}
+app.post("/api/epics/:key/run/card", (req, res) => {
+  const key = req.params.key;
+  const card = String((req.body || {}).card || "");
+  if (!/^[A-Z][A-Z0-9]+-[0-9]+$/.test(key) || !/^[A-Z][A-Z0-9]+-[0-9]+$/.test(card)) return res.status(400).json({ ok: false, message: "이슈 키 형식 오류" });
+  {
+    const off = lib.disabledMessage(getProject(String((req.query && req.query.project) || (req.body && req.body.project) || defaultProjectId() || "")));
+    if (off) return res.json({ ok: false, message: off });
+  }
+  try {
+    const { id, cfg } = resolveProject(req);
+    res.json(epicCardRetry(cfg, id, key, card, !!(req.body || {}).skip));
+  } catch (e) { fail(res, e); }
+});
+// 에이전트가 낸 선택지 중 하나를 고른다(Slack [선택] 버튼). 결정 코멘트를 PR·Jira 에 남긴 뒤 그 카드를 다시 시도한다.
+// 선택지는 러너가 중단 알림을 보낼 때 남긴 <KEY>.decision.json 에서 읽는다 — 버튼 value 에는 선택지 id 만 싣는다.
+app.post("/api/cards/:key/decide", async (req, res) => {
+  const key = req.params.key;
+  if (!/^[A-Z][A-Z0-9]+-[0-9]+$/.test(key)) return res.status(400).json({ ok: false, message: "이슈 키 형식 오류" });
+  try {
+    const { id, cfg, cred } = resolveProject(req);
+    const file = path.join(stateDirOf(cfg), `${key}.decision.json`);
+    const d = lib.readJson(file, null);
+    if (!d || !Array.isArray(d.options)) return res.json({ ok: false, message: "고를 선택지가 없습니다(이미 골랐거나 카드가 다시 시작됨)." });
+    const opt = d.options.find((o) => o.id === String((req.body || {}).option || ""));
+    if (!opt) return res.json({ ok: false, message: "알 수 없는 선택지입니다." });
+    const body = lib.decisionComment(d, opt);
+    const posted = [];
+    if (d.owner && d.number) {
+      const tmp = path.join(stateDirOf(cfg), `${key}.decision-comment.md`);
+      fs.writeFileSync(tmp, body);
+      const r = await gh(["pr", "comment", String(d.number), "--repo", d.owner, "--body-file", tmp], cred);
+      try { fs.unlinkSync(tmp); } catch {}
+      if (!r.ok) return res.json({ ok: false, message: `PR 코멘트 실패: ${(r.stderr || "").slice(0, 160)}` });
+      posted.push(`${d.owner}#${d.number}`);
+    }
+    try { await jiraReq("POST", `/rest/api/3/issue/${encodeURIComponent(key)}/comment`, { body: mdToADF(body) }, cfg, cred); posted.push(key); }
+    catch (e) { return res.json({ ok: false, message: `Jira 코멘트 실패: ${String(e.message || e).slice(0, 160)}` }); }
+    try { fs.unlinkSync(file); } catch {}
+    const epic = String((req.body || {}).epic || d.epic || "");
+    const retry = /^[A-Z][A-Z0-9]+-[0-9]+$/.test(epic) ? epicCardRetry(cfg, id, epic, key, false) : { ok: false, message: "에픽 정보가 없어 다시 시도는 하지 않았습니다." };
+    res.json({ ok: true, option: opt.id, posted, retry, message: `결정 (${opt.id}) 코멘트를 남겼습니다(${posted.join(", ")}). ${retry.message || ""}`.trim() });
+  } catch (e) { fail(res, e); }
+});
 // 자동 병합 옵션 변경 — 실행 중에도 즉시 반영된다(러너가 await-merge 폴링마다 옵션 파일을 다시 읽음).
 // body { autoMerge, autoMergeAfterMin, autoRetry, autoRetryMax, autoResolveConflict, conflictAfterMin, parallelExtra } — 준 것만 바꾼다.
 // parallelExtra 는 러너가 빈 슬롯을 채울 때마다 다시 읽는다(줄이면 돌던 카드는 끝까지, 새 카드만 덜 띄운다).
