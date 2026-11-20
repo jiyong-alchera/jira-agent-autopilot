@@ -1144,7 +1144,9 @@ function slackMessage(text, actions) {
     if (!def) continue;
     const btn = {
       type: "button", text: { type: "plain_text", text: clip(String(a.label || def.label), 75), emoji: true },
-      action_id: SLACK_ACTION_PREFIX + a.id, value: encodeSlackAction(a),
+      // 같은 동작 버튼이 여럿이면(선택지 a·b …) action_id 가 겹쳐 Slack 이 메시지를 통째로 거절한다(invalid_blocks).
+      action_id: SLACK_ACTION_PREFIX + a.id + (elements.some((e) => e.action_id === SLACK_ACTION_PREFIX + a.id) ? `:${elements.length}` : ""),
+      value: encodeSlackAction(a),
     };
     if (def.style) btn.style = def.style;
     elements.push(btn);

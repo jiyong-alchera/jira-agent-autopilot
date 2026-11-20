@@ -205,3 +205,10 @@ test("재시도해도 결과 줄이 쌓이지 않는다", async () => {
   assert.strictEqual(notes.length, 1);
   assert.match(notes[0].elements[0].text, /또 실패/);
 });
+
+test("같은 동작 버튼이 여럿이어도 action_id 가 겹치지 않는다(겹치면 Slack 이 invalid_blocks 로 거절)", () => {
+  const m = lib.slackMessage("t", [act({ id: "decide", step: "a" }), act({ id: "decide", step: "b" }), act({ id: "card-retry", epic: "EKYB-9" })]);
+  const ids = m.blocks.flatMap((b) => (b.elements || []).map((e) => e.action_id)).filter(Boolean);
+  assert.strictEqual(new Set(ids).size, ids.length);
+  assert.ok(ids.every((id) => id.startsWith(lib.SLACK_ACTION_PREFIX)));
+});
