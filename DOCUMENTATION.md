@@ -636,6 +636,8 @@ CI 가 끝난 뒤 에픽 러너의 '병합만 남음' 알림이 또 와서 그�
 | POST | `/api/epics/:key/run/resume` | **멈춘 지점부터 이어서 진행** — body `{skip?}`. `skip:true` 면 멈춘 단계를 건너뛰고 다음 단계부터(동시 실행이면 멈춘 카드 전부 각자). `paused`/`stopped` 상태에서만 수용하며, 재개 단계는 멈췄던 그 카드에만 적용(카드별 `EPIC_RESUME_POINTS`). 응답 `resumedAt` 은 `K-1 · ci, K-3 · build` 형식. **대상 repo 는 상태 파일에 기록된 시작 시점 값**을 그대로 쓴다(요청 body 로 못 바꾼다). 기록이 비어 있으면 **전체로 넓히지 않고 거부**한다 |
 | POST | `/api/epics/:key/run/options` | **자동 병합·자동 재시도·자동 충돌 해소·동시 실행·결정 대기 자동 결정 옵션 변경**(실행 중에도 즉시 반영) — body `{autoMerge?, autoMergeAfterMin?, autoRetry?, autoRetryMax?, autoResolveConflict?, conflictAfterMin?, parallelExtra?, autoDecide?, autoDecideAfterMin?}`. 생략한 필드는 기존 값 유지, 분은 1~1440(`autoDecideAfterMin` 은 5~1440)·`parallelExtra` 는 0~4 로 clamp. `.state/<EPIC>.epic.opts.json` 에 저장하고 러너가 병합 대기 폴링·빈 슬롯 채우기마다 다시 읽는다 |
 | POST | `/api/epics/:key/run/stop` | **에픽 연속 개발 중지** — `.epic.stop` 플래그를 먼저 쓴 뒤 프로세스 트리를 SIGTERM→6초 후 SIGKILL·락 정리(상태 파일은 남겨 재개 가능). 6초 안에 [이어서 진행]으로 새 러너가 락을 잡았으면(락 pid 가 중지한 pid 와 다르고 살아 있음) 락을 지우지 않는다(`lib.stopLockClearable`) |
+| GET | `/api/cleanup/preview` | **오래된 작업 정리 미리보기** — 지우지 않고, 보관 기간이 지난 clone 사본·`.state` 기록·로그 앞부분을 계산해 `{bases[{base,projects,retentionDays,cloneDays,clones[{name,key,reason,kb}],stateFiles,stateKb,errors}], logs[{file,kb}], totalKb, summary, last}` 로 돌려준다. `last` 는 서버가 뜬 뒤 마지막으로 실제 정리한 시각·합계 |
+| POST | `/api/cleanup/run` | **오래된 작업 정리 실행** — 미리보기와 같은 계산으로 실제로 지운다(7.4 「오래된 작업 정리」). 응답 형식은 preview 와 같다 |
 | POST | `/api/monitor/orphans/:key/cleanup` | **고아 프로세스 정리**(부하 화면의 [정리] 버튼) — 그 카드 작업 폴더에서 러너 없이 남은 프로세스와 자손을 SIGTERM, 5초 뒤 남은 것만 SIGKILL. 같은 카드 러너가 살아 있으면 `{ok:false, runnerAlive:true}` 로 거부. 응답 `{ok, killed[{pid,label,rss}]}` |
 | GET | `/api/monitor/load` | **오토파일럿 부하**(대시보드 5초 폴링) — 서버가 10초마다 `ps -axo pid,ppid,pcpu,rss,etime,command`·`sysctl vm.swapusage`·`memory_pressure` 를 떠서 **러너(카드) 단위로 합산**한 최신 값과 최근 30분 추이(메모리에만 보관, 재시작하면 비워짐). 응답 `{system{cores,load1,load5,load15,memFreePct,memTotal,swap{total,used},level,ratio,reasons[]}, autopilot{cpu,rss,count}, other{cpu,rss,count}, groups[{id,kind,key,project,phases[],cpu,rss,count,elapsedSec,runnerAlive,orphanCount,orphanRss,orphanOnly,top[{label,cpu,rss,count,orphan}]}], history[{t,load1,apCpu,otherCpu,apRss,otherRss,memFreePct}], thresholds}`. 소속은 **가장 가까운 러너 조상**(`run-jira-agent.sh <KEY> <단계>`·`run-review-loop.sh`·`run-review.sh`·`run-epic-loop.js`·`run-sentry-loop.js`·`run-cycle.js`·`loop-*.sh`)으로 정하고, 러너 조상이 없는데 명령줄에 `repos/<repo>-<KEY>/` 가 있으면 그 카드의 **고아 프로세스**로 센다. 그 밖(대화형 claude 세션·브라우저·Docker VM·대시보드 서버)은 `other`. `cpu` 는 ps `%cpu`(100 = 코어 하나). `level` 은 load/코어가 1.0 초과면 `warn`, 1.5 초과면 `crit`, 메모리 여유율 30% 미만 `warn`·20% 미만 `crit`(`lib-monitor.js`) |
 | GET | `/api/sentry/status` | **Sentry 자동 처리 상태** — `{ready:{ok,why}, running, config, epicKey, lastRunAt, lastError, lastCreated, lastRun, tracked, access:{<env>:bool}, dualSlack}`. 접근 정보 내용은 돌려주지 않는다(있는지만) |
@@ -744,6 +746,8 @@ CI 가 끝난 뒤 에픽 러너의 '병합만 남음' 알림이 또 와서 그�
 | env 파일 | `ENV_SRC` | `<WORK_DIR>/work.env` | clone 디렉토리로 복사할 env |
 | env 복사 대상 | `ENV_DEST_REL` | (없음=루프 루트) | repo 내 복사 대상 상대경로(예: `src/main/resources/application-private.properties`) |
 | clone 베이스 | `CLONE_BASE` | `<WORK_DIR>/repos` | clone 들이 모이는 폴더 |
+| 기록 보관 기간 | (설정 `retentionDays`) | `30` | 마지막 활동 후 이 일수가 지난 카드는 `.state` 산출물을 지우고 `<KEY>.summary.md` 만 남긴다. `loop-*.log` 도 이보다 오래된 줄을 잘라낸다. `0`=끔. clone 베이스를 공유하는 프로젝트는 가장 긴 값(하나라도 0 이면 끔) |
+| clone 사본 보관 | (설정 `cloneRetentionDays`) | `7` | 완료(병합·에픽 태스크 완료) 후 이 일수가 지난 카드의 clone 사본(`<repo>-<KEY>`)을 지운다. 완료 기록이 없는 사본은 `retentionDays` 뒤에 지운다. `0`=끔 |
 | 카드 전용 env 디렉토리 | (대시보드 `cardEnvDir`) | `<WORK_DIR>/card-envs` | 카드 전용 env(`<KEY>.env`)를 로컬에 보관·로드하는 폴더(gitignore, Jira 미업로드) |
 | Jira 사이트 | (대시보드 `jiraSite`) | (없음) | 예: `team.atlassian.net` (카드 조회용) |
 | 프로젝트 키 | `PROJECT_KEY` | (없음) | 예: `PROJ` (JQL 프로젝트 필터) |
@@ -915,6 +919,13 @@ tail -f loop-plan.log loop-build.log
   - **pm2**: `cd dashboard && pm2 start server.js --name jira-agent-dashboard && pm2 save && pm2 startup`
   - **launchd(macOS)**: `~/Library/LaunchAgents/com.jira-claude.dashboard.plist` 에 `ProgramArguments`로 `node <repo>/dashboard/server.js`, `RunAtLoad=true`, `KeepAlive=true` 를 지정하고 `launchctl load` 합니다.
   - 백엔드가 다시 뜨면 pidfile 로 루프 상태를 복구하므로, 대시보드 상태가 실제 프로세스와 항상 일치합니다.
+- **오래된 작업 정리(보관 기간)**: 서버가 뜬 2분 뒤 한 번, 이후 하루 한 번 `runRetention` 이 돈다(대시보드 설정의 「오래된 작업 정리」 [미리보기]·[지금 정리] 로도 실행). 판단은 `lib.retentionPlan` 이 한다.
+  - **카드의 마지막 활동** = 그 카드의 `.state` 파일·clone 폴더 수정 시각과 `history.jsonl` 기록 중 가장 최근.
+  - **clone 사본**: 완료 기록(`merge:merged`·`epic:task-done`·`build:already-done`)이 있고 `cloneRetentionDays`(기본 7) 지나면 삭제, 완료 기록이 없으면 `retentionDays`(기본 30) 지나면 삭제. 지우기 직전에 `<KEY>.lock` 을 다시 확인한다.
+  - **`.state` 기록**: `retentionDays` 지난 카드의 plan·build·review 출력, `.images`·`.docs`, rebase 로그, pr-body 등을 지우고 **`<KEY>.summary.md`·`<KEY>.epic.json` 만 남긴다.** `history.jsonl` 은 건드리지 않는다(카드당 한 줄씩 남는 최소 기록).
+  - **로그**: `loop-*.log` 에서 `retentionDays` 보다 오래된 `[YYYY-MM-DD HH:MM:SS]` 줄과 거기 딸린 줄을 잘라낸다. 루프가 `>>` 로 붙여 쓰는 중이라 파일을 바꿔치기하지 않고 같은 파일에 다시 쓴 뒤 truncate 한다.
+  - **건너뛰는 카드**: 락(`.lock`·`.review.lock`·`.reviewloop.lock`·`.epic.lock`)이나 `.decision.json` 이 있는 카드, 끝나지 않은(done·stopped 가 아닌) 에픽과 그 태스크·워커. 끝나지 않은 에픽 자체의 `epic-design.md`·`epic.opts.json` 도 남긴다.
+  - 정리한 것이 있으면 그 clone 베이스를 쓰는 프로젝트의 Slack 웹훅으로 한 줄(`🧹 오래된 작업 정리 — clone N개 · 기록 N개 · 로그 N개 잘라냄, 합계 …`)을 보낸다.
 - **구버전 루프 자동 교체**: 루프 시작 시 `loop-<type>.ver` 에 `LOOP_VERSION` 을 기록한다. 백엔드가 시작될 때 실행 중인 루프의 버전 마커가 현재와 다르거나 없으면(=구버전 프로세스), 그 루프를 종료하고 신버전으로 자동 재시작한다. (코드 업데이트 후 옛 루프가 계속 도는 문제 방지)
 
 ---
@@ -1038,6 +1049,7 @@ loop-work/                     # (= 저장소 루트)
    ├─ lib.js                   # 순수 로직 + 프로젝트 스토어 (단위 테스트 대상)
    ├─ slack-socket.js          # Slack 버튼 클릭 수신(Socket Mode) → 대시보드 API 실행
    ├─ test/lib.test.js         # 단위 테스트 (node:test) — `npm test`
+   ├─ test/retention.test.js   # 오래된 작업 정리(보관 기간) 판단 회귀 테스트 — 무엇을 지우고 남기는지
    ├─ test/review-loop.test.js # run-review-loop.sh 회귀 테스트 (하위 스크립트·gh 스텁, 네트워크 불필요)
    ├─ test/review-approve-ci-gate.test.js # 승인 알림 CI 게이트 회귀 테스트 (ci-state.js 스텁)
    ├─ test/attachments.test.js # 카드 첨부(이미지·문서) 인식 회귀 테스트 (fetch 스텁, 네트워크 불필요)

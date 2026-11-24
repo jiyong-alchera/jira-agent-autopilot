@@ -62,6 +62,8 @@ const DEFAULT_CONFIG = {
   cardEnvDir: "",                               // 카드 전용 env 보관 디렉토리(비우면 <workDir>/card-envs)
   engine: "",                                   // LLM 엔진(claude|codex|gemini). 비우면 전역 기본값(claude)
   model: "",                                    // 엔진에 넘길 모델명. 비우면 엔진 기본 모델
+  retentionDays: 30,                            // 마지막 활동 후 이 일수가 지난 카드는 .state 산출물을 지우고 summary 만 남김(0=끔)
+  cloneRetentionDays: 7,                        // 완료 후 이 일수가 지난 카드의 clone 사본 삭제(0=끔)
 };
 
 // ----- 순수 로직 + 프로젝트 스토어 (단위 테스트 대상은 lib.js 로 분리) -----
@@ -432,6 +434,156 @@ function removeCardClones(cfg, key) {
     catch (e) { errors.push(`${ent.name}: ${(e && e.message) || e}`); }
   }
   return { removed, errors };
+}
+
+// ----- 오래된 작업 정리(보관 기간) -----
+// cloneBase 를 공유하는 프로젝트는 한 번만 정리하고, 보관 일수는 그중 가장 긴 값(하나라도 0 이면 끔)을 쓴다.
+const RETENTION_SCAN_MS = 24 * 3600 * 1000;
+let lastRetention = null;
+
+function retentionTargets() {
+  const byBase = new Map();
+  for (const p of listProjects()) {
+    const cfg = getProject(p.id);
+    if (!cfg) continue;
+    const base = path.resolve(cfg.cloneBase || path.join(cfg.workDir || SCRIPTS_DIR, "repos"));
+    const cur = byBase.get(base) || { base, projects: [], retentionDays: null, cloneDays: null };
+    const rd = lib.clampRetentionDays(cfg.retentionDays, lib.RETENTION_DAYS_DEFAULT);
+    const cd = lib.clampRetentionDays(cfg.cloneRetentionDays, lib.CLONE_RETENTION_DAYS_DEFAULT);
+    cur.retentionDays = cur.retentionDays == null ? rd : (rd === 0 || cur.retentionDays === 0 ? 0 : Math.max(cur.retentionDays, rd));
+    cur.cloneDays = cur.cloneDays == null ? cd : (cd === 0 || cur.cloneDays === 0 ? 0 : Math.max(cur.cloneDays, cd));
+    cur.projects.push(p.id);
+    byBase.set(base, cur);
+  }
+  return [...byBase.values()];
+}
+
+// 지금 손대면 안 되는 카드: 락·결정 대기가 있거나, 끝나지 않은 에픽의 태스크·워커인 카드.
+function retentionActiveKeys(stateDir, names) {
+  const active = new Set(), epicStatus = {};
+  for (const n of names) {
+    const k = lib.stateFileKey(n);
+    if (!k) continue;
+    if (/\.(lock|review\.lock|reviewloop\.lock|epic\.lock|lock\.pid|lock\.phase)$/.test(n) || n.endsWith(".decision.json")) active.add(k);
+    if (n === `${k}.epic.json`) {
+      const d = lib.readJson(path.join(stateDir, n), null);
+      if (!d) { active.add(k); continue; }
+      epicStatus[k] = d.status || "";
+      if (!["done", "stopped"].includes(d.status)) for (const t of [...(d.tasks || []), ...(d.workers || [])]) if (t && t.key) active.add(t.key);
+    }
+  }
+  return { active, epicStatus };
+}
+
+function readHistoryLines() {
+  try {
+    return fs.readFileSync(HISTORY_PATH, "utf8").split("\n").filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+  } catch { return []; }
+}
+
+function diskKb(p) {
+  try { return parseInt(execFileSync("du", ["-sk", p], { encoding: "utf8", timeout: 120000 }).split(/\s/)[0], 10) || 0; } catch { return 0; }
+}
+
+// 로그 앞부분(cutoff 이전)을 제자리에서 잘라낸다. 루프가 >> 로 붙여 쓰는 중이라 파일을 바꿔치기하지 않고
+// 같은 inode 에 다시 쓴 뒤 truncate 한다(읽은 뒤 새로 붙은 내용까지 함께 옮긴다).
+function trimLogInPlace(file, cutoffMs, dryRun) {
+  let text;
+  try { text = fs.readFileSync(file, "utf8"); } catch { return 0; }
+  const off = lib.logTrimOffset(text, cutoffMs);
+  if (off <= 0) return 0;
+  const cutBytes = Buffer.byteLength(text.slice(0, off));
+  if (dryRun) return cutBytes;
+  const fd = fs.openSync(file, "r+");
+  try {
+    const size = fs.fstatSync(fd).size;
+    const rest = Buffer.alloc(size - cutBytes);
+    fs.readSync(fd, rest, 0, rest.length, cutBytes);
+    fs.writeSync(fd, rest, 0, rest.length, 0);
+    fs.ftruncateSync(fd, rest.length);
+  } finally { fs.closeSync(fd); }
+  return cutBytes;
+}
+
+function runRetention({ dryRun } = {}) {
+  const now = Date.now();
+  const history = readHistoryLines();
+  const result = { at: new Date(now).toISOString(), dryRun: !!dryRun, bases: [], logs: [], totalKb: 0 };
+  let logDays = 0;
+  for (const t of retentionTargets()) {
+    const stateDir = path.join(t.base, ".state");
+    const out = { base: t.base, projects: t.projects, retentionDays: t.retentionDays, cloneDays: t.cloneDays, clones: [], stateFiles: 0, stateKb: 0, errors: [] };
+    result.bases.push(out);
+    if (t.retentionDays > 0) logDays = Math.max(logDays, t.retentionDays);
+    if (!t.retentionDays && !t.cloneDays) continue;
+    let names = [], dirs = [];
+    try { names = fs.readdirSync(stateDir); } catch {}
+    try { dirs = fs.readdirSync(t.base, { withFileTypes: true }).filter((e) => e.isDirectory() && e.name !== ".state").map((e) => e.name); } catch {}
+    const mt = (p) => { try { return fs.statSync(p).mtimeMs; } catch { return NaN; } };
+    const { active, epicStatus } = retentionActiveKeys(stateDir, names);
+    const plan = lib.retentionPlan({
+      now, retentionDays: t.retentionDays, cloneDays: t.cloneDays, history, active, epicStatus,
+      stateEntries: names.map((n) => ({ name: n, mtimeMs: mt(path.join(stateDir, n)) })),
+      clones: dirs.filter((n) => lib.cloneDirKey(n)).map((n) => ({ name: n, mtimeMs: mt(path.join(t.base, n)) })),
+    });
+    for (const c of plan.clonesRemove) {
+      const dir = path.join(t.base, c.name);
+      const kb = diskKb(dir);
+      if (!dryRun) {
+        if (fs.existsSync(path.join(stateDir, `${c.key}.lock`))) { out.errors.push(`${c.name}: 처리 중(lock)`); continue; }
+        try { fs.rmSync(dir, { recursive: true, force: true }); } catch (e) { out.errors.push(`${c.name}: ${e.message}`); continue; }
+      }
+      out.clones.push({ ...c, kb });
+      result.totalKb += kb;
+    }
+    for (const n of plan.stateRemove) {
+      const p = path.join(stateDir, n);
+      if (path.dirname(path.resolve(p)) !== path.resolve(stateDir)) continue;   // .state 직속만
+      const kb = diskKb(p);
+      if (!dryRun) { try { fs.rmSync(p, { recursive: true, force: true }); } catch (e) { out.errors.push(`${n}: ${e.message}`); continue; } }
+      out.stateFiles += 1; out.stateKb += kb; result.totalKb += kb;
+    }
+  }
+  if (logDays > 0) {
+    const cutoff = now - logDays * 86400000;
+    let files = [];
+    try { files = fs.readdirSync(SCRIPTS_DIR).filter((f) => /^loop-.*\.log$/.test(f)); } catch {}
+    for (const f of files) {
+      try {
+        const bytes = trimLogInPlace(path.join(SCRIPTS_DIR, f), cutoff, dryRun);
+        if (bytes > 0) { result.logs.push({ file: f, kb: Math.round(bytes / 1024) }); result.totalKb += Math.round(bytes / 1024); }
+      } catch (e) { result.logs.push({ file: f, error: e.message }); }
+    }
+  }
+  if (!dryRun) lastRetention = result;
+  return result;
+}
+
+function fmtKb(kb) { return kb >= 1048576 ? `${(kb / 1048576).toFixed(1)}GB` : kb >= 1024 ? `${Math.round(kb / 1024)}MB` : `${kb}KB`; }
+
+function retentionSummary(r) {
+  const clones = r.bases.reduce((a, b) => a + b.clones.length, 0);
+  const files = r.bases.reduce((a, b) => a + b.stateFiles, 0);
+  const errs = r.bases.reduce((a, b) => a + b.errors.length, 0);
+  const days = r.bases.map((b) => `기록 ${b.retentionDays || "끔"}${b.retentionDays ? "일" : ""} · clone 완료 후 ${b.cloneDays || "끔"}${b.cloneDays ? "일" : ""}`)[0] || "";
+  return { clones, files, logs: r.logs.filter((l) => l.kb).length, errors: errs, total: fmtKb(r.totalKb),
+    text: `🧹 오래된 작업 정리 — clone ${clones}개 · 기록 ${files}개 · 로그 ${r.logs.filter((l) => l.kb).length}개 잘라냄, 합계 ${fmtKb(r.totalKb)}${errs ? ` (실패 ${errs}건)` : ""}${days ? `\n• 보관: ${days}` : ""}` };
+}
+
+async function scheduledRetention() {
+  const r = runRetention({});
+  const s = retentionSummary(r);
+  console.log(`[retention] ${s.text.split("\n")[0]}`);
+  if (!s.clones && !s.files && !s.logs) return;
+  const sent = new Set();
+  for (const b of r.bases) {
+    if (!b.clones.length && !b.stateFiles) continue;
+    const pid = b.projects.find((id) => (getProjectCreds(id) || {}).slackWebhookUrl);
+    const url = pid && getProjectCreds(pid).slackWebhookUrl;
+    if (!url || sent.has(url)) continue;
+    sent.add(url);
+    try { await fetch(url, { method: "POST", headers: { "Content-type": "application/json" }, body: JSON.stringify({ text: s.text }), signal: AbortSignal.timeout(10000) }); } catch {}
+  }
 }
 
 // 이슈를 완료 상태로 전환(설정한 완료 상태명 우선순위대로 시도, 없으면 Done 카테고리 transition)
@@ -2139,6 +2291,16 @@ if (LIVERELOAD) {
   catch (e) { console.warn("  (livereload) 파일 감시 실패:", e.message); }
 }
 
+// 오래된 작업 정리 — preview 는 지울 대상과 크기만, run 은 실제로 지운다.
+app.get("/api/cleanup/preview", (req, res) => {
+  try { const r = runRetention({ dryRun: true }); res.json({ ok: true, ...r, summary: retentionSummary(r), last: lastRetention && { at: lastRetention.at, summary: retentionSummary(lastRetention) } }); }
+  catch (e) { res.status(500).json({ ok: false, message: e.message }); }
+});
+app.post("/api/cleanup/run", (req, res) => {
+  try { const r = runRetention({}); console.log(`[retention] (수동) ${retentionSummary(r).text.split("\n")[0]}`); res.json({ ok: true, ...r, summary: retentionSummary(r) }); }
+  catch (e) { res.status(500).json({ ok: false, message: e.message }); }
+});
+
 // 정적 프론트
 app.use(express.static(path.join(ROOT, "public")));
 
@@ -2173,6 +2335,11 @@ app.listen(PORT, () => {
   const scanDecisions = async () => { try { await autoDecidePending(); } catch (e) { console.warn("[auto-decide] 스캔 오류:", e.message); } };
   setInterval(scanDecisions, 60000).unref?.();
   console.log("  결정 대기 자동 결정 감시: 60s 주기");
+  // 오래된 작업 정리 — 부팅 2분 뒤 1회, 이후 하루 한 번
+  const scanRetention = async () => { try { await scheduledRetention(); } catch (e) { console.warn("[retention] 정리 오류:", e.message); } };
+  setTimeout(scanRetention, 120000).unref?.();
+  setInterval(scanRetention, RETENTION_SCAN_MS).unref?.();
+  console.log("  오래된 작업 정리: 24h 주기");
   // Sentry 에러 자동 처리 — 프로젝트별 intervalMinutes 주기(판정은 1분마다)
   setInterval(() => { try { scanSentry(); } catch (e) { console.warn("[sentry] 스캔 오류:", e.message); } }, 60000).unref?.();
   setTimeout(() => { try { scanSentry(); } catch {} }, 20000).unref?.();

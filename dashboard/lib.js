@@ -1195,6 +1195,86 @@ function slackActorAllowed(cred, userId) {
   return list.includes(String(userId || ""));
 }
 
+// ----- 오래된 작업 정리(보관 기간) -----
+// 기록(.state 의 카드별 산출물)은 마지막 활동 후 retentionDays, clone 사본은 완료 후 cloneDays 가 지나면 지운다.
+// 남기는 최소 기록: <KEY>.summary.md · <KEY>.epic.json · history.jsonl(서버가 건드리지 않음).
+const RETENTION_DAYS_DEFAULT = 30;
+const CLONE_RETENTION_DAYS_DEFAULT = 7;
+const RETENTION_KEEP_SUFFIXES = [".summary.md", ".epic.json"];
+const EPIC_FINISHED = new Set(["done", "stopped"]);
+const DONE_EVENTS = new Set(["merge:merged", "epic:task-done", "build:already-done"]);
+const DAY_MS = 86400000;
+
+// 빈 값은 기본값, 0 이하는 끔(0), 그 밖은 정수 일수(최대 10년).
+function clampRetentionDays(v, def) {
+  if (v === "" || v == null) return def;
+  const n = Number(v);
+  if (!Number.isFinite(n)) return def;
+  if (n <= 0) return 0;
+  return Math.min(3650, Math.floor(n));
+}
+
+// 상태 파일 이름의 카드 키. "AML-257.build.out", "AML-257-rebase-mvn.log", "AML-102.images" → "AML-257"…
+function stateFileKey(name) {
+  const m = /^([A-Z][A-Z0-9]+-\d+)(?:[.-]|$)/.exec(String(name || ""));
+  return m ? m[1] : null;
+}
+
+// clone 디렉토리 이름(<repo>-<KEY>)의 카드 키.
+function cloneDirKey(name) {
+  const m = /-([A-Z][A-Z0-9]+-\d+)$/.exec(String(name || ""));
+  return m ? m[1] : null;
+}
+
+// 무엇을 지울지만 계산한다(IO 없음).
+// stateEntries [{name,mtimeMs}] · clones [{name,mtimeMs}] · history [{key,ts,phase,result}]
+// active: 지금 손대면 안 되는 카드 키(락·실행 중 에픽·결정 대기 등) · epicStatus { KEY: status }
+function retentionPlan({ now, retentionDays, cloneDays, stateEntries, clones, history, active, epicStatus }) {
+  const nowMs = Number(now) || Date.now();
+  const last = new Map(), done = new Set(), skip = new Set(active || []);
+  const bump = (k, ms) => { if (k && Number.isFinite(ms) && ms > (last.get(k) || 0)) last.set(k, ms); };
+  for (const e of stateEntries || []) bump(stateFileKey(e.name), e.mtimeMs);
+  for (const c of clones || []) bump(cloneDirKey(c.name), c.mtimeMs);
+  for (const h of history || []) {
+    if (!h || !h.key) continue;
+    bump(h.key, Date.parse(h.ts));
+    if (DONE_EVENTS.has(`${h.phase}:${h.result}`)) done.add(h.key);
+  }
+  for (const [k, s] of Object.entries(epicStatus || {})) if (!EPIC_FINISHED.has(s)) skip.add(k);
+  const age = (k) => (nowMs - (last.get(k) || nowMs)) / DAY_MS;
+  const stateRemove = [];
+  if (retentionDays > 0) {
+    for (const e of stateEntries || []) {
+      const k = stateFileKey(e.name);
+      if (!k || skip.has(k) || age(k) < retentionDays) continue;
+      if (RETENTION_KEEP_SUFFIXES.some((s) => e.name === k + s)) continue;
+      stateRemove.push(e.name);
+    }
+  }
+  const clonesRemove = [];
+  for (const c of clones || []) {
+    const k = cloneDirKey(c.name);
+    if (!k || skip.has(k)) continue;
+    const a = age(k);
+    if (cloneDays > 0 && done.has(k) && a >= cloneDays) clonesRemove.push({ name: c.name, key: k, reason: "done" });
+    else if (retentionDays > 0 && a >= retentionDays) clonesRemove.push({ name: c.name, key: k, reason: "old" });
+  }
+  return { stateRemove, clonesRemove };
+}
+
+// 로그에서 cutoff 보다 오래된 앞부분의 길이(문자 수). 줄 머리 "[YYYY-MM-DD HH:MM:SS]"(UTC)로 판단하고,
+// 시각이 없는 줄은 바로 앞 시각 줄에 딸린 것으로 본다. 시각 줄이 하나도 없으면 0(건드리지 않음).
+function logTrimOffset(text, cutoffMs) {
+  const s = String(text || "");
+  const re = /^\[(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2})\]/gm;
+  let m, seen = false;
+  while ((m = re.exec(s))) {
+    seen = true;
+    if (Date.parse(`${m[1]}T${m[2]}Z`) >= cutoffMs) return m.index;
+  }
+  return seen ? s.length : 0;
+}
+
 // rebase 병합이 '방식' 때문에 거절됐는지(충돌·권한·CI 가 아니라). 브랜치에 merge 커밋이 있으면
 // GitHub 가 "This branch can't be rebased" 로 거절하고, repo 가 rebase 병합을 꺼 두면
 // "Rebase merges are not allowed" 로 거절한다 — 이때만 merge commit 방식으로 다시 시도한다.
@@ -1224,4 +1304,5 @@ module.exports = {
   parseUsageLimitReset, classifyPause, planRetry,
   SLACK_ACTIONS, SLACK_ACTION_PREFIX, encodeSlackAction, decodeSlackAction, slackMessage, slackActorAllowed,
   rebaseMergeUnsupported,
+  RETENTION_DAYS_DEFAULT, CLONE_RETENTION_DAYS_DEFAULT, clampRetentionDays, stateFileKey, cloneDirKey, retentionPlan, logTrimOffset,
 };
