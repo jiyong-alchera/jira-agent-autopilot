@@ -1275,6 +1275,35 @@ function logTrimOffset(text, cutoffMs) {
   return seen ? s.length : 0;
 }
 
+// 임시 폴더 정리 — 테스트가 지우지 않고 남긴 항목(prefixes 로 시작)을 hours 가 지나면 지운다.
+// held: 지금 돌고 있는 프로세스 명령줄에 나오는 항목 이름(검사용 DB 가 아직 쓰는 폴더 등)은 건드리지 않는다.
+const TMP_RETENTION_HOURS_DEFAULT = 24;
+
+function parseTmpPrefixes(v) {
+  return [...new Set(String(v || "").split(/[\s,]+/).map((s) => s.trim()).filter((s) => s.length >= 3 && !/[\/\\.]/.test(s)))];
+}
+
+function tmpCleanPlan({ now, hours, prefixes, entries, held }) {
+  if (!(hours > 0) || !prefixes || !prefixes.length) return [];
+  const cutoff = (Number(now) || Date.now()) - hours * 3600000;
+  const busy = new Set(held || []);
+  return (entries || [])
+    .filter((e) => e && prefixes.some((p) => e.name.startsWith(p)) && !busy.has(e.name) && Number.isFinite(e.mtimeMs) && e.mtimeMs < cutoff)
+    .map((e) => e.name);
+}
+
+// ps 명령줄들에서 tmpDir 바로 아래 항목 이름을 뽑는다(/var ↔ /private/var 둘 다).
+function tmpHeldNames(psText, tmpDir) {
+  const base = String(tmpDir || "").replace(/\/+$/, "").replace(/^\/private/, "");
+  if (!base) return [];
+  const esc = base.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const re = new RegExp(`(?:/private)?${esc}/([^/\\s"']+)`, "g");
+  const out = new Set();
+  let m;
+  while ((m = re.exec(String(psText || "")))) out.add(m[1]);
+  return [...out];
+}
+
 // rebase 병합이 '방식' 때문에 거절됐는지(충돌·권한·CI 가 아니라). 브랜치에 merge 커밋이 있으면
 // GitHub 가 "This branch can't be rebased" 로 거절하고, repo 가 rebase 병합을 꺼 두면
 // "Rebase merges are not allowed" 로 거절한다 — 이때만 merge commit 방식으로 다시 시도한다.
@@ -1305,4 +1334,5 @@ module.exports = {
   SLACK_ACTIONS, SLACK_ACTION_PREFIX, encodeSlackAction, decodeSlackAction, slackMessage, slackActorAllowed,
   rebaseMergeUnsupported,
   RETENTION_DAYS_DEFAULT, CLONE_RETENTION_DAYS_DEFAULT, clampRetentionDays, stateFileKey, cloneDirKey, retentionPlan, logTrimOffset,
+  TMP_RETENTION_HOURS_DEFAULT, parseTmpPrefixes, tmpCleanPlan, tmpHeldNames,
 };

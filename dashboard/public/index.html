@@ -89,7 +89,7 @@ function CleanupControls() {
       {res && !res.ok && <p className="mt-2 text-rose-400">{res.message || "실패"}</p>}
       {s && (
         <p className="mt-2 text-slate-400">
-          {res.kind === "run" ? "정리함" : "지울 대상"}: clone {s.clones}개 · 기록 {s.files}개 · 로그 {s.logs}개 · 합계 {s.total}{s.errors ? ` · 실패 ${s.errors}건` : ""}
+          {res.kind === "run" ? "정리함" : "지울 대상"}: clone {s.clones}개 · 기록 {s.files}개 · 임시 {s.tmp || 0}개 · 로그 {s.logs}개 · 합계 {s.total}{s.errors ? ` · 실패 ${s.errors}건` : ""}
           {res.last && res.kind !== "run" && <span className="block text-xs text-slate-500">마지막 정리 {new Date(res.last.at).toLocaleString()} — {res.last.summary.total}</span>}
         </p>
       )}
@@ -811,6 +811,10 @@ function ProjectCard({ proj, onDeleted, flash, jumpTo }) {
           info={"마지막 활동 후 이 일수가 지난 카드는 .state 의 plan·build·review 출력, 이미지, rebase 로그 등을 지우고 <카드키>.summary.md 만 남깁니다. 기본 30, 0이면 끕니다.\n\n처리 이력(history.jsonl)과 에픽 상태 파일은 남고, loop-*.log 도 이 일수보다 오래된 줄은 잘라냅니다. 작업 중인 카드·끝나지 않은 에픽은 건너뜁니다. 하루 한 번 자동으로 돕니다."} />
         <Field label="clone 사본 보관(완료 후 일)" type="number" value={config.cloneRetentionDays} onChange={(v) => setConfig({ ...config, cloneRetentionDays: v === "" ? "" : parseInt(v, 10) })} placeholder="7"
           info={"병합·완료된 카드의 clone 사본(<repo>-<카드키>)을 완료 후 이 일수가 지나면 지웁니다. 기본 7, 0이면 끕니다.\n\n완료 기록이 없는 카드의 사본은 '기록 보관 기간'이 지나면 지웁니다. 다시 작업하면 새로 clone 합니다."} />
+        <Field label="임시 폴더 정리 접두사" value={config.tmpCleanPrefixes} onChange={(v) => setConfig({ ...config, tmpCleanPrefixes: v })} placeholder="예: aml-"
+          info={"테스트가 지우지 않고 남긴 임시 폴더($TMPDIR) 항목을 지울 때 쓰는 이름 접두사입니다. 쉼표로 여러 개 적을 수 있고, 비우면 끕니다.\n\n접두사로 시작하고 아래 시간보다 오래됐으며, 지금 돌고 있는 프로세스(검사용 DB 등)가 쓰지 않는 항목만 지웁니다. 6시간마다 돕니다. 3글자 미만이거나 / . 가 든 접두사는 무시합니다."} />
+        <Field label="임시 항목 보관(시간)" type="number" value={config.tmpRetentionHours} onChange={(v) => setConfig({ ...config, tmpRetentionHours: v === "" ? "" : parseInt(v, 10) })} placeholder="24"
+          info={"임시 폴더 항목을 마지막 수정 후 이 시간이 지나면 지웁니다. 기본 24."} />
         <Field label="테스트 명령 (비우면 자동 감지)" value={config.testCmd} onChange={(v) => setConfig({ ...config, testCmd: v })} placeholder="예: npm test"
           info={"PR 생성 전 검증에 사용할 테스트 명령입니다.\n\n비우면 claude가 프로젝트를 보고 자동 감지합니다(go test, npm test, pytest, Makefile의 test 등). 테스트가 통과할 때까지 수정을 반복하고, 통과 후에만 PR을 만듭니다."} />
         <Field label="빌드 명령 (비우면 자동 감지)" value={config.buildCmd} onChange={(v) => setConfig({ ...config, buildCmd: v })} placeholder="예: npm run build"

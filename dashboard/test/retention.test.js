@@ -122,3 +122,36 @@ test("logTrimOffset: cutoff 이전 시각 줄과 거기 딸린 줄을 잘라낸�
   assert.strictEqual(lib.logTrimOffset(log, Date.parse("2026-12-01T00:00:00Z")), log.length);
   assert.strictEqual(lib.logTrimOffset("시각 없는 로그\n", cut), 0);
 });
+
+test("parseTmpPrefixes: 쉼표·공백 구분, 너무 짧거나 경로 문자가 든 접두사는 버린다", () => {
+  assert.deepStrictEqual(lib.parseTmpPrefixes("aml-, kyb-test  aml-"), ["aml-", "kyb-test"]);
+  assert.deepStrictEqual(lib.parseTmpPrefixes("a, ../x, /tmp, .."), []);
+  assert.deepStrictEqual(lib.parseTmpPrefixes(""), []);
+});
+
+test("tmpCleanPlan: 접두사가 맞고 시간이 지났고 쓰는 프로세스가 없는 항목만", () => {
+  const H = 3600000;
+  const r = lib.tmpCleanPlan({
+    now: NOW, hours: 24, prefixes: ["aml-"],
+    entries: [
+      { name: "aml-pgtest-1", mtimeMs: NOW - 30 * H },   // 지움
+      { name: "aml-pgtest-2", mtimeMs: NOW - 30 * H },   // 쓰는 중
+      { name: "aml-e2e-x", mtimeMs: NOW - 2 * H },       // 아직 새것
+      { name: "node-compile-cache", mtimeMs: NOW - 99 * H }, // 접두사 아님
+    ],
+    held: ["aml-pgtest-2"],
+  });
+  assert.deepStrictEqual(r, ["aml-pgtest-1"]);
+  assert.deepStrictEqual(lib.tmpCleanPlan({ now: NOW, hours: 0, prefixes: ["aml-"], entries: [{ name: "aml-1", mtimeMs: 0 }] }), []);
+  assert.deepStrictEqual(lib.tmpCleanPlan({ now: NOW, hours: 24, prefixes: [], entries: [{ name: "aml-1", mtimeMs: 0 }] }), []);
+});
+
+test("tmpHeldNames: 명령줄의 임시 폴더 항목 이름(/var · /private/var 모두)", () => {
+  const T = "/private/var/folders/br/x/T/";
+  const ps = [
+    "/opt/pg/bin/postgres -D /var/folders/br/x/T/aml-pgtest-11/pg/cluster -p 5000",
+    "node e2e --data=/private/var/folders/br/x/T/aml-e2e-fresh-Ab",
+    "java -jar other.jar",
+  ].join("\n");
+  assert.deepStrictEqual(lib.tmpHeldNames(ps, T).sort(), ["aml-e2e-fresh-Ab", "aml-pgtest-11"]);
+});

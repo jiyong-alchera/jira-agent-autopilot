@@ -64,6 +64,8 @@ const DEFAULT_CONFIG = {
   model: "",                                    // 엔진에 넘길 모델명. 비우면 엔진 기본 모델
   retentionDays: 30,                            // 마지막 활동 후 이 일수가 지난 카드는 .state 산출물을 지우고 summary 만 남김(0=끔)
   cloneRetentionDays: 7,                        // 완료 후 이 일수가 지난 카드의 clone 사본 삭제(0=끔)
+  tmpCleanPrefixes: "",                         // 임시 폴더($TMPDIR)에서 지울 항목 접두사(쉼표 구분, 예: aml-). 비우면 끔
+  tmpRetentionHours: 24,                        // 위 항목이 이 시간보다 오래되면 삭제
 };
 
 // ----- 순수 로직 + 프로젝트 스토어 (단위 테스트 대상은 lib.js 로 분리) -----
@@ -555,8 +557,53 @@ function runRetention({ dryRun } = {}) {
       } catch (e) { result.logs.push({ file: f, error: e.message }); }
     }
   }
+  try { result.tmp = runTmpClean({ dryRun }); result.totalKb += result.tmp.freedKb; } catch (e) { result.tmp = { removed: 0, errors: [e.message] }; }
   if (!dryRun) lastRetention = result;
   return result;
+}
+
+// 임시 폴더 정리 — 프로젝트들이 준 접두사를 합쳐, 지금 어떤 프로세스도 쓰지 않는 오래된 항목만 지운다.
+function tmpCleanTargets() {
+  const prefixes = new Set();
+  let hours = 0;
+  for (const p of listProjects()) {
+    const cfg = getProject(p.id);
+    if (!cfg) continue;
+    const ps = lib.parseTmpPrefixes(cfg.tmpCleanPrefixes);
+    if (!ps.length) continue;
+    ps.forEach((x) => prefixes.add(x));
+    const h = Number(cfg.tmpRetentionHours);
+    hours = Math.max(hours, Number.isFinite(h) && h > 0 ? h : lib.TMP_RETENTION_HOURS_DEFAULT);
+  }
+  return { prefixes: [...prefixes], hours };
+}
+
+function diskFreeKb(dir) {
+  try { const st = fs.statfsSync(dir); return Math.round((st.bavail * st.bsize) / 1024); } catch { return null; }
+}
+
+function runTmpClean({ dryRun } = {}) {
+  const dir = os.tmpdir();
+  const { prefixes, hours } = tmpCleanTargets();
+  const out = { dir, prefixes, hours, removed: 0, held: 0, freedKb: 0, errors: [] };
+  if (!prefixes.length || !hours) return out;
+  let entries = [];
+  try { entries = fs.readdirSync(dir).map((n) => { try { return { name: n, mtimeMs: fs.lstatSync(path.join(dir, n)).mtimeMs }; } catch { return null; } }).filter(Boolean); } catch (e) { out.errors.push(e.message); return out; }
+  let psText = "";
+  try { psText = execFileSync("ps", ["-axww", "-o", "command="], { encoding: "utf8", maxBuffer: 64 << 20 }); } catch (e) { out.errors.push(`ps 실패: ${e.message}`); return out; }   // 누가 쓰는지 모르면 지우지 않는다
+  const held = lib.tmpHeldNames(psText, dir);
+  out.held = held.filter((n) => prefixes.some((p) => n.startsWith(p))).length;
+  const names = lib.tmpCleanPlan({ now: Date.now(), hours, prefixes, entries, held });
+  if (dryRun) { out.removed = names.length; return out; }
+  const before = diskFreeKb(dir);
+  for (const n of names) {
+    const p = path.join(dir, n);
+    if (path.dirname(path.resolve(p)) !== path.resolve(dir)) continue;
+    try { fs.rmSync(p, { recursive: true, force: true }); out.removed += 1; } catch (e) { if (out.errors.length < 5) out.errors.push(`${n}: ${e.message}`); }
+  }
+  const after = diskFreeKb(dir);
+  if (before != null && after != null) out.freedKb = Math.max(0, after - before);
+  return out;
 }
 
 function fmtKb(kb) { return kb >= 1048576 ? `${(kb / 1048576).toFixed(1)}GB` : kb >= 1024 ? `${Math.round(kb / 1024)}MB` : `${kb}KB`; }
@@ -566,18 +613,19 @@ function retentionSummary(r) {
   const files = r.bases.reduce((a, b) => a + b.stateFiles, 0);
   const errs = r.bases.reduce((a, b) => a + b.errors.length, 0);
   const days = r.bases.map((b) => `기록 ${b.retentionDays || "끔"}${b.retentionDays ? "일" : ""} · clone 완료 후 ${b.cloneDays || "끔"}${b.cloneDays ? "일" : ""}`)[0] || "";
-  return { clones, files, logs: r.logs.filter((l) => l.kb).length, errors: errs, total: fmtKb(r.totalKb),
-    text: `🧹 오래된 작업 정리 — clone ${clones}개 · 기록 ${files}개 · 로그 ${r.logs.filter((l) => l.kb).length}개 잘라냄, 합계 ${fmtKb(r.totalKb)}${errs ? ` (실패 ${errs}건)` : ""}${days ? `\n• 보관: ${days}` : ""}` };
+  const tmp = (r.tmp && r.tmp.removed) || 0;
+  return { clones, files, tmp, logs: r.logs.filter((l) => l.kb).length, errors: errs, total: fmtKb(r.totalKb),
+    text: `🧹 오래된 작업 정리 — clone ${clones}개 · 기록 ${files}개 · 임시 ${tmp}개 · 로그 ${r.logs.filter((l) => l.kb).length}개 잘라냄, 합계 ${fmtKb(r.totalKb)}${errs ? ` (실패 ${errs}건)` : ""}${days ? `\n• 보관: ${days}` : ""}` };
 }
 
 async function scheduledRetention() {
   const r = runRetention({});
   const s = retentionSummary(r);
   console.log(`[retention] ${s.text.split("\n")[0]}`);
-  if (!s.clones && !s.files && !s.logs) return;
+  if (!s.clones && !s.files && !s.logs && !s.tmp) return;
   const sent = new Set();
   for (const b of r.bases) {
-    if (!b.clones.length && !b.stateFiles) continue;
+    if (!b.clones.length && !b.stateFiles && !s.tmp) continue;
     const pid = b.projects.find((id) => (getProjectCreds(id) || {}).slackWebhookUrl);
     const url = pid && getProjectCreds(pid).slackWebhookUrl;
     if (!url || sent.has(url)) continue;
@@ -2339,7 +2387,12 @@ app.listen(PORT, () => {
   const scanRetention = async () => { try { await scheduledRetention(); } catch (e) { console.warn("[retention] 정리 오류:", e.message); } };
   setTimeout(scanRetention, 120000).unref?.();
   setInterval(scanRetention, RETENTION_SCAN_MS).unref?.();
-  console.log("  오래된 작업 정리: 24h 주기");
+  // 테스트 임시 항목은 하루 수십 GB 씩 쌓일 수 있어 6시간마다 따로 지운다(Slack 알림 없이 로그만)
+  setInterval(() => {
+    try { const t = runTmpClean({}); if (t.removed) console.log(`[retention] 임시 폴더 ${t.removed}개 삭제 · ${fmtKb(t.freedKb)} 확보 (사용 중 ${t.held}개 유지)`); }
+    catch (e) { console.warn("[retention] 임시 폴더 정리 오류:", e.message); }
+  }, 6 * 3600 * 1000).unref?.();
+  console.log("  오래된 작업 정리: 24h 주기 (임시 폴더는 6h)");
   // Sentry 에러 자동 처리 — 프로젝트별 intervalMinutes 주기(판정은 1분마다)
   setInterval(() => { try { scanSentry(); } catch (e) { console.warn("[sentry] 스캔 오류:", e.message); } }, 60000).unref?.();
   setTimeout(() => { try { scanSentry(); } catch {} }, 20000).unref?.();
