@@ -1413,7 +1413,7 @@ function EpicPrs({ pid, cardKey, epicKey, step, flash, onMerged }) {
     : p.ci === "pending" ? "⚠️ CI 가 아직 진행 중입니다.\n" : "");
   const ciForce = (p) => p.ci === "fail" || p.ci === "pending";
   const mergeOne = async (p) => {
-    if (!window.confirm(`${p.repo} #${p.number} — "${p.title}"\n${p.approved ? "" : "⚠️ 아직 리뷰 승인 마커가 없습니다.\n"}${p.mergeable === "CONFLICTING" ? "⚠️ base 충돌 상태입니다.\n" : ""}${ciWarn(p)}\nrebase merge 하고 브랜치를 삭제합니다. 진행할까요?`)) return;
+    if (!window.confirm(`${p.repo} #${p.number} — "${p.title}"\n${p.approved ? "" : p.staleApproval ? "⚠️ 승인 뒤에 새 커밋이 올라와 지금 코드는 리뷰되지 않았습니다.\n" : "⚠️ 아직 리뷰 승인 마커가 없습니다.\n"}${p.mergeable === "CONFLICTING" ? "⚠️ base 충돌 상태입니다.\n" : ""}${ciWarn(p)}\nrebase merge 하고 브랜치를 삭제합니다. 진행할까요?`)) return;
     setBusy(idOf(p));
     try {
       const r = await api.post(`/api/cards/${cardKey}/merge`, { owner: p.owner, number: p.number, project: pid, force: ciForce(p) });
@@ -1422,7 +1422,7 @@ function EpicPrs({ pid, cardKey, epicKey, step, flash, onMerged }) {
   };
   const mergeMany = async (targets, label) => {
     if (!targets.length) return;
-    const list = targets.map((p) => `  · ${p.repo} #${p.number}${p.approved ? "" : " (미승인)"}${p.mergeable === "CONFLICTING" ? " (충돌)" : ""}${p.ci === "fail" ? " (CI 실패)" : p.ci === "pending" ? " (CI 진행중)" : ""}`).join("\n");
+    const list = targets.map((p) => `  · ${p.repo} #${p.number}${p.approved ? "" : p.staleApproval ? " (승인 뒤 새 커밋)" : " (미승인)"}${p.mergeable === "CONFLICTING" ? " (충돌)" : ""}${p.ci === "fail" ? " (CI 실패)" : p.ci === "pending" ? " (CI 진행중)" : ""}`).join("\n");
     if (!window.confirm(`${label} — PR ${targets.length}건을 rebase merge 합니다.\n\n${list}\n\n진행할까요?`)) return;
     setBusy(label);
     try {

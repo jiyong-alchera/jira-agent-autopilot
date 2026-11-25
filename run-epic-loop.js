@@ -329,13 +329,25 @@ function ghJson(args) {
 }
 // 실패를 '결과 없음'으로 삼키지 않는 판. 승인·CI 판정처럼 '못 물어본 것'과 '없는 것'을 구분해야
 // 하는 자리에 쓴다 — 조용히 빈 배열을 주면 미승인 PR 이 승인된 것처럼, CI 실패가 없는 것처럼 보인다.
-function ghJsonStrict(args) {
+function ghJsonOnce(args) {
   return new Promise((resolve, reject) => {
     execFile("gh", args, { env: BASE_ENV, maxBuffer: 20 * 1024 * 1024 }, (err, stdout, stderr) => {
       if (err) return reject(new Error(`gh ${args.slice(0, 2).join(" ")} 실패: ${String(stderr || err.message).trim().slice(0, 200)}`));
       try { resolve(JSON.parse(stdout || "null")); } catch (e) { reject(new Error(`gh 출력 파싱 실패: ${e.message}`)); }
     });
   });
+}
+// GitHub 일시 장애(빈 응답·5xx·GraphQL "Something went wrong")는 잠깐 뒤 다시 보낸다 — 한 번의 장애로 에픽이
+// 멈추던 일(2026-11-25 PHYS-601 승인 무효화) 대응. 여기로 오는 호출은 조회와 코멘트 수정(PATCH)뿐이라 다시 보내도 안전하다.
+const GH_RETRY_DELAYS_MS = (process.env.EPIC_GH_RETRY_DELAYS || "20,60").split(",").map((x) => Math.max(0, parseInt(x, 10) || 0) * 1000);
+async function ghJsonStrict(args) {
+  for (let i = 0; ; i++) {
+    try { return await ghJsonOnce(args); } catch (e) {
+      if (i >= GH_RETRY_DELAYS_MS.length || !lib.isTransientGhError(e.message)) throw e;
+      log(`GitHub 일시 오류 — ${GH_RETRY_DELAYS_MS[i] / 1000}초 뒤 다시 시도 (${i + 1}/${GH_RETRY_DELAYS_MS.length}): ${e.message}`);
+      await sleep(GH_RETRY_DELAYS_MS[i]);
+    }
+  }
 }
 const ownerRepo = (url) => String(url || "").replace(/\.git$/, "").replace(/^https?:\/\/github\.com\//, "").split("/").slice(0, 2).join("/");
 
@@ -351,12 +363,16 @@ async function cardOpenPRs(key) {
       if (p.isDraft) continue;
       // --search 는 PR 본문까지 훑어 형제 카드의 PR 까지 잡는다 → 브랜치/제목으로 이 카드 것만 남긴다.
       if (!lib.prBelongsToCard({ branch: p.headRefName, title: p.title }, key)) continue;
-      const comments = await ghJsonStrict(["api", `repos/${or}/issues/${p.number}/comments?per_page=100`, "--jq", "[.[].body]"]);
-      const approved = (comments || []).some((b) => String(b).includes(APPROVED_MARKER));
+      const comments = await ghJsonStrict(["api", `repos/${or}/issues/${p.number}/comments?per_page=100`, "--jq", "[.[] | {id, body, createdAt: .created_at}]"]);
+      const head = { sha: p.headRefOid || "", committedAt: "" };
+      if (head.sha && lib.approvalNeedsCommitTime(comments)) {
+        head.committedAt = await ghJsonStrict(["api", `repos/${or}/commits/${head.sha}`, "--jq", "{d: .commit.committer.date}"]).then((x) => (x && x.d) || "");
+      }
+      const { approved, staleIds } = lib.approvalOf(comments, head);
       let ci = lib.ciStateOf(p.statusCheckRollup);
       if (ci === "none") ci = lib.ciStateWithRuns(ci, await actionRunsOf(or, p.headRefOid));
       prs.push({
-        owner: or, number: p.number, url: p.url, sha: p.headRefOid || "", approved,
+        owner: or, number: p.number, url: p.url, sha: p.headRefOid || "", approved, staleApproval: staleIds.length > 0,
         mergeable: p.mergeable || "UNKNOWN",
         ci, ciFailed: lib.failedChecks(p.statusCheckRollup),
       });
@@ -440,10 +456,35 @@ async function stepBuild(task) {
   }
   return { ok: true };
 }
+// 승인 마커가 있지만 지금 head 에 대한 것이 아닌 PR(승인 뒤 커밋이 올라왔는데 무효화가 빠진 경우) —
+// 그 승인을 무효화하고 리뷰부터 다시 태운다. 리뷰 안 된 커밋이 '승인됨'으로 병합되지 않게 한다.
+async function reReviewStale(task, pr) {
+  const tag = `${pr.owner}#${pr.number}`;
+  log(`${task.key} ${tag} 승인 뒤 새 커밋 감지 → 기존 승인 무효화·재리뷰`);
+  await slack(`🔁 [${EPIC_KEY}] ${task.key} — 승인 뒤 새 커밋이 올라와 다시 리뷰합니다 · ${tag}`);
+  try {
+    const n = await supersedeApproval(pr.owner, pr.number, lib.REVIEW_SUPERSEDED_STALE, "승인 뒤 새 커밋이 올라와");
+    if (n) log(`${task.key} ${tag} 기존 리뷰 승인 ${n}건 무효화`);
+  } catch (e) { return { ok: false, reason: `${tag} 기존 승인 무효화 실패: ${e.message}` }; }
+  const re = await taskEnv(task.key);
+  re.REVIEW_FIRST = "1";   // 새 커밋을 아직 아무도 안 봤다 → 반영할 의견 없이 리뷰부터
+  re.REVIEW_LOOP_MAX = String(lib.clampReviewLoopMax(process.env.REVIEW_LOOP_MAX, cfg));
+  const { code } = await runScript("run-review-loop.sh", [task.key, pr.owner, String(pr.number)], re);
+  if (stopRequested()) return { ok: false, stop: true };
+  if (code !== 0) return { ok: false, reason: `${tag} 새 커밋 재리뷰 실패 (exit ${code})` };
+  return { ok: true };
+}
 // [이어서 진행]으로 ci·approve 에서 재개한 카드 — approve 에서 한 번만 리뷰 루프를 다시 태운다(runTask 시작 시 채움).
 const REVIEW_ON_RESUME = new Set();
 async function stepApprove(task) {
   let prs = await cardOpenPRs(task.key);
+  if (!prs.length) return { ok: true, note: "열린 PR 없음(이미 병합됨)" };
+  const stale = prs.filter((p) => p.staleApproval);
+  for (const pr of stale) {
+    const r = await reReviewStale(task, pr);
+    if (!r.ok) return r;
+  }
+  if (stale.length) prs = await cardOpenPRs(task.key);
   if (!prs.length) return { ok: true, note: "열린 PR 없음(이미 병합됨)" };
   const targets = lib.approveReviewTargets(prs, REVIEW_ON_RESUME.delete(task.key));
   for (const pr of targets) {
@@ -712,6 +753,17 @@ async function stepAwaitMerge(task) {
         if (!r.ok) return r;
       }
       readyNotified = false;                    // CI 가 다시 초록이 되면 '병합만 남음' 을 새로 알린다
+      continue;
+    }
+
+    // 승인 뒤 새 커밋(사람의 직접 푸시, 무효화가 빠진 CI 수정 등) → 그 승인은 지금 코드에 대한 것이 아니다.
+    const stale = prsErr ? [] : openPRs.filter((p) => p.staleApproval && !lib.isConflicting(p));
+    if (stale.length) {
+      for (const pr of stale) {
+        const r = await reReviewStale(task, pr);
+        if (!r.ok) return r;
+      }
+      readyNotified = false;
       continue;
     }
 

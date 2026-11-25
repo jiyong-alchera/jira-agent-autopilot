@@ -353,7 +353,7 @@ Sentry 가 잡은 에러를 **「Sentry 작동 업무 처리」 에픽의 하위
 | `build` | `REVIEW_LOOP_AFTER=1 run-jira-agent.sh <KEY> build` — 개발·PR 생성 후 **[승인까지 리뷰 루프](#43c-run-review-loopsh-승인까지-반복-루프--대시보드-승인까지-루프)** 가 이어서 실행 | 중단 |
 | `ci` | 열린 PR 의 **CI(체크)가 초록이 될 때까지** '원인 파악 → 수정/재실행 → 재검증' 을 반복(기본 5회, `EPIC_CI_LOOP_MAX`) — [4.3e](#43e-ci-단계-ci-실패-자동-수정) | 상한을 다 써도 빨간색이면 중단 |
 | `approve` | 카드의 **열린 봇 PR 전부**에 승인 마커(`CLAUDE-REVIEW-APPROVED`)가 있는지 확인. **[이어서 진행]으로 이 단계나 `ci` 에서 재개하면**(`lib.reviewOnResume`) 미승인 PR 마다 `run-review-loop.sh`(반영 → 재리뷰, 최대 `REVIEW_LOOP_MAX`회)를 **한 번** 다시 태운 뒤 확인한다(`lib.approveReviewTargets`) | 미승인 PR 이 남으면 중단 |
-| `await-merge` | **사용자가 그 카드의 PR 을 모두 병합할 때까지 대기.** `EPIC_MERGE_POLL`(기본 60초)마다 `/api/cards/sync-merged` 를 호출해 외부 병합 감지를 앞당긴 뒤 카드가 완료됐는지 확인. **자동 병합**이 켜져 있으면 조건 충족 시 대신 병합. **base 충돌**이 나면 알림 후(버튼 포함) **자동 충돌 해소**가 켜져 있으면 대기 시간 뒤 `rebase 해소 → 재푸시 → 승인 무효화 → 재리뷰`. 대기 중 **CI 가 깨지면**(`lib.ciFixTargets` — 충돌 PR 제외) `ci` 단계와 같은 CI 수정 루프(수정 → 승인 무효화 → 재리뷰)를 즉시 다시 태운다 | 자동 병합 실패 · 충돌 해소 실패 · CI 수정 상한 소진 시 중단 |
+| `await-merge` | **사용자가 그 카드의 PR 을 모두 병합할 때까지 대기.** `EPIC_MERGE_POLL`(기본 60초)마다 `/api/cards/sync-merged` 를 호출해 외부 병합 감지를 앞당긴 뒤 카드가 완료됐는지 확인. **자동 병합**이 켜져 있으면 조건 충족 시 대신 병합. **base 충돌**이 나면 알림 후(버튼 포함) **자동 충돌 해소**가 켜져 있으면 대기 시간 뒤 `rebase 해소 → 재푸시 → 승인 무효화 → 재리뷰`. 대기 중 **CI 가 깨지면**(`lib.ciFixTargets` — 충돌 PR 제외) `ci` 단계와 같은 CI 수정 루프(수정 → 승인 무효화 → 재리뷰)를 즉시 다시 태운다. **승인 뒤 새 커밋**이 보이면(`staleApproval`) 승인 무효화 → 재리뷰 | 자동 병합 실패 · 충돌 해소 실패 · CI 수정 상한 소진 · 새 커밋 재리뷰 실패 시 중단 |
 
 - **이미 진행된 카드는 건너뛴다**: 시작 단계는 카드의 라벨/상태로 판정한다(`lib.epicTaskStep`) —
   `claude-pr` 있으면 `ci`, `claude-answered` 있으면 `build`, `claude-planned` 만 있으면 `adopt` …
@@ -433,6 +433,11 @@ Sentry 가 잡은 에러를 **「Sentry 작동 업무 처리」 에픽의 하위
   - 조건(모두 충족해야 병합): ① 옵션 켜짐 ② `await-merge` 진입 후 **대기 시간**(기본 60분, 1~1440) 경과
     ③ 이 카드의 **열린 PR 이 전부 리뷰 승인**(`CLAUDE-REVIEW-APPROVED`). 미승인 PR 이 하나라도 있으면
     시간이 지나도 병합하지 않는다(승인 게이트를 시간으로 우회하지 않기 위해).
+    승인은 **지금 PR head 에 대한 것만** 유효하다(`lib.approvalOf`): 마커 코멘트의 `<!-- CLAUDE-REVIEW-APPROVED:<sha> -->`
+    가 head SHA 와 같아야 하고, SHA 가 없는 옛 마커는 코멘트 시각이 head 커밋 시각 이후여야 한다.
+    승인 뒤 커밋이 올라왔는데 무효화가 빠진 PR(중단·재개로 '재리뷰 필요' 표시가 사라진 경우, 사람의 직접 푸시 등)은
+    `approve`·`await-merge` 에서 기존 승인을 `CLAUDE-REVIEW-SUPERSEDED-BY-NEW-COMMIT` 로 무효화하고 리뷰부터 다시 태운다
+    (2026-11-25 PHYS-602 — CI 수정 커밋이 리뷰 없이 '승인됨' 으로 병합된 일 대응). 대시보드 PR 목록(`?approved=1`)도 같은 판정이다.
     ④ **열린 PR 의 CI 가 전부 초록**. `ci` 단계에서 초록을 확인하고 왔더라도 병합 대기 중 base 가 움직여
     다시 깨질 수 있어, 그 회귀를 여기서 한 번 더 막는다(`ci-failed`/`ci-pending`). **판정 불능도 막는다**
     (`ci-unknown` — gh 조회 실패). 모르면 병합하지 않는 쪽이 안전하고, 다음 폴링에서 다시 판정하므로 스스로 풀린다.
@@ -800,6 +805,7 @@ CI 가 끝난 뒤 에픽 러너의 '병합만 남음' 알림이 또 와서 그�
 | CI 수정 반복 상한 | `EPIC_CI_LOOP_MAX` (설정 `ciLoopMax`) | `5` | `ci` 단계에서 'CI 수정 → 재리뷰 → 재판정' 을 반복하는 최대 회차(1~20). 소진하면 `needs-human` 으로 중단(자동 재시도 안 함) |
 | CI 폴링(초) | `EPIC_CI_POLL` | `30` | `ci` 단계에서 CI 완료 여부를 확인하는 주기 |
 | CI 완료 대기 한도(분) | `EPIC_CI_WAIT_MAX_MIN` | `40` | 이 시간 안에 CI 가 끝나지 않으면 '아직 진행 중' 사유로 중단 |
+| GitHub 일시 오류 재시도 간격(초) | `EPIC_GH_RETRY_DELAYS` | `20,60` | 러너의 PR·CI·승인 조회와 승인 무효화(PATCH)가 GitHub 일시 장애(빈 응답 `unexpected end of JSON input`·5xx·GraphQL `Something went wrong`·연결 끊김)로 실패하면 이 간격으로 다시 보낸다(`lib.isTransientGhError`). 권한·404·검증 실패는 바로 실패. 다 써도 실패하면 종전대로 중단 |
 | 자동 재시도 | (옵션 파일 `autoRetry`) | (꺼짐) | 중단 사유가 사용량 한도·일시적 오류면 백엔드가 자동으로 재개(60초 주기 감시). 대시보드 패널 체크박스로 설정 |
 | 자동 재시도 상한 | (옵션 파일 `autoRetryMax`) | `5` | 같은 지점에서 반복 실패할 때의 최대 재시도 횟수(1~20). 진행 지점이 바뀌면 리셋 |
 | 결정 대기 자동 결정 | (옵션 파일 `autoDecide`) | (꺼짐) | 에이전트가 선택지를 내고 멈춘 카드를, 아무도 고르지 않은 채 대기 시간이 지나면 권장안(`DECISION_DEFAULT`)으로 정한다. 대시보드 백엔드가 60초마다 `.state/*.decision.json` 을 보고 처리한다(`autoDecidePending`). 권장안이 없으면 하지 않으며, 한 선택지는 한 번만 시도한다(`autoTriedAt`) |
@@ -1053,6 +1059,7 @@ loop-work/                     # (= 저장소 루트)
    ├─ slack-socket.js          # Slack 버튼 클릭 수신(Socket Mode) → 대시보드 API 실행
    ├─ test/lib.test.js         # 단위 테스트 (node:test) — `npm test`
    ├─ test/retention.test.js   # 오래된 작업 정리(보관 기간) 판단 회귀 테스트 — 무엇을 지우고 남기는지
+   ├─ test/approval-head.test.js   # 승인 마커가 지금 PR head 에 대한 것인지(lib.approvalOf)·GitHub 일시 오류 판정 회귀 테스트
    ├─ test/review-loop.test.js # run-review-loop.sh 회귀 테스트 (하위 스크립트·gh 스텁, 네트워크 불필요)
    ├─ test/review-approve-ci-gate.test.js # 승인 알림 CI 게이트 회귀 테스트 (ci-state.js 스텁)
    ├─ test/attachments.test.js # 카드 첨부(이미지·문서) 인식 회귀 테스트 (fetch 스텁, 네트워크 불필요)

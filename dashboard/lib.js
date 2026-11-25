@@ -1019,6 +1019,48 @@ const isConflicting = (p) => String((p && p.mergeable) || "").toUpperCase() === 
 // (CI 수정·충돌 해소가 같은 방식을 쓰되, 무효 사유는 마커로 구분한다)
 const REVIEW_SUPERSEDED_CI = "CLAUDE-REVIEW-SUPERSEDED-BY-CI-FIX";
 const REVIEW_SUPERSEDED_CONFLICT = "CLAUDE-REVIEW-SUPERSEDED-BY-CONFLICT-FIX";
+const REVIEW_SUPERSEDED_STALE = "CLAUDE-REVIEW-SUPERSEDED-BY-NEW-COMMIT";
+// 승인 마커가 지금 PR head 에 대한 것인지. 마커만 있으면 승인으로 보던 판정은, 승인 뒤 커밋이 올라오고
+// 무효화가 빠지면(중단·재개로 '재리뷰 필요' 표시가 사라지는 등) 리뷰 안 된 코드를 승인된 것으로 읽었다.
+//   마커에 SHA(<!-- CLAUDE-REVIEW-APPROVED:<sha> -->)가 있으면 head 와 같아야 유효.
+//   SHA 가 없는 옛 마커는 코멘트 시각이 head 커밋 시각 이후여야 유효(커밋 시각을 모르면 유효로 둔다).
+// comments: [{id, body, createdAt}], head: {sha, committedAt}
+// → { approved, staleIds: 승인 마커가 있지만 head 에 대한 것이 아닌 코멘트 id }
+const APPROVED_SHA_RE = new RegExp(`${REVIEW_APPROVED_MARKER}:([0-9a-f]{7,40})`, "gi");
+function shaMatches(a, b) {
+  const x = String(a || "").toLowerCase(), y = String(b || "").toLowerCase();
+  if (x.length < 7 || y.length < 7) return false;
+  return x.startsWith(y) || y.startsWith(x);
+}
+function approvalOf(comments, head) {
+  const h = head || {};
+  const headMs = Date.parse(h.committedAt || "");
+  let approved = false;
+  const staleIds = [];
+  for (const c of comments || []) {
+    const body = String((c && c.body) || "");
+    if (!body.includes(REVIEW_APPROVED_MARKER)) continue;
+    const shas = [...body.matchAll(APPROVED_SHA_RE)].map((m) => m[1]);
+    let valid;
+    if (shas.length) valid = !h.sha || shas.some((x) => shaMatches(x, h.sha));
+    else {
+      const at = Date.parse((c && c.createdAt) || "");
+      valid = !Number.isFinite(headMs) || !Number.isFinite(at) || at >= headMs;
+    }
+    if (valid) approved = true;
+    else if (c && c.id != null) staleIds.push(c.id);
+  }
+  return { approved, staleIds: approved ? [] : staleIds };
+}
+// 승인 마커 중 SHA 가 없는 것이 있어 head 커밋 시각이 있어야 판정할 수 있는지
+const approvalNeedsCommitTime = (comments) => (comments || []).some((c) => {
+  const b = String((c && c.body) || "");
+  return b.includes(REVIEW_APPROVED_MARKER) && !new RegExp(`${REVIEW_APPROVED_MARKER}:[0-9a-f]{7,40}`, "i").test(b);
+});
+// gh 호출이 GitHub 일시 장애로 실패했는지(다시 보내면 풀릴 수 있는 것만). 권한·없는 대상·검증 실패는 아님.
+function isTransientGhError(msg) {
+  return /unexpected end of JSON input|Something went wrong|HTTP 5\d\d|\b50[234]\b|Bad Gateway|Service Unavailable|Gateway Time-?out|timed? ?out|ETIMEDOUT|ECONNRESET|connection reset|unexpected EOF|TLS handshake/i.test(String(msg || ""));
+}
 function supersededBody(body, marker, why, when) {
   return `${String(body || "").split(REVIEW_APPROVED_MARKER).join(marker)}\n\n> ⚠️ ${why} 이 승인은 무효화됐습니다(${when}). 재리뷰가 진행됩니다.\n`;
 }
@@ -1328,7 +1370,8 @@ module.exports = {
   EPIC_HIERARCHY_LEVEL, EPIC_LABEL_FALLBACK, topLevelIssueTypes, epicSearchJql, epicTypeLabel,
   EPIC_AUTO_MERGE_MIN_DEFAULT, EPIC_AUTO_MERGE_MIN_LIMIT, clampAutoMergeMin, shouldAutoMerge, mergeReadyState, isMergeReady, awaitMergeEntryNotice, ciFixTargets,
   EPIC_CONFLICT_MIN_DEFAULT, EPIC_CONFLICT_MIN_LIMIT, clampConflictMin, isConflicting, conflictingPRs, shouldAutoResolveConflict,
-  REVIEW_SUPERSEDED_CI, REVIEW_SUPERSEDED_CONFLICT, supersededBody,
+  REVIEW_SUPERSEDED_CI, REVIEW_SUPERSEDED_CONFLICT, REVIEW_SUPERSEDED_STALE, supersededBody,
+  approvalOf, approvalNeedsCommitTime, isTransientGhError,
   EPIC_RETRY_MAX_DEFAULT, EPIC_RETRY_MAX_LIMIT, EPIC_RETRY_BACKOFF_MIN, clampRetryMax,
   parseUsageLimitReset, classifyPause, planRetry,
   SLACK_ACTIONS, SLACK_ACTION_PREFIX, encodeSlackAction, decodeSlackAction, slackMessage, slackActorAllowed,

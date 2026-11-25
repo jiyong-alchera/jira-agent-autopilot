@@ -1676,12 +1676,12 @@ async function listCardPRs(repos, key, cred) {
   const out = [];
   for (const repo of repos) {
     const or = ownerRepo(repo.url); if (!or) continue;
-    const list = await gh(["pr", "list", "--repo", or, "--search", key, "--state", "all", "--json", "number,url,title,state,headRefName,baseRefName,isDraft,author,createdAt,mergeable,mergeStateStatus,statusCheckRollup"], cred);
+    const list = await gh(["pr", "list", "--repo", or, "--search", key, "--state", "all", "--json", "number,url,title,state,headRefName,headRefOid,baseRefName,isDraft,author,createdAt,mergeable,mergeStateStatus,statusCheckRollup"], cred);
     // 조회 실패를 'PR 없음'으로 삼키면 안 된다. gh 검색은 분당 30회 제한에 걸리면 빈손으로 돌아오는데,
     // 그걸 '이 카드엔 PR 이 없다'로 읽어 자동 병합이 아무것도 못 찾고 실패한 적이 있다(원인도 안 남았다).
     if (!list.ok) throw new Error(`${repo.name}: PR 목록 조회 실패 — ${(list.stderr || "").trim().slice(0, 160)}`);
     let prs = []; try { prs = JSON.parse(list.stdout || "[]"); } catch (e) { throw new Error(`${repo.name}: PR 목록 파싱 실패 — ${e.message}`); }
-    for (const pr of prs) out.push({ repo: repo.name, owner: or, number: pr.number, url: pr.url, title: pr.title, state: pr.state, branch: pr.headRefName || "", base: pr.baseRefName || "", isDraft: !!pr.isDraft, author: (pr.author && pr.author.login) || "", createdAt: pr.createdAt || "", mergeable: pr.mergeable || "UNKNOWN", mergeState: pr.mergeStateStatus || "UNKNOWN", ci: lib.ciStateOf(pr.statusCheckRollup), ciFailed: lib.failedChecks(pr.statusCheckRollup) });
+    for (const pr of prs) out.push({ repo: repo.name, owner: or, number: pr.number, url: pr.url, title: pr.title, state: pr.state, branch: pr.headRefName || "", sha: pr.headRefOid || "", base: pr.baseRefName || "", isDraft: !!pr.isDraft, author: (pr.author && pr.author.login) || "", createdAt: pr.createdAt || "", mergeable: pr.mergeable || "UNKNOWN", mergeState: pr.mergeStateStatus || "UNKNOWN", ci: lib.ciStateOf(pr.statusCheckRollup), ciFailed: lib.failedChecks(pr.statusCheckRollup) });
   }
   return out;
 }
@@ -1770,10 +1770,17 @@ app.get("/api/cards/:key/prs", async (req, res) => {
     if (req.query.approved === "1") {
       prs = await Promise.all(prs.map(async (p) => {
         if (p.state !== "OPEN") return p;
-        const r = await gh(["api", `repos/${p.owner}/issues/${p.number}/comments?per_page=100`, "--jq", "[.[].body]"], cred);
-        let approved = false;
-        try { approved = (JSON.parse(r.stdout || "[]") || []).some((b) => String(b).includes(REVIEW_APPROVED_MARKER)); } catch {}
-        return { ...p, approved };
+        // 러너와 같은 판정 — 승인 마커가 지금 head 에 대한 것일 때만 승인(lib.approvalOf)
+        const r = await gh(["api", `repos/${p.owner}/issues/${p.number}/comments?per_page=100`, "--jq", "[.[] | {id, body, createdAt: .created_at}]"], cred);
+        let comments = [];
+        try { comments = JSON.parse(r.stdout || "[]") || []; } catch {}
+        const head = { sha: p.sha || "", committedAt: "" };
+        if (head.sha && lib.approvalNeedsCommitTime(comments)) {
+          const c = await gh(["api", `repos/${p.owner}/commits/${head.sha}`, "--jq", ".commit.committer.date"], cred);
+          if (c.ok) head.committedAt = String(c.stdout || "").trim();
+        }
+        const { approved, staleIds } = lib.approvalOf(comments, head);
+        return { ...p, approved, staleApproval: staleIds.length > 0 };
       }));
     }
     res.json({ ok: true, prs, botLogin });
